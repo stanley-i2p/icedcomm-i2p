@@ -1,10 +1,12 @@
 # IcedComm-I2P
 
-**IcedComm-I2P** is a Rust/Iced graphical private messenger for one-to-one communication over the I2P network.
+**An Iced-powered, maximum-security GUI messaging tool for one-to-one communication over I2P.**
 
 Current version: **1.0.0-beta.1**
 
-The project is a GUI reimplementation of the Termchat-I2P protocol and design. The Python `termchat-i2p` application remains the reference implementation while the Rust GUI is developed toward feature parity and a more accessible desktop experience.
+
+### GUI Implementation Notice
+This project is a graphical user interface (GUI) implementation built entirely on top of the original protocol, architecture, and core security features of [termchat-i2p](https://github.com/stanley-i2p/termchat-i2p). While the interface has been modernized using the Rust-based Iced framework, the underlying application logic strictly honors the native end-to-end encryption, compartmentalized per-profile model, TOFU peer pinning, and metadata-poor offline deaddrop system engineered by the original author.
 
 ![IcedComm-I2P](Screenshot_1.png)
 ![IcedComm-I2P](Screenshot_2.png)
