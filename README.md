@@ -213,3 +213,11 @@ This first public beta focuses on:
 - Public binary testing
 
 Users should keep backups and report issues with startup, vault encryption, profile import/export, offline delivery, image transfer, and router/SAM compatibility.
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0.
+See the `LICENSE` file for the full license text.
+
+Original authorship and attribution notices are provided in the `NOTICE` file
+and must be preserved as required by the license.
