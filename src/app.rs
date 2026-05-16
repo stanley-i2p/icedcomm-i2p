@@ -1,6 +1,6 @@
 use crate::constants::{
-    APP_NAME, APP_VERSION, DEFAULT_SAM_HOST, DEFAULT_SAM_PORT, MAX_ACTIVE_DEADDROP_REPLICAS,
-    MAX_FILE_SIZE,
+    APP_FONT_FAMILY, APP_NAME, APP_VERSION, DEFAULT_SAM_HOST, DEFAULT_SAM_PORT,
+    MAX_ACTIVE_DEADDROP_REPLICAS, MAX_FILE_SIZE,
 };
 use crate::deaddrop::{DeadDropClient, DeaddropOpStat};
 use crate::e2e::E2E;
@@ -7917,8 +7917,9 @@ fn bold_indicator<'a>(label: &'a str, bg: Color) -> iced::widget::Container<'a, 
 
 fn indicator_font() -> Font {
     Font {
+        family: font::Family::Name(APP_FONT_FAMILY),
         weight: font::Weight::Semibold,
-        ..Font::MONOSPACE
+        ..Font::DEFAULT
     }
 }
 

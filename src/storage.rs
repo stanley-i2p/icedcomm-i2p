@@ -149,7 +149,24 @@ impl Drop for AppLock {
 
 pub fn base_dir() -> PathBuf {
     let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = env::var_os("HOMEDRIVE")?;
+            let path = env::var_os("HOMEPATH")?;
+            if drive.is_empty() || path.is_empty() {
+                None
+            } else {
+                let mut home = PathBuf::from(drive);
+                home.push(path);
+                Some(home)
+            }
+        })
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".icedcomm-i2p")
 }

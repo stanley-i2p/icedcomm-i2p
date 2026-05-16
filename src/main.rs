@@ -11,7 +11,10 @@ mod vault;
 mod app_home;
 
 use app::TermchatApp;
+use constants::APP_FONT_FAMILY;
 use iced::{Font, Theme, application, window};
+
+const INTER_FONT_BYTES: &[u8] = include_bytes!("../fonts/Inter-VariableFont_opsz,wght.ttf");
 
 fn app_title(_: &TermchatApp) -> String {
     String::from("IcedComm-I2P")
@@ -31,6 +34,7 @@ fn main() -> iced::Result {
             min_size: Some(iced::Size::new(1280.0, 700.0)),
             ..Default::default()
         })
-        .default_font(Font::MONOSPACE)
+        .font(INTER_FONT_BYTES)
+        .default_font(Font::with_name(APP_FONT_FAMILY))
         .run()
 }

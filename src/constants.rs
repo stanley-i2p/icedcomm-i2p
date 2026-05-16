@@ -1,5 +1,6 @@
 pub const APP_NAME: &str = "IcedComm-I2P";
 pub const APP_VERSION: &str = "1.0.0-beta.1";
+pub const APP_FONT_FAMILY: &str = "Inter";
 
 pub const MAGIC: [u8; 4] = [0x89, b'I', b'2', b'P'];
 pub const PROTOCOL_VERSION: u8 = 3;
