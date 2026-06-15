@@ -118,6 +118,7 @@ const DD_FAILURE_PENALTY: f64 = 2500.0;
 const DD_UNKNOWN_SERVER_SCORE: f64 = -1e18;
 const DD_STATS_SAVE_INTERVAL_MS: u64 = 15_000;
 const DEADDROP_PANEL_HEIGHT_PORTION: u16 = 2;
+const OFFLINE_SECRET_REQUEST_SIGNAL: &str = "__SIGNAL__:OFFLINE_SECRET_REQUEST";
 const TEXT_BUBBLE_MAX_WIDTH: f32 = 460.0;
 const TEXT_BUBBLE_MIN_BODY_WIDTH: f32 = 92.0;
 const FILE_BUBBLE_WIDTH: f32 = 340.0;
@@ -2151,7 +2152,7 @@ impl TermchatApp {
                                 .unwrap_or(false)
                             {
                                 if let Some(tab_id) = state.active_tab().map(|t| t.id) {
-                                    state.send_offline_secret_if_needed_task(tab_id)
+                                    state.sync_offline_secret_if_needed_task(tab_id)
                                 } else {
                                     Task::none()
                                 }
@@ -5464,6 +5465,7 @@ impl TermchatApp {
 
         let mut secure_session_just_established = false;
         let mut secure_session_tab_id: Option<u64> = None;
+        let mut offline_secret_request_tab_id: Option<u64> = None;
 
         let push_log = |tab: &mut OpenedTab, line: String| {
             tab.session.log_lines.push(line);
@@ -5941,6 +5943,15 @@ impl TermchatApp {
                                         move |result| Message::IncomingAccepted(tab_id, result),
                                     ));
                                     break;
+                                }
+
+                                if body == OFFLINE_SECRET_REQUEST_SIGNAL {
+                                    push_log(
+                                        tab,
+                                        "Peer requested offline secret sync.".to_string(),
+                                    );
+                                    offline_secret_request_tab_id = Some(tab_id);
+                                    continue;
                                 }
 
                                 match SamClient::destination_to_b32(&body) {
@@ -6522,7 +6533,7 @@ impl TermchatApp {
                     .map(|t| t.session.profile != "default")
                     .unwrap_or(false);
 
-                tasks.push(self.send_offline_secret_if_needed_task(tab_id));
+                tasks.push(self.sync_offline_secret_if_needed_task(tab_id));
 
                 if is_persistent_tab {
                     tasks.push(self.send_deaddrop_server_list_task(tab_id));
@@ -6532,6 +6543,10 @@ impl TermchatApp {
                     self.load_active_runtime();
                 }
             }
+        }
+
+        if let Some(tab_id) = offline_secret_request_tab_id {
+            tasks.push(self.send_offline_secret_if_needed_task(tab_id));
         }
 
         tasks
@@ -6887,6 +6902,13 @@ impl TermchatApp {
             .unwrap_or(false)
     }
 
+    fn session_has_real_offline_secret(session: &SessionState) -> bool {
+        session
+            .offline_shared_secret
+            .map(|s| s.iter().any(|b| *b != 0))
+            .unwrap_or(false)
+    }
+
     fn should_initiate_offline_secret_for_session(session: &SessionState) -> bool {
         let Some(my_b32) = session.my_b32.as_ref() else {
             return false;
@@ -6917,6 +6939,55 @@ impl TermchatApp {
             && !self.session.deaddrop_servers.is_empty()
     }
 
+    fn sync_offline_secret_if_needed_task(&mut self, tab_id: u64) -> Task<Message> {
+        let Some(idx) = self.find_tab_index_by_id(tab_id) else {
+            return Task::none();
+        };
+
+        if Self::should_initiate_offline_secret_for_session(&self.opened_tabs[idx].session) {
+            self.send_offline_secret_if_needed_task(tab_id)
+        } else {
+            self.request_offline_secret_if_needed_task(tab_id)
+        }
+    }
+
+    fn request_offline_secret_if_needed_task(&mut self, tab_id: u64) -> Task<Message> {
+        let Some(idx) = self.find_tab_index_by_id(tab_id) else {
+            return Task::none();
+        };
+
+        let Some(conn) = self.opened_tabs[idx].live_conn.clone() else {
+            return Task::none();
+        };
+
+        let session = &self.opened_tabs[idx].session;
+        if !session.live_ready
+            || session.profile == "default"
+            || session.stored_peer.is_none()
+            || session.stored_peer_dest_b64.is_none()
+            || session.deaddrop_servers.is_empty()
+            || Self::session_has_real_offline_secret(session)
+        {
+            return Task::none();
+        }
+
+        self.opened_tabs[idx]
+            .session
+            .log_lines
+            .push("Requesting offline secret sync from peer.".into());
+
+        let frame = Frame {
+            msg_type: MsgType::S,
+            msg_id: self.generate_msg_id(),
+            payload: OFFLINE_SECRET_REQUEST_SIGNAL.as_bytes().to_vec(),
+        };
+
+        Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
+            move |result| Message::SendFinished(tab_id, result),
+        )
+    }
+
     fn send_offline_secret_if_needed_task(&mut self, tab_id: u64) -> Task<Message> {
         let Some(idx) = self.find_tab_index_by_id(tab_id) else {
             return Task::none();
@@ -6938,53 +7009,54 @@ impl TermchatApp {
             return Task::none();
         }
 
-        let already_has_real = self.opened_tabs[idx]
-            .session
-            .offline_shared_secret
-            .map(|s| s.iter().any(|b| *b != 0))
-            .unwrap_or(false);
-
-        if already_has_real {
-            return Task::none();
-        }
-
         if !Self::should_initiate_offline_secret_for_session(&self.opened_tabs[idx].session) {
             return Task::none();
         }
 
-        let secret: [u8; 32] = random();
-
-        self.opened_tabs[idx].session.offline_shared_secret = Some(secret);
-
-        if self.active_tab().map(|t| t.id) == Some(tab_id) {
-            self.session.offline_shared_secret = Some(secret);
-        }
-
-        if let Some(peer_b32) = self.opened_tabs[idx].session.stored_peer.clone() {
-            let offline = Self::offline_state_from_session(&self.opened_tabs[idx].session);
-
-            match storage::save_offline_state(
-                &self.opened_tabs[idx].session.profile,
-                &peer_b32,
-                &offline,
-            ) {
-                Ok(()) => {
-                    self.opened_tabs[idx]
-                        .session
-                        .log_lines
-                        .push("Offline secret generated and saved.".into());
-                }
-                Err(err) => {
-                    self.opened_tabs[idx]
-                        .session
-                        .log_lines
-                        .push(format!("Offline secret save failed: {err}"));
-                    return Task::none();
-                }
-            }
+        let secret = if Self::session_has_real_offline_secret(&self.opened_tabs[idx].session) {
+            let Some(secret) = self.opened_tabs[idx].session.offline_shared_secret else {
+                return Task::none();
+            };
+            self.opened_tabs[idx]
+                .session
+                .log_lines
+                .push("Offline secret sync sent.".into());
+            secret
         } else {
-            return Task::none();
-        }
+            let secret: [u8; 32] = random();
+            self.opened_tabs[idx].session.offline_shared_secret = Some(secret);
+
+            if self.active_tab().map(|t| t.id) == Some(tab_id) {
+                self.session.offline_shared_secret = Some(secret);
+            }
+
+            if let Some(peer_b32) = self.opened_tabs[idx].session.stored_peer.clone() {
+                let offline = Self::offline_state_from_session(&self.opened_tabs[idx].session);
+
+                match storage::save_offline_state(
+                    &self.opened_tabs[idx].session.profile,
+                    &peer_b32,
+                    &offline,
+                ) {
+                    Ok(()) => {
+                        self.opened_tabs[idx]
+                            .session
+                            .log_lines
+                            .push("Offline secret generated and saved.".into());
+                    }
+                    Err(err) => {
+                        self.opened_tabs[idx]
+                            .session
+                            .log_lines
+                            .push(format!("Offline secret save failed: {err}"));
+                        return Task::none();
+                    }
+                }
+            } else {
+                return Task::none();
+            }
+            secret
+        };
 
         let frame = Frame {
             msg_type: MsgType::X,
