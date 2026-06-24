@@ -1,11 +1,13 @@
 use crate::constants::{
-    APP_FONT_FAMILY, APP_NAME, APP_VERSION, DEFAULT_SAM_HOST, DEFAULT_SAM_PORT,
-    MAX_ACTIVE_DEADDROP_REPLICAS, MAX_FILE_SIZE,
+    APP_FONT_FAMILY, APP_ICON_FONT_FAMILY, APP_NAME, APP_VERSION, DEFAULT_SAM_HOST,
+    DEFAULT_SAM_PORT, MAX_ACTIVE_DEADDROP_REPLICAS, MAX_FILE_SIZE,
 };
 use crate::deaddrop::{DeadDropClient, DeaddropOpStat};
 use crate::e2e::E2E;
 use crate::protocol::{Frame, MsgType};
 use crate::sam::{AcceptedIncoming, LiveConnection, SamClient, SamInitResult};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use iced::border;
 use iced::widget::Id as ScrollableId;
 use iced::widget::operation;
@@ -17,12 +19,16 @@ use iced::{
     font, futures::SinkExt, stream, time, window,
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::storage::{self, AppLock, ContactMeta, OfflineState};
+use crate::storage::{
+    self, AppLock, ContactMeta, GroupInvite, GroupIssuedInvite, GroupMember, GroupMeta,
+    OfflineState,
+};
 
 use base64::{Engine as _, engine::general_purpose};
 use std::collections::HashMap;
@@ -125,8 +131,19 @@ const FILE_BUBBLE_WIDTH: f32 = 340.0;
 const IMAGE_BUBBLE_MAX_WIDTH: f32 = 420.0;
 const IMAGE_BUBBLE_MAX_HEIGHT: f32 = 360.0;
 const SYSTEM_BUBBLE_MAX_WIDTH: f32 = 700.0;
+const REPLY_BEGIN_MARKER: &str = "[ICEDCOMM-REPLY-v1]";
+const REPLY_QUOTE_MARKER: &str = "[ICEDCOMM-QUOTE]";
+const REPLY_END_MARKER: &str = "[/ICEDCOMM-REPLY]";
 const IMAGE_TRANSFER_MAX_DIMENSION: u32 = 1280;
 const IMAGE_TRANSFER_JPEG_QUALITY: u8 = 82;
+const GROUP_INVITE_STRING_PREFIX: &str = "ICEDCOMM-GROUP-INVITE-v1:";
+const GROUP_CONTROL_JOIN_PROOF: &str = "join_proof";
+const GROUP_CONTROL_RENAME_REQUEST: &str = "rename_request";
+const SHUTDOWN_NOTIFY_GRACE_MS: u64 = 1_200;
+const HEARTBEAT_PING_INTERVAL_MS: u64 = 10_000;
+const HEARTBEAT_TIMEOUT_MS: u64 = 35_000;
+const HEARTBEAT_PING_PREFIX: &str = "__SIGNAL__:PING:";
+const HEARTBEAT_PONG_PREFIX: &str = "__SIGNAL__:PONG:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupGate {
@@ -138,6 +155,7 @@ pub enum StartupGate {
 pub enum TabKind {
     AppHome,
     Chat,
+    Group,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +214,56 @@ pub struct OpenedTab {
     pub outgoing_image_msg_id: u64,
     pub outgoing_image_phase: OutgoingImagePhase,
     pub outgoing_image_send_in_flight: bool,
+    pub group: Option<GroupRuntime>,
+}
+
+pub struct GroupPeerRuntime {
+    pub member: GroupMember,
+    pub conn: Option<LiveConnection>,
+    pub pending_conn: Option<LiveConnection>,
+    pub e2e: E2E,
+    pub ready: bool,
+    pub authorized: bool,
+    pub connecting: bool,
+    pub last_connect_attempt_ms: u64,
+    pub heartbeat_last_rx_ms: u64,
+    pub heartbeat_last_ping_ms: u64,
+}
+
+pub struct GroupRuntime {
+    pub meta: GroupMeta,
+    pub peers: Vec<GroupPeerRuntime>,
+    pub accept_armed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupControlMessage {
+    kind: String,
+    token: String,
+    b32: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GroupRosterSignaturePayload {
+    format: String,
+    version: u32,
+    group_name: String,
+    owner_b32: String,
+    roster_version: u64,
+    members: Vec<GroupMember>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupRosterSync {
+    format: String,
+    version: u32,
+    group_name: String,
+    owner_b32: String,
+    roster_version: u64,
+    members: Vec<GroupMember>,
+    roster_signing_pubkey: String,
+    roster_signature: String,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +276,15 @@ pub struct ProfileEntry {
 pub enum SidebarConfirm {
     DeleteProfile(String),
     ResetProfile(String),
+    DeleteGroup {
+        key: String,
+        name: String,
+    },
+    DeleteGroupMember {
+        group_key: String,
+        member_b32: String,
+        member_name: String,
+    },
 }
 
 impl ProfileEntry {
@@ -279,6 +356,8 @@ pub struct Bubble {
     pub timestamp_utc: String,
     pub msg_id: Option<u64>,
     pub delivered: bool,
+    pub group_expected_acks: Vec<String>,
+    pub group_received_acks: Vec<String>,
 }
 
 impl Bubble {
@@ -291,6 +370,8 @@ impl Bubble {
             timestamp_utc: TermchatApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         }
     }
 
@@ -303,6 +384,22 @@ impl Bubble {
             timestamp_utc: TermchatApp::now_utc_hms(),
             msg_id: Some(msg_id),
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
+        }
+    }
+
+    fn group_me_with_id(text: impl Into<String>, msg_id: u64, expected_acks: Vec<String>) -> Self {
+        Self {
+            author: "Me".into(),
+            content: BubbleContent::Text(text.into()),
+            mine: true,
+            offline: false,
+            timestamp_utc: TermchatApp::now_utc_hms(),
+            msg_id: Some(msg_id),
+            delivered: expected_acks.is_empty(),
+            group_expected_acks: expected_acks,
+            group_received_acks: Vec::new(),
         }
     }
 
@@ -315,6 +412,8 @@ impl Bubble {
             timestamp_utc: TermchatApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         }
     }
 
@@ -331,6 +430,8 @@ impl Bubble {
             timestamp_utc: TermchatApp::now_utc_hms(),
             msg_id: if msg_id == 0 { None } else { Some(msg_id) },
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         }
     }
 
@@ -343,6 +444,8 @@ impl Bubble {
             timestamp_utc: TermchatApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         }
     }
 
@@ -355,6 +458,8 @@ impl Bubble {
             timestamp_utc: TermchatApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         }
     }
 }
@@ -391,6 +496,15 @@ pub struct SessionState {
     pub selected_profile_idx: usize,
     pub profile_name_input: String,
     pub sidebar_confirm: Option<SidebarConfirm>,
+    pub groups: Vec<GroupMeta>,
+    pub selected_group_idx: Option<usize>,
+    pub group_name_input: String,
+    pub group_display_name_input: String,
+    pub group_member_name_input: String,
+    pub group_member_b32_input: String,
+    pub group_invite_string_input: String,
+    pub group_generated_invite_string: String,
+    pub group_status: String,
     pub tabs: Vec<ChatTab>,
     pub active_tab_idx: Option<usize>,
     pub my_b32: Option<String>,
@@ -416,6 +530,8 @@ pub struct SessionState {
     pub dd_status: String,
     pub dd_status_at_ms: u64,
     pub accept_armed: bool,
+    pub heartbeat_last_rx_ms: u64,
+    pub heartbeat_last_ping_ms: u64,
 
     pub call_blink_on: bool,
     pub call_blink_ticks: u8,
@@ -424,10 +540,12 @@ pub struct SessionState {
     pub action_param: String,
 
     pub input: String,
+    pub reply_to: Option<ReplyDraft>,
     pub bubbles: Vec<Bubble>,
     pub status_lines: Vec<String>,
     pub show_logs: bool,
     pub show_deaddrop_panel: bool,
+    pub show_group_panel: bool,
     pub deaddrop_server_input: String,
     pub log_lines: Vec<String>,
     pub messages_scroll_id: ScrollableId,
@@ -445,6 +563,12 @@ pub struct SessionState {
     pub seen_drop_msgs: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplyDraft {
+    pub author: String,
+    pub text: String,
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         Self {
@@ -453,6 +577,15 @@ impl Default for SessionState {
             selected_profile_idx: 0,
             profile_name_input: String::new(),
             sidebar_confirm: None,
+            groups: Vec::new(),
+            selected_group_idx: None,
+            group_name_input: String::new(),
+            group_display_name_input: String::new(),
+            group_member_name_input: String::new(),
+            group_member_b32_input: String::new(),
+            group_invite_string_input: String::new(),
+            group_generated_invite_string: String::new(),
+            group_status: "Groups use separate I2P identities and live fan-out only.".into(),
             tabs: vec![],
             active_tab_idx: None,
             my_b32: None,
@@ -476,11 +609,14 @@ impl Default for SessionState {
             dd_status: "idle".into(),
             dd_status_at_ms: 0,
             accept_armed: false,
+            heartbeat_last_rx_ms: 0,
+            heartbeat_last_ping_ms: 0,
             pending_action: None,
             call_blink_on: true,
             call_blink_ticks: 0,
             action_param: String::new(),
             input: String::new(),
+            reply_to: None,
             bubbles: vec![],
             status_lines: vec![
                 format!("{APP_NAME} {APP_VERSION}"),
@@ -489,6 +625,7 @@ impl Default for SessionState {
             ],
             show_logs: false,
             show_deaddrop_panel: false,
+            show_group_panel: false,
             deaddrop_server_input: String::new(),
             log_lines: vec![
                 format!("{APP_NAME} {APP_VERSION}"),
@@ -619,13 +756,41 @@ pub enum Message {
     ActionCancel,
     CopyStatusMyB32Pressed,
     CopyStatusPeerB32Pressed,
+    CopyBubbleTextPressed(usize),
+    ReplyBubblePressed(usize),
+    CancelReplyPressed,
     ToggleLogsPressed,
+    ToggleGroupPanelPressed,
     DdServerInputChanged(String),
     DdServerAddPressed,
     DdServerDeletePressed(usize),
     DdServerSharePressed,
+    GroupSelected(usize),
+    GroupNameInputChanged(String),
+    GroupDisplayNameInputChanged(String),
+    SaveGroupDisplayNamePressed,
+    GroupMemberNameInputChanged(String),
+    GroupMemberB32InputChanged(String),
+    CreateGroupPressed,
+    OpenGroupPressed,
+    AddGroupMemberPressed,
+    DeleteGroupPressed,
+    DeleteGroupMemberPressed(usize),
+    ExportGroupInvitePressed,
+    ImportGroupInvitePressed,
+    GroupInviteStringInputChanged(String),
+    GenerateGroupInvitePressed,
+    CopyGeneratedGroupInvitePressed,
+    CopyGroupInviteStringPressed,
+    ImportGroupInviteStringPressed,
+    GroupInviteExportPathChosen(Option<PathBuf>),
+    GroupInviteImportPathChosen(Option<PathBuf>),
+    GroupInviteExportFinished(Result<(PathBuf, GroupMeta), String>),
+    GroupInviteImportFinished(Result<String, String>),
 
     SamInitialized(u64, Result<(SamClient, SamInitResult), String>),
+    GroupConnectFinished(u64, String, Result<(String, LiveConnection), String>),
+    GroupIncomingAccepted(u64, Result<AcceptedIncoming, String>),
     ConnectFinished(u64, Result<(String, LiveConnection), String>),
     IncomingAccepted(u64, Result<AcceptedIncoming, String>),
     SendFinished(u64, Result<(), String>),
@@ -743,12 +908,19 @@ impl TermchatApp {
         }
 
         let contacts = storage::load_contacts().map_err(|e| e.to_string())?;
+        let groups = storage::load_groups().map_err(|e| e.to_string())?;
         self.session.profiles = vec![ProfileEntry::transient()];
         for contact in contacts {
             self.session
                 .profiles
                 .push(ProfileEntry::persistent(contact.name));
         }
+        self.session.groups = groups;
+        self.session.selected_group_idx = if self.session.groups.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         self.session.selected_profile_idx = 0;
         self.session.tabs = vec![Self::new_app_home_tab()];
         self.session.active_tab_idx = Some(0);
@@ -850,6 +1022,7 @@ impl TermchatApp {
             outgoing_image_msg_id: 0,
             outgoing_image_phase: OutgoingImagePhase::Idle,
             outgoing_image_send_in_flight: false,
+            group: None,
 
             session,
         };
@@ -873,6 +1046,58 @@ impl TermchatApp {
                 tab.e2e = E2E::new(tab.session.pq_enabled);
             }
         }
+
+        tab
+    }
+
+    fn new_opened_group_tab(&self, group_meta: GroupMeta) -> OpenedTab {
+        let profile_name = format!("group:{}", storage::group_storage_key(&group_meta));
+        let mut tab = self.new_opened_tab(&profile_name);
+
+        tab.meta.kind = TabKind::Group;
+        tab.meta.title = format!("#{}", group_meta.name);
+        tab.meta.profile_name = profile_name.clone();
+        tab.session.profile = profile_name;
+        tab.session.my_dest_b64 = group_meta.my_dest_b64.clone();
+        tab.session.stored_peer = None;
+        tab.session.stored_peer_dest_b64 = None;
+        tab.session.current_peer_addr = None;
+        tab.session.current_peer_dest_b64 = None;
+        tab.session.peer_b32 = None;
+        tab.session.pending_peer_addr = None;
+        tab.session.pending_peer_dest_b64 = None;
+        tab.session.offline_mode = false;
+        tab.session.deaddrop_servers.clear();
+        tab.session.show_deaddrop_panel = false;
+        tab.session.log_lines = vec![
+            format!("Group opened: {}", group_meta.name),
+            "Group chat uses separate identity and live fan-out only.".into(),
+        ];
+        tab.session.bubbles.clear();
+
+        let peers = group_meta
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GroupPeerRuntime {
+                member,
+                conn: None,
+                pending_conn: None,
+                e2e: E2E::new(false),
+                ready: false,
+                authorized: true,
+                connecting: false,
+                last_connect_attempt_ms: 0,
+                heartbeat_last_rx_ms: 0,
+                heartbeat_last_ping_ms: 0,
+            })
+            .collect();
+
+        tab.group = Some(GroupRuntime {
+            meta: group_meta,
+            peers,
+            accept_armed: false,
+        });
 
         tab
     }
@@ -932,54 +1157,79 @@ impl TermchatApp {
     }
 
     fn begin_shutdown(&mut self, target: ShutdownTarget) -> Task<Message> {
-        let quit_frame = self.make_signal_frame("QUIT");
         let mut tasks: Vec<Task<Message>> = Vec::new();
 
         for tab in &mut self.opened_tabs {
             let tab_id = tab.id;
+            let live = tab.live_conn.clone();
+            let pending = tab.pending_conn.clone();
+            let group_conns: Vec<LiveConnection> = tab
+                .group
+                .as_ref()
+                .map(|group| {
+                    group
+                        .peers
+                        .iter()
+                        .flat_map(|peer| [peer.conn.clone(), peer.pending_conn.clone()])
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut sam = tab.sam.clone();
+            let dd = if tab.deaddrop_started {
+                Some(std::sync::Arc::clone(&tab.deaddrop))
+            } else {
+                None
+            };
 
             Self::flush_deaddrop_stats_for_tab(tab, true);
 
-            if let Some(conn) = tab.live_conn.clone() {
-                let quit_frame_clone = quit_frame.clone();
-                tasks.push(Task::perform(
-                    async move {
-                        let _ = conn.send_frame(&quit_frame_clone).await;
-                        conn.close().await.map_err(|e| e.to_string())
-                    },
-                    move |result| Message::CloseFinished(tab_id, result),
-                ));
-            }
-
-            if let Some(conn) = tab.pending_conn.clone() {
-                let quit_frame_clone = quit_frame.clone();
-                tasks.push(Task::perform(
-                    async move {
-                        let _ = conn.send_frame(&quit_frame_clone).await;
-                        conn.close().await.map_err(|e| e.to_string())
-                    },
-                    move |result| Message::CloseFinished(tab_id, result),
-                ));
-            }
-
-            let mut sam = tab.sam.clone();
             tasks.push(Task::perform(
-                async move { sam.close().await.map_err(|e| e.to_string()) },
+                async move {
+                    if let Some(conn) = live {
+                        let quit_live = Frame {
+                            msg_type: MsgType::S,
+                            msg_id: 0,
+                            payload: b"__SIGNAL__:QUIT".to_vec(),
+                        };
+                        let _ = conn.send_frame(&quit_live).await;
+                        sleep(Duration::from_millis(120)).await;
+                        let _ = conn.close().await;
+                    }
+
+                    if let Some(conn) = pending {
+                        let quit_pending = Frame {
+                            msg_type: MsgType::S,
+                            msg_id: 0,
+                            payload: b"__SIGNAL__:QUIT".to_vec(),
+                        };
+                        let _ = conn.send_frame(&quit_pending).await;
+                        sleep(Duration::from_millis(120)).await;
+                        let _ = conn.close().await;
+                    }
+
+                    for conn in group_conns {
+                        let quit_group = Frame {
+                            msg_type: MsgType::S,
+                            msg_id: 0,
+                            payload: b"__SIGNAL__:QUIT".to_vec(),
+                        };
+                        let _ = conn.send_frame(&quit_group).await;
+                        sleep(Duration::from_millis(30)).await;
+                        let _ = conn.close().await;
+                    }
+
+                    if let Some(dd) = dd {
+                        let mut dd = dd.lock().await;
+                        dd.close().await;
+                    }
+
+                    sam.close().await.map_err(|e| e.to_string())
+                },
                 move |result| Message::SamCloseFinished(tab_id, result),
             ));
 
             if tab.deaddrop_started {
-                let dd = std::sync::Arc::clone(&tab.deaddrop);
-
-                tasks.push(Task::perform(
-                    async move {
-                        let mut dd = dd.lock().await;
-                        dd.close().await;
-                        tab_id
-                    },
-                    Message::DeaddropClosed,
-                ));
-
                 tab.deaddrop_started = false;
                 tab.deaddrop_poller_started = false;
                 tab.deaddrop_poll_in_flight = false;
@@ -996,13 +1246,27 @@ impl TermchatApp {
             tab.session.current_peer_addr = None;
             tab.session.peer_b32 = None;
             tab.session.accept_armed = false;
+            if let Some(group) = tab.group.as_mut() {
+                for peer in &mut group.peers {
+                    peer.conn = None;
+                    peer.pending_conn = None;
+                    peer.ready = false;
+                    peer.connecting = false;
+                    peer.heartbeat_last_rx_ms = 0;
+                    peer.heartbeat_last_ping_ms = 0;
+                }
+                group.accept_armed = false;
+            }
         }
 
         self.reset_connection_state();
         self.store_active_runtime();
 
         tasks.push(Task::perform(
-            async move { target },
+            async move {
+                sleep(Duration::from_millis(SHUTDOWN_NOTIFY_GRACE_MS)).await;
+                target
+            },
             Message::ExitAfterNotify,
         ));
         Task::batch(tasks)
@@ -1023,6 +1287,73 @@ impl TermchatApp {
         } else {
             Task::none()
         }
+    }
+
+    fn group_accept_task(&self, tab_id: u64) -> Task<Message> {
+        let sam = self
+            .opened_tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.sam.clone());
+
+        if let Some(sam) = sam {
+            Task::perform(
+                async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
+                move |result| Message::GroupIncomingAccepted(tab_id, result),
+            )
+        } else {
+            Task::none()
+        }
+    }
+
+    fn group_connect_tasks(&mut self, tab_id: u64) -> Vec<Task<Message>> {
+        let Some(idx) = self.find_tab_index_by_id(tab_id) else {
+            return Vec::new();
+        };
+
+        let sam = self.opened_tabs[idx].sam.clone();
+        let Some(group) = self.opened_tabs[idx].group.as_mut() else {
+            return Vec::new();
+        };
+
+        let mut tasks = Vec::new();
+        let now_ms = Self::now_epoch_millis();
+
+        for peer in &mut group.peers {
+            if !peer.authorized {
+                continue;
+            }
+
+            if peer.ready || peer.connecting || peer.conn.is_some() {
+                continue;
+            }
+
+            if peer.last_connect_attempt_ms != 0
+                && now_ms.saturating_sub(peer.last_connect_attempt_ms) < 5_000
+            {
+                continue;
+            }
+
+            peer.connecting = true;
+            peer.last_connect_attempt_ms = now_ms;
+            let peer_b32 = peer.member.b32.clone();
+            let sam_clone = sam.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let conn = sam_clone
+                        .stream_connect(&peer_b32)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok((peer_b32.clone(), conn))
+                },
+                {
+                    let peer_b32 = peer.member.b32.clone();
+                    move |result| Message::GroupConnectFinished(tab_id, peer_b32.clone(), result)
+                },
+            ));
+        }
+
+        tasks
     }
 
     fn active_tab(&self) -> Option<&OpenedTab> {
@@ -1065,6 +1396,15 @@ impl TermchatApp {
         let sidebar_selected = self.session.selected_profile_idx;
         let sidebar_input = self.session.profile_name_input.clone();
         let sidebar_confirm = self.session.sidebar_confirm.clone();
+        let groups = self.session.groups.clone();
+        let selected_group_idx = self.session.selected_group_idx;
+        let group_name_input = self.session.group_name_input.clone();
+        let group_display_name_input = self.session.group_display_name_input.clone();
+        let group_member_name_input = self.session.group_member_name_input.clone();
+        let group_member_b32_input = self.session.group_member_b32_input.clone();
+        let group_invite_string_input = self.session.group_invite_string_input.clone();
+        let group_generated_invite_string = self.session.group_generated_invite_string.clone();
+        let group_status = self.session.group_status.clone();
         let tabs = self.session.tabs.clone();
         let active_idx = self.session.active_tab_idx;
 
@@ -1073,6 +1413,15 @@ impl TermchatApp {
         snapshot.selected_profile_idx = 0;
         snapshot.profile_name_input.clear();
         snapshot.sidebar_confirm = None;
+        snapshot.groups = Vec::new();
+        snapshot.selected_group_idx = None;
+        snapshot.group_name_input.clear();
+        snapshot.group_display_name_input.clear();
+        snapshot.group_member_name_input.clear();
+        snapshot.group_member_b32_input.clear();
+        snapshot.group_invite_string_input.clear();
+        snapshot.group_generated_invite_string.clear();
+        snapshot.group_status.clear();
 
         if let Some(tab) = self.active_tab_mut() {
             tab.session = snapshot;
@@ -1084,6 +1433,15 @@ impl TermchatApp {
         self.session.selected_profile_idx = sidebar_selected;
         self.session.profile_name_input = sidebar_input;
         self.session.sidebar_confirm = sidebar_confirm;
+        self.session.groups = groups;
+        self.session.selected_group_idx = selected_group_idx;
+        self.session.group_name_input = group_name_input;
+        self.session.group_display_name_input = group_display_name_input;
+        self.session.group_member_name_input = group_member_name_input;
+        self.session.group_member_b32_input = group_member_b32_input;
+        self.session.group_invite_string_input = group_invite_string_input;
+        self.session.group_generated_invite_string = group_generated_invite_string;
+        self.session.group_status = group_status;
         self.session.tabs = tabs;
         self.session.active_tab_idx = active_idx;
     }
@@ -1093,6 +1451,15 @@ impl TermchatApp {
         let sidebar_selected = self.session.selected_profile_idx;
         let sidebar_input = self.session.profile_name_input.clone();
         let sidebar_confirm = self.session.sidebar_confirm.clone();
+        let groups = self.session.groups.clone();
+        let selected_group_idx = self.session.selected_group_idx;
+        let group_name_input = self.session.group_name_input.clone();
+        let group_display_name_input = self.session.group_display_name_input.clone();
+        let group_member_name_input = self.session.group_member_name_input.clone();
+        let group_member_b32_input = self.session.group_member_b32_input.clone();
+        let group_invite_string_input = self.session.group_invite_string_input.clone();
+        let group_generated_invite_string = self.session.group_generated_invite_string.clone();
+        let group_status = self.session.group_status.clone();
         let tabs = self.session.tabs.clone();
         let active_idx = self.session.active_tab_idx;
 
@@ -1102,6 +1469,15 @@ impl TermchatApp {
             self.session.selected_profile_idx = sidebar_selected;
             self.session.profile_name_input = sidebar_input;
             self.session.sidebar_confirm = sidebar_confirm;
+            self.session.groups = groups;
+            self.session.selected_group_idx = selected_group_idx;
+            self.session.group_name_input = group_name_input;
+            self.session.group_display_name_input = group_display_name_input;
+            self.session.group_member_name_input = group_member_name_input;
+            self.session.group_member_b32_input = group_member_b32_input;
+            self.session.group_invite_string_input = group_invite_string_input;
+            self.session.group_generated_invite_string = group_generated_invite_string;
+            self.session.group_status = group_status;
             self.session.tabs = tabs;
             self.session.active_tab_idx = active_idx;
         }
@@ -1112,6 +1488,15 @@ impl TermchatApp {
         let sidebar_selected = self.session.selected_profile_idx;
         let sidebar_input = self.session.profile_name_input.clone();
         let sidebar_confirm = self.session.sidebar_confirm.clone();
+        let groups = self.session.groups.clone();
+        let selected_group_idx = self.session.selected_group_idx;
+        let group_name_input = self.session.group_name_input.clone();
+        let group_display_name_input = self.session.group_display_name_input.clone();
+        let group_member_name_input = self.session.group_member_name_input.clone();
+        let group_member_b32_input = self.session.group_member_b32_input.clone();
+        let group_invite_string_input = self.session.group_invite_string_input.clone();
+        let group_generated_invite_string = self.session.group_generated_invite_string.clone();
+        let group_status = self.session.group_status.clone();
 
         self.session.tabs = std::iter::once(Self::new_app_home_tab())
             .chain(self.opened_tabs.iter().map(|t| t.meta.clone()))
@@ -1119,10 +1504,19 @@ impl TermchatApp {
 
         match self.session.active_tab_idx {
             Some(0) | None => {
-                self.session.profiles = sidebar_profiles;
+                self.session.profiles = sidebar_profiles.clone();
                 self.session.selected_profile_idx = sidebar_selected;
-                self.session.profile_name_input = sidebar_input;
-                self.session.sidebar_confirm = sidebar_confirm;
+                self.session.profile_name_input = sidebar_input.clone();
+                self.session.sidebar_confirm = sidebar_confirm.clone();
+                self.session.groups = groups.clone();
+                self.session.selected_group_idx = selected_group_idx;
+                self.session.group_name_input = group_name_input.clone();
+                self.session.group_display_name_input = group_display_name_input.clone();
+                self.session.group_member_name_input = group_member_name_input.clone();
+                self.session.group_member_b32_input = group_member_b32_input.clone();
+                self.session.group_invite_string_input = group_invite_string_input.clone();
+                self.session.group_generated_invite_string = group_generated_invite_string.clone();
+                self.session.group_status = group_status.clone();
                 self.session.active_tab_idx = Some(0);
                 self.session.profile = "__app__".into();
             }
@@ -1134,10 +1528,20 @@ impl TermchatApp {
                         let tabs = self.session.tabs.clone();
 
                         self.session = snapshot;
-                        self.session.profiles = sidebar_profiles;
+                        self.session.profiles = sidebar_profiles.clone();
                         self.session.selected_profile_idx = sidebar_selected;
-                        self.session.profile_name_input = sidebar_input;
-                        self.session.sidebar_confirm = sidebar_confirm;
+                        self.session.profile_name_input = sidebar_input.clone();
+                        self.session.sidebar_confirm = sidebar_confirm.clone();
+                        self.session.groups = groups.clone();
+                        self.session.selected_group_idx = selected_group_idx;
+                        self.session.group_name_input = group_name_input.clone();
+                        self.session.group_display_name_input = group_display_name_input.clone();
+                        self.session.group_member_name_input = group_member_name_input.clone();
+                        self.session.group_member_b32_input = group_member_b32_input.clone();
+                        self.session.group_invite_string_input = group_invite_string_input.clone();
+                        self.session.group_generated_invite_string =
+                            group_generated_invite_string.clone();
+                        self.session.group_status = group_status.clone();
                         self.session.tabs = tabs;
                         self.session.active_tab_idx = Some(visible_idx);
 
@@ -1145,10 +1549,20 @@ impl TermchatApp {
                             tab.meta.has_unread = false;
                         }
                     } else {
-                        self.session.profiles = sidebar_profiles;
+                        self.session.profiles = sidebar_profiles.clone();
                         self.session.selected_profile_idx = sidebar_selected;
-                        self.session.profile_name_input = sidebar_input;
-                        self.session.sidebar_confirm = sidebar_confirm;
+                        self.session.profile_name_input = sidebar_input.clone();
+                        self.session.sidebar_confirm = sidebar_confirm.clone();
+                        self.session.groups = groups.clone();
+                        self.session.selected_group_idx = selected_group_idx;
+                        self.session.group_name_input = group_name_input.clone();
+                        self.session.group_display_name_input = group_display_name_input.clone();
+                        self.session.group_member_name_input = group_member_name_input.clone();
+                        self.session.group_member_b32_input = group_member_b32_input.clone();
+                        self.session.group_invite_string_input = group_invite_string_input.clone();
+                        self.session.group_generated_invite_string =
+                            group_generated_invite_string.clone();
+                        self.session.group_status = group_status.clone();
                         self.session.active_tab_idx = Some(0);
                         self.session.profile = "__app__".into();
                     }
@@ -1158,14 +1572,18 @@ impl TermchatApp {
     }
 
     fn start_tab_runtime_task(&self, tab_idx: usize) -> Task<Message> {
-        let (tab_id, profile_name, sam_host, sam_port, saved_dest_b64) =
+        let (tab_id, tab_kind, profile_name, sam_host, sam_port, saved_dest_b64) =
             if let Some(tab) = self.opened_tabs.get(tab_idx) {
                 (
                     tab.id,
+                    tab.meta.kind,
                     tab.session.profile.clone(),
                     tab.sam.sam_host.clone(),
                     tab.sam.sam_port,
-                    tab.session.my_dest_b64.clone(),
+                    tab.group
+                        .as_ref()
+                        .and_then(|group| group.meta.my_dest_b64.clone())
+                        .or_else(|| tab.session.my_dest_b64.clone()),
                 )
             } else {
                 return Task::none();
@@ -1173,9 +1591,13 @@ impl TermchatApp {
 
         Task::perform(
             async move {
+                let session_label: String = profile_name
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                    .collect();
                 let session_id = format!(
                     "chat_{}_{}",
-                    profile_name,
+                    session_label,
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -1188,6 +1610,16 @@ impl TermchatApp {
                     sam.initialize_transient(session_id)
                         .await
                         .map_err(|e| e.to_string())?
+                } else if tab_kind == TabKind::Group {
+                    if let Some(my_dest_b64) = saved_dest_b64 {
+                        sam.initialize_persistent(session_id, my_dest_b64)
+                            .await
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        sam.initialize_transient(session_id)
+                            .await
+                            .map_err(|e| e.to_string())?
+                    }
                 } else if let Some(my_dest_b64) = saved_dest_b64 {
                     sam.initialize_persistent(session_id, my_dest_b64)
                         .await
@@ -1286,6 +1718,563 @@ impl TermchatApp {
                 return Task::none();
             }
 
+            Message::GroupSelected(idx) => {
+                if idx < state.session.groups.len() {
+                    state.session.selected_group_idx = Some(idx);
+                    state.session.group_display_name_input =
+                        state.session.groups[idx].my_name.clone();
+                    state.session.group_generated_invite_string.clear();
+                    state.session.group_status =
+                        format!("Selected group: {}", state.session.groups[idx].name);
+                }
+                return Task::none();
+            }
+
+            Message::GroupNameInputChanged(value) => {
+                state.session.group_name_input = value;
+                return Task::none();
+            }
+
+            Message::GroupDisplayNameInputChanged(value) => {
+                state.session.group_display_name_input = value;
+                return Task::none();
+            }
+
+            Message::SaveGroupDisplayNamePressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(mut group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                let display_name = state.session.group_display_name_input.trim().to_string();
+                if let Err(err) = Self::validate_group_display_name(&display_name) {
+                    state.session.group_status = err;
+                    return Task::none();
+                }
+
+                group.my_name = display_name.clone();
+                let is_admin = Self::group_is_admin(&group);
+                if is_admin {
+                    group.roster_version = group.roster_version.saturating_add(1);
+                    if let Err(err) = Self::sign_group_roster_if_admin(&mut group) {
+                        state.session.group_status = format!("Group roster signing failed: {err}");
+                        return Task::none();
+                    }
+                }
+
+                match storage::save_group_meta(&group) {
+                    Ok(()) => {
+                        state.session.groups[group_idx] = group.clone();
+                        state.update_open_group_roster(&group);
+                        state.session.group_display_name_input = display_name.clone();
+                        state.session.group_status =
+                            format!("Saved group display name: {display_name}");
+                        if is_admin {
+                            return state.send_group_roster_sync_for_group_task(
+                                &storage::group_storage_key(&group),
+                            );
+                        }
+                        return state.send_group_rename_request_task(
+                            &storage::group_storage_key(&group),
+                            display_name,
+                        );
+                    }
+                    Err(err) => {
+                        state.session.group_status =
+                            format!("Save group display name failed: {err}");
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::GroupMemberNameInputChanged(value) => {
+                state.session.group_member_name_input = value;
+                return Task::none();
+            }
+
+            Message::GroupMemberB32InputChanged(value) => {
+                state.session.group_member_b32_input = value;
+                return Task::none();
+            }
+
+            Message::GroupInviteStringInputChanged(value) => {
+                state.session.group_invite_string_input = value;
+                return Task::none();
+            }
+
+            Message::CreateGroupPressed => {
+                let name = state.session.group_name_input.trim().to_string();
+
+                if name.is_empty() {
+                    state.session.group_status = "Group name cannot be empty.".into();
+                    return Task::none();
+                }
+
+                if state
+                    .session
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.name.eq_ignore_ascii_case(&name))
+                {
+                    state.session.group_status = "That name already exists.".into();
+                    return Task::none();
+                }
+
+                match storage::create_group(&name) {
+                    Ok(group) => {
+                        let group_key = storage::group_storage_key(&group);
+                        state.session.groups.push(group);
+                        state.session.groups.sort_by(|a, b| {
+                            a.name
+                                .to_lowercase()
+                                .cmp(&b.name.to_lowercase())
+                                .then_with(|| {
+                                    storage::group_storage_key(a)
+                                        .cmp(&storage::group_storage_key(b))
+                                })
+                        });
+                        state.session.selected_group_idx = state
+                            .session
+                            .groups
+                            .iter()
+                            .position(|group| storage::group_storage_key(group) == group_key);
+                        state.session.group_display_name_input = state
+                            .session
+                            .selected_group_idx
+                            .and_then(|idx| state.session.groups.get(idx))
+                            .map(|group| group.my_name.clone())
+                            .unwrap_or_default();
+                        state.session.group_name_input.clear();
+                        state.session.group_generated_invite_string.clear();
+                        state.session.group_status = format!("Created group: {name}");
+                    }
+                    Err(err) => {
+                        state.session.group_status = format!("Create group failed: {err}");
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::AddGroupMemberPressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                if group_idx >= state.session.groups.len() {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                }
+
+                let member_name = state.session.group_member_name_input.trim().to_string();
+                let member_b32 = state.session.group_member_b32_input.trim().to_lowercase();
+
+                if member_name.is_empty() {
+                    state.session.group_status = "Member name cannot be empty.".into();
+                    return Task::none();
+                }
+
+                if !Self::is_valid_b32_address(&member_b32) {
+                    state.session.group_status = "Member address must be a b32.i2p address.".into();
+                    return Task::none();
+                }
+
+                let mut group = state.session.groups[group_idx].clone();
+                if !Self::group_is_admin(&group) {
+                    state.session.group_status = "Only the group admin can add members.".into();
+                    return Task::none();
+                }
+
+                if group
+                    .members
+                    .iter()
+                    .any(|member| member.b32.eq_ignore_ascii_case(&member_b32))
+                {
+                    state.session.group_status = "That member address already exists.".into();
+                    return Task::none();
+                }
+
+                group.members.push(GroupMember {
+                    name: member_name.clone(),
+                    b32: member_b32.clone(),
+                });
+                group.roster_version = group.roster_version.saturating_add(1);
+                if let Err(err) = Self::sign_group_roster_if_admin(&mut group) {
+                    state.session.group_status = format!("Group roster signing failed: {err}");
+                    return Task::none();
+                }
+
+                match storage::save_group_meta(&group) {
+                    Ok(()) => {
+                        state.session.groups[group_idx] = group;
+                        let updated_group = state.session.groups[group_idx].clone();
+                        state.update_open_group_roster(&updated_group);
+                        state.session.group_member_name_input.clear();
+                        state.session.group_member_b32_input.clear();
+                        state.session.group_status =
+                            format!("Added {member_name} to group roster.");
+                        return state.send_group_roster_sync_for_group_task(
+                            &storage::group_storage_key(&updated_group),
+                        );
+                    }
+                    Err(err) => {
+                        state.session.group_status = format!("Save group failed: {err}");
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::DeleteGroupMemberPressed(member_idx) => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                if !Self::group_is_admin(&group) {
+                    state.session.group_status = "Only the group admin can delete members.".into();
+                    return Task::none();
+                }
+
+                if member_idx >= group.members.len() {
+                    state.session.group_status = "Selected member is missing.".into();
+                    return Task::none();
+                }
+
+                let member = group.members[member_idx].clone();
+                state.session.sidebar_confirm = Some(SidebarConfirm::DeleteGroupMember {
+                    group_key: storage::group_storage_key(&group),
+                    member_b32: member.b32,
+                    member_name: member.name,
+                });
+
+                return Task::none();
+            }
+
+            Message::DeleteGroupPressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                let group_key = storage::group_storage_key(&group);
+                if state.is_group_open_in_any_tab(&group_key) {
+                    state.session.group_status =
+                        format!("Close #{} before deleting the group.", group.name);
+                    return Task::none();
+                }
+
+                state.session.sidebar_confirm = Some(SidebarConfirm::DeleteGroup {
+                    key: group_key,
+                    name: group.name,
+                });
+
+                return Task::none();
+            }
+
+            Message::ExportGroupInvitePressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(group) = state.session.groups.get(group_idx) else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                if group.my_b32.is_none() {
+                    state.session.group_status =
+                        "Open this group once before exporting its invite.".into();
+                    return Task::none();
+                }
+
+                let file_name = format!("{}-group-invite.tcginvite", group.name);
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("IcedComm-I2P group invite", &["tcginvite"])
+                            .set_file_name(file_name)
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::GroupInviteExportPathChosen,
+                );
+            }
+
+            Message::ImportGroupInvitePressed => {
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("IcedComm-I2P group invite", &["tcginvite", "json"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::GroupInviteImportPathChosen,
+                );
+            }
+
+            Message::GenerateGroupInvitePressed | Message::CopyGroupInviteStringPressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                if !Self::group_is_admin(&group) {
+                    state.session.group_status =
+                        "Only the group admin can generate invites.".into();
+                    return Task::none();
+                }
+
+                match Self::encode_group_invite_string(&group) {
+                    Ok((updated_group, invite_string)) => {
+                        if let Some(idx) = state.session.groups.iter().position(|existing| {
+                            storage::group_storage_key(existing)
+                                == storage::group_storage_key(&updated_group)
+                        }) {
+                            state.session.groups[idx] = updated_group.clone();
+                        }
+                        state.update_open_group_roster(&updated_group);
+                        state.session.group_generated_invite_string = invite_string;
+                        state.session.group_status =
+                            "Generated new single-use group invite.".into();
+                    }
+                    Err(err) => {
+                        state.session.group_status =
+                            format!("Group invite string export failed: {err}");
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::CopyGeneratedGroupInvitePressed => {
+                if state
+                    .session
+                    .group_generated_invite_string
+                    .trim()
+                    .is_empty()
+                {
+                    state.session.group_status = "Generate a group invite first.".into();
+                    return Task::none();
+                }
+
+                state.copy_text_to_clipboard(
+                    state.session.group_generated_invite_string.clone(),
+                    "new group invite",
+                );
+                state.session.group_status = "Copied generated group invite.".into();
+                return Task::none();
+            }
+
+            Message::ImportGroupInviteStringPressed => {
+                let invite_string = state.session.group_invite_string_input.trim().to_string();
+
+                if invite_string.is_empty() {
+                    state.session.group_status = "Paste a group invite string first.".into();
+                    return Task::none();
+                }
+
+                match Self::import_group_invite_string(&invite_string) {
+                    Ok(group_key) => match storage::load_groups() {
+                        Ok(groups) => {
+                            state.session.groups = groups;
+                            state.session.selected_group_idx =
+                                state.session.groups.iter().position(|group| {
+                                    storage::group_storage_key(group) == group_key
+                                });
+                            state.session.group_display_name_input = state
+                                .session
+                                .selected_group_idx
+                                .and_then(|idx| state.session.groups.get(idx))
+                                .map(|group| group.my_name.clone())
+                                .unwrap_or_default();
+                            state.session.group_generated_invite_string.clear();
+                            if let Some(group) = state
+                                .session
+                                .groups
+                                .iter()
+                                .find(|group| storage::group_storage_key(group) == group_key)
+                                .cloned()
+                            {
+                                state.update_open_group_roster(&group);
+                            }
+                            let display_name = state
+                                .session
+                                .selected_group_idx
+                                .and_then(|idx| state.session.groups.get(idx))
+                                .map(|group| group.name.clone())
+                                .unwrap_or_else(|| group_key.clone());
+                            state.session.group_invite_string_input.clear();
+                            state.session.group_status =
+                                format!("Imported group invite string: {display_name}");
+                            return state.send_group_roster_sync_for_group_task(&group_key);
+                        }
+                        Err(err) => {
+                            state.session.group_status = format!("Reload groups failed: {err}");
+                        }
+                    },
+                    Err(err) => {
+                        state.session.group_status =
+                            format!("Group invite string import failed: {err}");
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::OpenGroupPressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                let group_key = storage::group_storage_key(&group);
+                let group_name = group.name.clone();
+                state.open_or_focus_tab_for_group(&group_key);
+                state.session.group_status = format!("Opened group: {group_name}");
+
+                if let Some(visible_idx) = state.session.active_tab_idx {
+                    if let Some(real_idx) = Self::visible_to_real_tab_index(visible_idx) {
+                        return Task::batch(vec![
+                            operation::snap_to_end(state.session.logs_scroll_id.clone()),
+                            state.ensure_tab_runtime_started(real_idx),
+                        ]);
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::GroupInviteExportPathChosen(path_opt) => {
+                let Some(path) = path_opt else {
+                    state.session.group_status = "Group invite export cancelled.".into();
+                    return Task::none();
+                };
+
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+
+                let Some(group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+
+                return Task::perform(
+                    async move {
+                        Self::export_group_invite_file(&path, &group)
+                            .map(|updated_group| (path, updated_group))
+                    },
+                    Message::GroupInviteExportFinished,
+                );
+            }
+
+            Message::GroupInviteImportPathChosen(path_opt) => {
+                let Some(path) = path_opt else {
+                    state.session.group_status = "Group invite import cancelled.".into();
+                    return Task::none();
+                };
+
+                return Task::perform(
+                    async move { Self::import_group_invite_file(&path) },
+                    Message::GroupInviteImportFinished,
+                );
+            }
+
+            Message::GroupInviteExportFinished(result) => {
+                state.session.group_status = match result {
+                    Ok((path, updated_group)) => {
+                        if let Some(idx) = state.session.groups.iter().position(|group| {
+                            storage::group_storage_key(group)
+                                == storage::group_storage_key(&updated_group)
+                        }) {
+                            state.session.groups[idx] = updated_group.clone();
+                        }
+                        state.update_open_group_roster(&updated_group);
+                        format!("Exported group invite to {}", path.display())
+                    }
+                    Err(err) => format!("Group invite export failed: {err}"),
+                };
+                return Task::none();
+            }
+
+            Message::GroupInviteImportFinished(result) => {
+                match result {
+                    Ok(group_key) => match storage::load_groups() {
+                        Ok(groups) => {
+                            state.session.groups = groups;
+                            state.session.selected_group_idx =
+                                state.session.groups.iter().position(|group| {
+                                    storage::group_storage_key(group) == group_key
+                                });
+                            state.session.group_display_name_input = state
+                                .session
+                                .selected_group_idx
+                                .and_then(|idx| state.session.groups.get(idx))
+                                .map(|group| group.my_name.clone())
+                                .unwrap_or_default();
+                            state.session.group_generated_invite_string.clear();
+                            if let Some(group) = state
+                                .session
+                                .groups
+                                .iter()
+                                .find(|group| storage::group_storage_key(group) == group_key)
+                                .cloned()
+                            {
+                                state.update_open_group_roster(&group);
+                            }
+                            let display_name = state
+                                .session
+                                .selected_group_idx
+                                .and_then(|idx| state.session.groups.get(idx))
+                                .map(|group| group.name.clone())
+                                .unwrap_or_else(|| group_key.clone());
+                            state.session.group_status =
+                                format!("Imported group invite: {display_name}");
+                            return state.send_group_roster_sync_for_group_task(&group_key);
+                        }
+                        Err(err) => {
+                            state.session.group_status = format!("Reload groups failed: {err}");
+                        }
+                    },
+                    Err(err) => {
+                        state.session.group_status = format!("Group invite import failed: {err}");
+                    }
+                }
+                return Task::none();
+            }
+
             Message::TabSelected(idx) => {
                 state.store_active_runtime();
 
@@ -1314,6 +2303,25 @@ impl TermchatApp {
                         .position(|p| p.name == state.opened_tabs[real_idx].meta.profile_name)
                     {
                         state.session.selected_profile_idx = profile_idx;
+                    }
+
+                    if state.opened_tabs[real_idx].meta.kind == TabKind::Group {
+                        if let Some(group_key) = state.opened_tabs[real_idx]
+                            .meta
+                            .profile_name
+                            .strip_prefix("group:")
+                        {
+                            state.session.selected_group_idx =
+                                state.session.groups.iter().position(|group| {
+                                    storage::group_storage_key(group) == group_key
+                                });
+                            state.session.group_display_name_input = state
+                                .session
+                                .selected_group_idx
+                                .and_then(|idx| state.session.groups.get(idx))
+                                .map(|group| group.my_name.clone())
+                                .unwrap_or_default();
+                        }
                     }
 
                     state.refresh_visible_from_active_tab();
@@ -1358,6 +2366,18 @@ impl TermchatApp {
 
                         tab.e2e = E2E::new(tab.session.pq_enabled);
 
+                        if let Some(group) = tab.group.as_mut() {
+                            for peer in &mut group.peers {
+                                peer.conn = None;
+                                peer.pending_conn = None;
+                                peer.ready = false;
+                                peer.connecting = false;
+                                peer.heartbeat_last_rx_ms = 0;
+                                peer.heartbeat_last_ping_ms = 0;
+                            }
+                            group.accept_armed = false;
+                        }
+
                         if tab.deaddrop_started {
                             let dd = std::sync::Arc::clone(&tab.deaddrop);
                             let tab_id = tab.id;
@@ -1393,6 +2413,30 @@ impl TermchatApp {
                                     selected_profile_idx: state.session.selected_profile_idx,
                                     profile_name_input: state.session.profile_name_input.clone(),
                                     sidebar_confirm: state.session.sidebar_confirm.clone(),
+                                    groups: state.session.groups.clone(),
+                                    selected_group_idx: state.session.selected_group_idx,
+                                    group_name_input: state.session.group_name_input.clone(),
+                                    group_display_name_input: state
+                                        .session
+                                        .group_display_name_input
+                                        .clone(),
+                                    group_member_name_input: state
+                                        .session
+                                        .group_member_name_input
+                                        .clone(),
+                                    group_member_b32_input: state
+                                        .session
+                                        .group_member_b32_input
+                                        .clone(),
+                                    group_invite_string_input: state
+                                        .session
+                                        .group_invite_string_input
+                                        .clone(),
+                                    group_generated_invite_string: state
+                                        .session
+                                        .group_generated_invite_string
+                                        .clone(),
+                                    group_status: state.session.group_status.clone(),
                                     tabs: vec![Self::new_app_home_tab()],
                                     active_tab_idx: Some(0),
                                     bubbles: vec![],
@@ -1456,8 +2500,13 @@ impl TermchatApp {
                     .profiles
                     .iter()
                     .any(|p| p.name.eq_ignore_ascii_case(&name))
+                    || state
+                        .session
+                        .groups
+                        .iter()
+                        .any(|group| group.name.eq_ignore_ascii_case(&name))
                 {
-                    state.post_system("Profile already exists.");
+                    state.post_system("That name already exists.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
@@ -1584,6 +2633,111 @@ impl TermchatApp {
                             }
                         }
                     }
+                    SidebarConfirm::DeleteGroup { key, name } => {
+                        if state.is_group_open_in_any_tab(&key) {
+                            state.session.group_status =
+                                format!("Close #{name} before deleting the group.");
+                            return Task::none();
+                        }
+
+                        match storage::delete_group(&key) {
+                            Ok(()) => {
+                                if let Some(group_idx) = state
+                                    .session
+                                    .groups
+                                    .iter()
+                                    .position(|group| storage::group_storage_key(group) == key)
+                                {
+                                    state.session.groups.remove(group_idx);
+                                    state.session.selected_group_idx =
+                                        if state.session.groups.is_empty() {
+                                            None
+                                        } else {
+                                            Some(group_idx.min(state.session.groups.len() - 1))
+                                        };
+                                    state.session.group_display_name_input = state
+                                        .session
+                                        .selected_group_idx
+                                        .and_then(|idx| state.session.groups.get(idx))
+                                        .map(|group| group.my_name.clone())
+                                        .unwrap_or_default();
+                                }
+                                state.session.group_generated_invite_string.clear();
+                                state.session.group_status = format!("Deleted group: {name}");
+                                return Task::none();
+                            }
+                            Err(err) => {
+                                state.session.group_status = format!("Delete group failed: {err}");
+                                return Task::none();
+                            }
+                        }
+                    }
+                    SidebarConfirm::DeleteGroupMember {
+                        group_key,
+                        member_b32,
+                        member_name,
+                    } => {
+                        let Some(group_idx) = state
+                            .session
+                            .groups
+                            .iter()
+                            .position(|group| storage::group_storage_key(group) == group_key)
+                        else {
+                            state.session.group_status = "Selected group is missing.".into();
+                            return Task::none();
+                        };
+
+                        let Some(mut group) = state.session.groups.get(group_idx).cloned() else {
+                            state.session.group_status = "Selected group is missing.".into();
+                            return Task::none();
+                        };
+
+                        if !Self::group_is_admin(&group) {
+                            state.session.group_status =
+                                "Only the group admin can delete members.".into();
+                            return Task::none();
+                        }
+
+                        let Some(member_idx) = group
+                            .members
+                            .iter()
+                            .position(|member| member.b32.eq_ignore_ascii_case(&member_b32))
+                        else {
+                            state.session.group_status = "Selected member is missing.".into();
+                            return Task::none();
+                        };
+
+                        let removed = group.members.remove(member_idx);
+                        group.issued_invites.retain(|invite| {
+                            !invite
+                                .redeemed_b32
+                                .as_deref()
+                                .map(|b32| b32.eq_ignore_ascii_case(&removed.b32))
+                                .unwrap_or(false)
+                        });
+                        group.roster_version = group.roster_version.saturating_add(1);
+                        if let Err(err) = Self::sign_group_roster_if_admin(&mut group) {
+                            state.session.group_status =
+                                format!("Group roster signing failed: {err}");
+                            return Task::none();
+                        }
+
+                        match storage::save_group_meta(&group) {
+                            Ok(()) => {
+                                state.session.groups[group_idx] = group.clone();
+                                state.update_open_group_roster(&group);
+                                state.session.group_status =
+                                    format!("Deleted member: {member_name}");
+                                return state.send_group_roster_sync_for_group_task(
+                                    &storage::group_storage_key(&group),
+                                );
+                            }
+                            Err(err) => {
+                                state.session.group_status = format!("Save group failed: {err}");
+                                return Task::none();
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1596,6 +2750,71 @@ impl TermchatApp {
                 let trimmed = state.session.input.trim().to_string();
 
                 if !trimmed.is_empty() {
+                    let outgoing_text =
+                        Self::compose_reply_text(state.session.reply_to.as_ref(), &trimmed);
+
+                    if state.active_tab_is_group() {
+                        let tab_id = match state.active_tab() {
+                            Some(tab) => tab.id,
+                            None => return Task::none(),
+                        };
+
+                        let msg_id = state.generate_msg_id();
+                        let mut tasks = Vec::new();
+                        let mut sent_count = 0usize;
+                        let mut expected_acks = Vec::new();
+
+                        if let Some(tab) = state.active_tab_mut() {
+                            let Some(group) = tab.group.as_mut() else {
+                                return Task::none();
+                            };
+
+                            for peer in &group.peers {
+                                if !peer.ready || !peer.authorized {
+                                    continue;
+                                }
+
+                                let Some(conn) = peer.conn.clone() else {
+                                    continue;
+                                };
+
+                                let frame = Frame {
+                                    msg_type: MsgType::U,
+                                    msg_id,
+                                    payload: peer.e2e.encrypt(outgoing_text.as_bytes()),
+                                };
+                                sent_count += 1;
+                                expected_acks.push(peer.member.b32.to_ascii_lowercase());
+                                tasks.push(Task::perform(
+                                    async move {
+                                        conn.send_frame(&frame).await.map_err(|e| e.to_string())
+                                    },
+                                    move |result| Message::SendFinished(tab_id, result),
+                                ));
+                            }
+                        }
+
+                        if sent_count == 0 {
+                            state.post_system("No ready group members.");
+                            state.store_active_runtime();
+                            return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                        }
+
+                        state.session.bubbles.push(Bubble::group_me_with_id(
+                            outgoing_text.clone(),
+                            msg_id,
+                            expected_acks,
+                        ));
+                        state.session.input.clear();
+                        state.session.reply_to = None;
+                        state.store_active_runtime();
+
+                        tasks.push(operation::snap_to_end(
+                            state.session.messages_scroll_id.clone(),
+                        ));
+                        return Task::batch(tasks);
+                    }
+
                     if state.active_live_conn().is_some() && !state.session.live_ready {
                         state.post_system("Live connection is not ready yet. Wait for secure session to be established.");
                         state.store_active_runtime();
@@ -1610,8 +2829,8 @@ impl TermchatApp {
 
                         let enc_payload = state
                             .active_tab()
-                            .map(|t| t.e2e.encrypt(trimmed.as_bytes()))
-                            .unwrap_or_else(|| trimmed.as_bytes().to_vec());
+                            .map(|t| t.e2e.encrypt(outgoing_text.as_bytes()))
+                            .unwrap_or_else(|| outgoing_text.as_bytes().to_vec());
 
                         let msg_id = state.generate_msg_id();
 
@@ -1624,9 +2843,10 @@ impl TermchatApp {
                         state
                             .session
                             .bubbles
-                            .push(Bubble::me_with_id(trimmed, msg_id));
+                            .push(Bubble::me_with_id(outgoing_text, msg_id));
 
                         state.session.input.clear();
+                        state.session.reply_to = None;
                         state.store_active_runtime();
 
                         return Task::batch(vec![
@@ -1700,7 +2920,7 @@ impl TermchatApp {
                             let frame = Frame {
                                 msg_type: MsgType::U,
                                 msg_id,
-                                payload: tab.e2e.encrypt(trimmed.as_bytes()),
+                                payload: tab.e2e.encrypt(outgoing_text.as_bytes()),
                             };
 
                             let key = Self::offline_directional_key(
@@ -1736,12 +2956,13 @@ impl TermchatApp {
                             )
                         };
 
-                        state
-                            .session
-                            .bubbles
-                            .push(Bubble::me_offline_with_id(trimmed.clone(), offline_msg_id));
+                        state.session.bubbles.push(Bubble::me_offline_with_id(
+                            outgoing_text.clone(),
+                            offline_msg_id,
+                        ));
 
                         state.session.input.clear();
+                        state.session.reply_to = None;
                         state.store_active_runtime();
 
                         return Task::batch(vec![
@@ -1858,15 +3079,17 @@ impl TermchatApp {
                             move |result| Message::QuitSignalSent(tab_id, result),
                         ));
 
+                        let close_conn = conn.clone();
                         tasks.push(Task::perform(
-                            async move { conn.close().await.map_err(|e| e.to_string()) },
+                            async move { close_conn.close().await.map_err(|e| e.to_string()) },
                             move |result| Message::CloseFinished(tab_id, result),
                         ));
                     }
 
                     if let Some(conn) = pending {
+                        let close_conn = conn.clone();
                         tasks.push(Task::perform(
-                            async move { conn.close().await.map_err(|e| e.to_string()) },
+                            async move { close_conn.close().await.map_err(|e| e.to_string()) },
                             move |result| Message::CloseFinished(tab_id, result),
                         ));
                     }
@@ -1935,8 +3158,9 @@ impl TermchatApp {
                     ];
 
                     if let Some(conn) = pending {
+                        let close_conn = conn.clone();
                         tasks.push(Task::perform(
-                            async move { conn.close().await.map_err(|e| e.to_string()) },
+                            async move { close_conn.close().await.map_err(|e| e.to_string()) },
                             move |result| Message::CloseFinished(tab_id, result),
                         ));
                     }
@@ -2059,6 +3283,46 @@ impl TermchatApp {
                 state.copy_peer_b32_to_clipboard();
                 state.store_active_runtime();
                 return operation::snap_to_end(state.session.logs_scroll_id.clone());
+            }
+
+            Message::CopyBubbleTextPressed(idx) => {
+                let Some(text) = state.session.bubbles.get(idx).and_then(|bubble| {
+                    if let BubbleContent::Text(value) = &bubble.content {
+                        Some(display_reply_text(value))
+                    } else {
+                        None
+                    }
+                }) else {
+                    state.post_system("Message text is not available.");
+                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                };
+
+                state.copy_text_to_clipboard(text, "message text");
+                state.store_active_runtime();
+                return operation::snap_to_end(state.session.logs_scroll_id.clone());
+            }
+
+            Message::ReplyBubblePressed(idx) => {
+                let Some((author, text)) = state.session.bubbles.get(idx).and_then(|bubble| {
+                    if let BubbleContent::Text(value) = &bubble.content {
+                        Some((bubble.author.clone(), reply_source_text(value)))
+                    } else {
+                        None
+                    }
+                }) else {
+                    state.post_system("Message text is not available for reply.");
+                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                };
+
+                state.session.reply_to = Some(ReplyDraft { author, text });
+                state.store_active_runtime();
+                return operation::snap_to_end(state.session.messages_scroll_id.clone());
+            }
+
+            Message::CancelReplyPressed => {
+                state.session.reply_to = None;
+                state.store_active_runtime();
+                return Task::none();
             }
 
             Message::ActionParamChanged(value) => {
@@ -2205,6 +3469,12 @@ impl TermchatApp {
                 return operation::snap_to_end(state.session.messages_scroll_id.clone());
             }
 
+            Message::ToggleGroupPanelPressed => {
+                state.session.show_group_panel = !state.session.show_group_panel;
+                state.store_active_runtime();
+                return Task::none();
+            }
+
             Message::DdServerInputChanged(value) => {
                 state.session.deaddrop_server_input = value;
                 state.store_active_runtime();
@@ -2325,6 +3595,8 @@ impl TermchatApp {
             Message::SamInitialized(tab_id, result) => match result {
                 Ok((sam, init)) => {
                     let mut profile_name: Option<String> = None;
+                    let mut group_name: Option<String> = None;
+                    let mut group_old_key: Option<String> = None;
 
                     if let Some(tab) = state.tab_by_id_mut(tab_id) {
                         profile_name = Some(tab.session.profile.clone());
@@ -2348,12 +3620,69 @@ impl TermchatApp {
 
                         tab.meta.initializing = false;
                         tab.meta.initialized = true;
+
+                        if let Some(group) = tab.group.as_mut() {
+                            let old_key = storage::group_storage_key(&group.meta);
+                            group.meta.my_dest_b64 = Some(init.my_dest_b64.clone());
+                            group.meta.my_b32 = Some(init.my_b32.clone());
+                            if group.meta.owner_b32.is_none() && group.meta.join_token.is_none() {
+                                group.meta.owner_b32 = Some(init.my_b32.clone());
+                            }
+                            if let Some(owner_b32) = group.meta.owner_b32.clone() {
+                                group.meta.id = owner_b32;
+                            }
+                            if let Err(err) = Self::sign_group_roster_if_admin(&mut group.meta) {
+                                tab.session
+                                    .log_lines
+                                    .push(format!("Group roster signing failed: {err}"));
+                            }
+                            let new_key = storage::group_storage_key(&group.meta);
+                            let new_profile_name = format!("group:{new_key}");
+                            tab.meta.profile_name = new_profile_name.clone();
+                            tab.session.profile = new_profile_name;
+                            group.accept_armed = true;
+                            group_name = Some(group.meta.name.clone());
+                            group_old_key = Some(old_key);
+                            tab.session
+                                .log_lines
+                                .push(format!("Group address: {}", init.my_b32));
+                        }
                     } else {
                         return Task::none();
                     }
 
+                    if group_name.is_some() {
+                        if let Some(group_meta) = state
+                            .opened_tabs
+                            .iter()
+                            .find(|tab| tab.id == tab_id)
+                            .and_then(|tab| tab.group.as_ref().map(|group| group.meta.clone()))
+                        {
+                            if let Err(err) = storage::save_group_meta(&group_meta) {
+                                state.session.group_status =
+                                    format!("Save group metadata failed: {err}");
+                            }
+                            let new_key = storage::group_storage_key(&group_meta);
+
+                            if let Some(idx) = state.session.groups.iter().position(|group| {
+                                storage::group_storage_key(group) == new_key
+                                    || group_old_key
+                                        .as_deref()
+                                        .map(|old_key| storage::group_storage_key(group) == old_key)
+                                        .unwrap_or(false)
+                            }) {
+                                state.session.groups[idx] = group_meta;
+                            }
+                            if let Some(old_key) = group_old_key {
+                                if old_key != new_key {
+                                    let _ = storage::delete_group(&old_key);
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(name) = profile_name {
-                        if name != "default" {
+                        if name != "default" && !name.starts_with("group:") {
                             state.save_active_contact_meta_for_name(&name);
                         }
                     }
@@ -2364,6 +3693,19 @@ impl TermchatApp {
 
                     if state.active_tab().map(|t| t.id) == Some(tab_id) {
                         state.load_active_runtime();
+                    }
+
+                    let is_group_tab = state
+                        .opened_tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .map(|tab| tab.meta.kind == TabKind::Group)
+                        .unwrap_or(false);
+
+                    if is_group_tab {
+                        let mut tasks = state.group_connect_tasks(tab_id);
+                        tasks.push(state.group_accept_task(tab_id));
+                        return Task::batch(tasks);
                     }
 
                     return state.accept_task(tab_id);
@@ -2384,6 +3726,102 @@ impl TermchatApp {
                     return Task::none();
                 }
             },
+
+            Message::GroupConnectFinished(tab_id, member_b32, result) => {
+                let is_active = state.active_tab().map(|t| t.id) == Some(tab_id);
+
+                match result {
+                    Ok((_peer, conn)) => {
+                        let msg_id_s = state.generate_msg_id();
+                        let msg_id_k = state.generate_msg_id();
+                        let mut send_task: Option<Task<Message>> = None;
+
+                        if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            let Some(group) = tab.group.as_mut() else {
+                                return Task::none();
+                            };
+
+                            let Some(peer) = group
+                                .peers
+                                .iter_mut()
+                                .find(|peer| peer.member.b32 == member_b32)
+                            else {
+                                return Task::none();
+                            };
+
+                            peer.connecting = false;
+                            peer.pending_conn = None;
+                            peer.e2e = E2E::new(false);
+                            peer.conn = Some(conn.clone());
+                            peer.ready = false;
+                            peer.heartbeat_last_rx_ms = 0;
+                            peer.heartbeat_last_ping_ms = 0;
+
+                            tab.session
+                                .log_lines
+                                .push(format!("Group handshake sent to {}.", peer.member.name));
+
+                            if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
+                                let line = format!("{my_dest_b64}\n");
+                                let frame_s = Frame {
+                                    msg_type: MsgType::S,
+                                    msg_id: msg_id_s,
+                                    payload: my_dest_b64.into_bytes(),
+                                };
+                                let frame_k = Frame {
+                                    msg_type: MsgType::K,
+                                    msg_id: msg_id_k,
+                                    payload: peer.e2e.public_bytes(),
+                                };
+
+                                send_task = Some(Task::perform(
+                                    async move {
+                                        conn.send_raw_line(&line)
+                                            .await
+                                            .map_err(|e| e.to_string())?;
+                                        conn.send_frame(&frame_s)
+                                            .await
+                                            .map_err(|e| e.to_string())?;
+                                        conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
+                                    },
+                                    move |result| Message::SendFinished(tab_id, result),
+                                ));
+                            }
+                        }
+
+                        if is_active {
+                            state.load_active_runtime();
+                        }
+
+                        if let Some(task) = send_task {
+                            return task;
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            if let Some(group) = tab.group.as_mut() {
+                                if let Some(peer) = group
+                                    .peers
+                                    .iter_mut()
+                                    .find(|peer| peer.member.b32 == member_b32)
+                                {
+                                    peer.connecting = false;
+                                }
+                            }
+
+                            tab.session
+                                .log_lines
+                                .push(format!("Group connect failed for {member_b32}: {err}"));
+                        }
+                    }
+                }
+
+                if is_active {
+                    state.load_active_runtime();
+                }
+
+                return Task::none();
+            }
 
             Message::ConnectFinished(tab_id, result) => {
                 match result {
@@ -2467,6 +3905,116 @@ impl TermchatApp {
 
                 return Task::none();
             }
+
+            Message::GroupIncomingAccepted(tab_id, result) => match result {
+                Ok(incoming) => {
+                    let msg_id_s = state.generate_msg_id();
+                    let msg_id_k = state.generate_msg_id();
+                    let mut accepted_conn: Option<LiveConnection> = None;
+                    let mut frames: Option<(String, Frame, Frame)> = None;
+                    let is_active = state.active_tab().map(|t| t.id) == Some(tab_id);
+
+                    if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                        let Some(group) = tab.group.as_mut() else {
+                            return Task::none();
+                        };
+
+                        let peer_idx = if let Some(peer_idx) = group
+                            .peers
+                            .iter()
+                            .position(|peer| peer.member.b32 == incoming.peer_b32)
+                        {
+                            tab.session.log_lines.push(format!(
+                                "Accepted group connection from {}.",
+                                group.peers[peer_idx].member.name
+                            ));
+                            peer_idx
+                        } else {
+                            let member_name =
+                                format!("member-{}", short_b32(Some(&incoming.peer_b32)));
+                            let member = GroupMember {
+                                name: member_name.clone(),
+                                b32: incoming.peer_b32.clone(),
+                            };
+
+                            tab.session.log_lines.push(format!(
+                                "Provisional group caller {member_name}; awaiting invite proof."
+                            ));
+
+                            group.peers.push(GroupPeerRuntime {
+                                member,
+                                conn: None,
+                                pending_conn: None,
+                                e2e: E2E::new(false),
+                                ready: false,
+                                authorized: false,
+                                connecting: false,
+                                last_connect_attempt_ms: 0,
+                                heartbeat_last_rx_ms: 0,
+                                heartbeat_last_ping_ms: 0,
+                            });
+
+                            group.peers.len() - 1
+                        };
+
+                        let peer = &mut group.peers[peer_idx];
+                        peer.pending_conn = None;
+                        peer.conn = Some(incoming.conn.clone());
+                        peer.e2e = E2E::new(false);
+                        peer.ready = false;
+                        peer.connecting = false;
+                        peer.heartbeat_last_rx_ms = 0;
+                        peer.heartbeat_last_ping_ms = 0;
+
+                        if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
+                            let line = format!("{my_dest_b64}\n");
+                            let frame_s = Frame {
+                                msg_type: MsgType::S,
+                                msg_id: msg_id_s,
+                                payload: my_dest_b64.into_bytes(),
+                            };
+                            let frame_k = Frame {
+                                msg_type: MsgType::K,
+                                msg_id: msg_id_k,
+                                payload: peer.e2e.public_bytes(),
+                            };
+                            accepted_conn = Some(incoming.conn.clone());
+                            frames = Some((line, frame_s, frame_k));
+                        }
+                    }
+
+                    let mut tasks = vec![state.group_accept_task(tab_id)];
+                    if let (Some(conn), Some((line, frame_s, frame_k))) = (accepted_conn, frames) {
+                        tasks.push(Task::perform(
+                            async move {
+                                conn.send_raw_line(&line).await.map_err(|e| e.to_string())?;
+                                conn.send_frame(&frame_s).await.map_err(|e| e.to_string())?;
+                                conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
+                            },
+                            move |result| Message::SendFinished(tab_id, result),
+                        ));
+                    }
+
+                    if is_active {
+                        state.load_active_runtime();
+                    }
+
+                    return Task::batch(tasks);
+                }
+                Err(err) => {
+                    if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                        tab.session
+                            .log_lines
+                            .push(format!("Group accept failed: {err}"));
+                    }
+
+                    if state.active_tab().map(|t| t.id) == Some(tab_id) {
+                        state.load_active_runtime();
+                    }
+
+                    return state.group_accept_task(tab_id);
+                }
+            },
 
             Message::IncomingAccepted(tab_id, result) => {
                 match result {
@@ -2765,6 +4313,8 @@ impl TermchatApp {
                     timestamp_utc: Self::now_utc_hms(),
                     msg_id: Some(msg_id),
                     delivered: false,
+                    group_expected_acks: Vec::new(),
+                    group_received_acks: Vec::new(),
                 });
 
                 if let Some(tab) = state.active_tab_mut() {
@@ -4103,10 +5653,53 @@ impl TermchatApp {
             Some(profile) if profile.persistent => !state.is_profile_open_in_any_tab(&profile.name),
             _ => false,
         };
-        let sidebar_idle = state.session.sidebar_confirm.is_none();
-        let sidebar_ops_allowed = delete_allowed && sidebar_idle;
+        let profile_confirm_active = matches!(
+            state.session.sidebar_confirm,
+            Some(SidebarConfirm::DeleteProfile(_) | SidebarConfirm::ResetProfile(_))
+        );
+        let group_delete_confirm_active = matches!(
+            state.session.sidebar_confirm,
+            Some(SidebarConfirm::DeleteGroup { .. })
+        );
+        let group_member_confirm_active = matches!(
+            state.session.sidebar_confirm,
+            Some(SidebarConfirm::DeleteGroupMember { .. })
+        );
+        let profile_buttons_allowed = !profile_confirm_active;
+        let profile_ops_allowed = delete_allowed && profile_buttons_allowed;
+        let group_buttons_allowed = !group_delete_confirm_active;
+        let selected_group = state
+            .session
+            .selected_group_idx
+            .and_then(|idx| state.session.groups.get(idx));
+        let group_selected = selected_group.is_some();
+        let selected_group_is_admin = selected_group.map(Self::group_is_admin).unwrap_or(false);
+        let group_delete_allowed = selected_group
+            .map(|group| !state.is_group_open_in_any_tab(&storage::group_storage_key(group)))
+            .unwrap_or(false);
+        let selected_group_role = if selected_group_is_admin {
+            "Owner"
+        } else {
+            "Member"
+        };
+        let selected_group_total_known = selected_group
+            .map(|group| group.members.len().saturating_add(1))
+            .unwrap_or(0);
+        let active_group_member_b32s: Vec<String> = state
+            .active_tab()
+            .and_then(|tab| tab.group.as_ref())
+            .map(|runtime| {
+                runtime
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.ready && peer.authorized)
+                    .map(|peer| peer.member.b32.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let active_group_peer_count = active_group_member_b32s.len();
 
-        let sidebar_confirm = match &state.session.sidebar_confirm {
+        let profile_sidebar_confirm = match &state.session.sidebar_confirm {
             Some(SidebarConfirm::DeleteProfile(name)) => column![
                 text(format!("Delete profile {name}?")).size(12),
                 row![
@@ -4137,7 +5730,26 @@ impl TermchatApp {
                 .spacing(6)
             ]
             .spacing(6),
-            None => column![],
+            _ => column![],
+        };
+
+        let group_delete_confirm = match &state.session.sidebar_confirm {
+            Some(SidebarConfirm::DeleteGroup { name, .. }) => column![
+                text(format!("Delete group #{name}?")).size(12),
+                row![
+                    button(text("Yes").size(12))
+                        .padding([4, 8])
+                        .style(app_button_style)
+                        .on_press(Message::SidebarConfirmYes),
+                    button(text("No").size(12))
+                        .padding([4, 8])
+                        .style(app_button_style)
+                        .on_press(Message::SidebarConfirmNo),
+                ]
+                .spacing(6)
+            ]
+            .spacing(6),
+            _ => column![],
         };
 
         let profile_list = state.session.profiles.iter().enumerate().fold(
@@ -4171,6 +5783,46 @@ impl TermchatApp {
             },
         );
 
+        let group_list = if state.session.groups.is_empty() {
+            column![
+                text("No groups.")
+                    .size(12)
+                    .color(Color::from_rgb8(150, 150, 150))
+            ]
+            .spacing(6)
+            .width(Length::Fill)
+        } else {
+            state.session.groups.iter().enumerate().fold(
+                column!().spacing(6).width(Length::Fill),
+                |col, (idx, group)| {
+                    let selected = state.session.selected_group_idx == Some(idx);
+                    let label = row![
+                        text("#").size(13).color(PY_CYAN),
+                        text(&group.name).size(13).color(Color::WHITE),
+                        text(format!("({})", group.members.len()))
+                            .size(12)
+                            .color(Color::from_rgb8(160, 160, 168)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    col.push(
+                        button(
+                            container(label)
+                                .width(Length::Fill)
+                                .padding([6, 8])
+                                .style(|_| profile_row_content_style(APP_PROFILE_TEXT)),
+                        )
+                        .width(Length::Fill)
+                        .style(move |theme, status| profile_button_style(theme, status, selected))
+                        .on_press_maybe(
+                            group_buttons_allowed.then_some(Message::GroupSelected(idx)),
+                        ),
+                    )
+                },
+            )
+        };
+
         let profile_sidebar = container(
             column![
                 container(
@@ -4178,7 +5830,7 @@ impl TermchatApp {
                         .height(Length::Fill)
                         .width(Length::Fill)
                 )
-                .height(Length::Fill)
+                .height(Length::FillPortion(2))
                 .width(Length::Fill)
                 .padding(4)
                 .style(|_| sidebar_panel_style()),
@@ -4196,7 +5848,7 @@ impl TermchatApp {
                                 .width(Length::Fill)
                                 .style(app_button_style);
 
-                            if sidebar_idle {
+                            if profile_buttons_allowed {
                                 btn.on_press(Message::OpenSelectedProfilePressed)
                             } else {
                                 btn
@@ -4208,7 +5860,7 @@ impl TermchatApp {
                                 .width(Length::Fill)
                                 .style(app_button_style);
 
-                            if sidebar_idle {
+                            if profile_buttons_allowed {
                                 btn.on_press(Message::CreateProfilePressed)
                             } else {
                                 btn
@@ -4224,7 +5876,7 @@ impl TermchatApp {
                                 .width(Length::Fill)
                                 .style(app_button_style);
 
-                            if sidebar_ops_allowed {
+                            if profile_ops_allowed {
                                 btn.on_press(Message::DeleteProfilePressed)
                             } else {
                                 btn
@@ -4236,7 +5888,7 @@ impl TermchatApp {
                                 .width(Length::Fill)
                                 .style(app_button_style);
 
-                            if sidebar_ops_allowed {
+                            if profile_ops_allowed {
                                 btn.on_press(Message::ResetProfilePressed)
                             } else {
                                 btn
@@ -4248,7 +5900,94 @@ impl TermchatApp {
                 ]
                 .spacing(6)
                 .width(Length::Fill),
-                sidebar_confirm,
+                profile_sidebar_confirm,
+                Space::new().height(4),
+                container(Space::new().height(3))
+                    .width(Length::Fill)
+                    .style(|_| sidebar_divider_style()),
+                Space::new().height(4),
+                container(
+                    scrollable(group_list)
+                        .height(Length::Fill)
+                        .width(Length::Fill)
+                )
+                .height(Length::FillPortion(1))
+                .width(Length::Fill)
+                .padding(4)
+                .style(|_| sidebar_panel_style()),
+                {
+                    let input = text_input("New group name...", &state.session.group_name_input)
+                        .on_input(Message::GroupNameInputChanged)
+                        .padding(8)
+                        .size(13)
+                        .width(Length::Fill);
+
+                    if group_buttons_allowed {
+                        input.on_submit(Message::CreateGroupPressed)
+                    } else {
+                        input
+                    }
+                },
+                column![
+                    row![
+                        button(text("New").size(12))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(app_button_style)
+                            .on_press_maybe(
+                                group_buttons_allowed.then_some(Message::CreateGroupPressed)
+                            ),
+                        button(text("Open").size(12))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(app_button_style)
+                            .on_press_maybe(
+                                (group_selected && group_buttons_allowed)
+                                    .then_some(Message::OpenGroupPressed)
+                            ),
+                    ]
+                    .spacing(6)
+                    .width(Length::Fill),
+                    button(text("Delete").size(12))
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (group_delete_allowed && group_buttons_allowed)
+                                .then_some(Message::DeleteGroupPressed)
+                        ),
+                ]
+                .spacing(6)
+                .width(Length::Fill),
+                group_delete_confirm,
+                row![
+                    {
+                        let input = text_input(
+                            "Paste group invite...",
+                            &state.session.group_invite_string_input,
+                        )
+                        .on_input(Message::GroupInviteStringInputChanged)
+                        .padding(8)
+                        .size(12)
+                        .width(Length::Fill);
+
+                        if group_buttons_allowed {
+                            input.on_submit(Message::ImportGroupInviteStringPressed)
+                        } else {
+                            input
+                        }
+                    },
+                    button(text("OK").size(12))
+                        .padding([4, 8])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            group_buttons_allowed
+                                .then_some(Message::ImportGroupInviteStringPressed)
+                        ),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
             ]
             .spacing(8)
             .width(Length::Fill)
@@ -4330,6 +6069,19 @@ impl TermchatApp {
             connection_status_color(&state.session),
         );
 
+        let active_group_counts = state.active_tab().and_then(|tab| {
+            tab.group.as_ref().map(|group| {
+                let active_peers = group
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.ready && peer.authorized)
+                    .count();
+                (
+                    active_peers.saturating_add(1),
+                    group.meta.members.len().saturating_add(1),
+                )
+            })
+        });
         let my_b32_available = state.session.my_b32.is_some();
         let peer_b32_available =
             state.session.live_ready && state.session.current_peer_addr.is_some();
@@ -4350,8 +6102,29 @@ impl TermchatApp {
         )
         .padding([4, 10])
         .style(peer_status_address_button_style);
+        let group_active_label = active_group_counts
+            .map(|(active, total)| format!("{active}/{total} active"))
+            .unwrap_or_else(|| "0/0 active".into());
+        let group_active_indicator = container(
+            text(group_active_label)
+                .size(13)
+                .color(Color::from_rgb8(150, 150, 158)),
+        )
+        .padding([4, 10])
+        .style(|_| status_address_container_style());
 
-        let right_status = container(
+        let right_status = container(if active_group_counts.is_some() {
+            row![
+                if my_b32_available {
+                    my_b32_button.on_press(Message::CopyStatusMyB32Pressed)
+                } else {
+                    my_b32_button
+                },
+                text(" : ").size(13),
+                group_active_indicator,
+            ]
+            .align_y(Alignment::Center)
+        } else {
             row![
                 if my_b32_available {
                     my_b32_button.on_press(Message::CopyStatusMyB32Pressed)
@@ -4365,8 +6138,8 @@ impl TermchatApp {
                     peer_b32_button
                 },
             ]
-            .align_y(Alignment::Center),
-        );
+            .align_y(Alignment::Center)
+        });
 
         let status_inner = container(
             stack![
@@ -4386,9 +6159,9 @@ impl TermchatApp {
 
         let status_bar = status_inner;
 
-        let messages = state.session.bubbles.iter().fold(
+        let messages = state.session.bubbles.iter().enumerate().fold(
             column!().spacing(12).padding([8, 4]).width(Length::Fill),
-            |col, bubble| col.push(message_row(bubble)),
+            |col, (idx, bubble)| col.push(message_row(idx, bubble)),
         );
 
         let chat_panel = container(
@@ -4543,12 +6316,222 @@ impl TermchatApp {
         .padding(6)
         .style(|_| log_panel_style());
 
+        let group_roster_rows = if let Some(group) = selected_group {
+            if group.members.is_empty() {
+                column![
+                    text("Roster is empty.")
+                        .size(12)
+                        .color(Color::from_rgb8(150, 150, 158))
+                ]
+                .spacing(6)
+                .padding([6, 4])
+                .width(Length::Fill)
+            } else {
+                group.members.iter().enumerate().fold(
+                    column!().spacing(6).padding([6, 4]).width(Length::Fill),
+                    |col, (member_idx, member)| {
+                        let group_key = storage::group_storage_key(group);
+                        let active = active_group_member_b32s
+                            .iter()
+                            .any(|b32| b32.eq_ignore_ascii_case(&member.b32));
+                        let name_color = if active {
+                            Color::WHITE
+                        } else {
+                            Color::from_rgb8(135, 135, 144)
+                        };
+                        let b32_color = if active {
+                            Color::from_rgb8(155, 155, 162)
+                        } else {
+                            Color::from_rgb8(105, 105, 114)
+                        };
+                        let row_content = row![
+                            text(if active { "●" } else { "○" })
+                                .size(12)
+                                .color(if active {
+                                    PY_GREEN
+                                } else {
+                                    Color::from_rgb8(105, 105, 114)
+                                }),
+                            column![
+                                text(&member.name)
+                                    .size(12)
+                                    .color(name_color)
+                                    .width(Length::Fill),
+                                text(&member.b32)
+                                    .size(11)
+                                    .color(b32_color)
+                                    .width(Length::Fill),
+                            ]
+                            .spacing(2)
+                            .width(Length::Fill),
+                            button(text("Delete").size(12))
+                                .padding([4, 8])
+                                .style(app_button_style)
+                                .on_press_maybe(
+                                    (selected_group_is_admin && !group_member_confirm_active)
+                                        .then_some(Message::DeleteGroupMemberPressed(member_idx))
+                                ),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill);
+
+                        let member_confirm = match &state.session.sidebar_confirm {
+                            Some(SidebarConfirm::DeleteGroupMember {
+                                group_key: confirm_group_key,
+                                member_b32,
+                                member_name,
+                            }) if confirm_group_key == &group_key
+                                && member_b32.eq_ignore_ascii_case(&member.b32) =>
+                            {
+                                column![
+                                    text(format!("Delete member {member_name}?")).size(12),
+                                    row![
+                                        button(text("Yes").size(12))
+                                            .padding([4, 8])
+                                            .style(app_button_style)
+                                            .on_press(Message::SidebarConfirmYes),
+                                        button(text("No").size(12))
+                                            .padding([4, 8])
+                                            .style(app_button_style)
+                                            .on_press(Message::SidebarConfirmNo),
+                                    ]
+                                    .spacing(6)
+                                ]
+                                .spacing(6)
+                            }
+                            _ => column![],
+                        };
+
+                        col.push(
+                            container(column![row_content, member_confirm].spacing(8))
+                                .padding(10)
+                                .width(Length::Fill)
+                                .style(|_| operation_panel_style()),
+                        )
+                    },
+                )
+            }
+        } else {
+            column![
+                text("Select or open a group.")
+                    .size(12)
+                    .color(Color::from_rgb8(150, 150, 158))
+            ]
+            .spacing(6)
+            .padding([6, 4])
+            .width(Length::Fill)
+        };
+
+        let group_panel = container(
+            column![
+                column![
+                    text(
+                        selected_group
+                            .map(|group| format!("#{}", group.name))
+                            .unwrap_or_else(|| "Group".into())
+                    )
+                    .size(13)
+                    .width(Length::Fill),
+                    text(if selected_group.is_some() {
+                        format!(
+                            "Online peers: {}  Total known: {}",
+                            active_group_peer_count, selected_group_total_known
+                        )
+                    } else {
+                        "Online peers: 0  Total known: 0".into()
+                    })
+                    .size(11)
+                    .color(Color::from_rgb8(155, 155, 164))
+                    .width(Length::Fill),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                row![
+                    button(text("Save New Name").size(12))
+                        .padding([6, 10])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            group_selected.then_some(Message::SaveGroupDisplayNamePressed)
+                        ),
+                    text_input(
+                        "My group display name...",
+                        &state.session.group_display_name_input
+                    )
+                    .on_input(Message::GroupDisplayNameInputChanged)
+                    .on_submit(Message::SaveGroupDisplayNamePressed)
+                    .padding(8)
+                    .size(13)
+                    .width(Length::Fixed(220.0)),
+                    container(text(format!("Role: {selected_group_role}")).size(12).color(
+                        if selected_group_is_admin {
+                            PY_GREEN
+                        } else {
+                            Color::from_rgb8(175, 175, 184)
+                        }
+                    ),)
+                    .padding([4, 8])
+                    .style(move |_| {
+                        let role_color = if selected_group_is_admin {
+                            PY_GREEN
+                        } else {
+                            Color::from_rgb8(175, 175, 184)
+                        };
+                        indicator_style(Color::from_rgb8(35, 35, 40), role_color)
+                    }),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                row![
+                    button(text("Generate New Invite").size(12))
+                        .padding([6, 10])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (group_selected && selected_group_is_admin)
+                                .then_some(Message::GenerateGroupInvitePressed)
+                        ),
+                    text_input(
+                        "Generated invite appears here...",
+                        &state.session.group_generated_invite_string
+                    )
+                    .padding(8)
+                    .size(12)
+                    .width(Length::Fixed(360.0)),
+                    button(text("Copy New Invite").size(12))
+                        .padding([6, 10])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (selected_group_is_admin
+                                && !state
+                                    .session
+                                    .group_generated_invite_string
+                                    .trim()
+                                    .is_empty())
+                            .then_some(Message::CopyGeneratedGroupInvitePressed),
+                        ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                scrollable(group_roster_rows)
+                    .height(Length::Fill)
+                    .width(Length::Fill),
+                text(&state.session.group_status).size(12),
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fill)
+        .height(Length::FillPortion(1))
+        .padding(6)
+        .style(|_| log_panel_style());
+
         let selected_persistent_profile = state
             .session
             .profiles
             .get(state.session.selected_profile_idx)
             .filter(|profile| profile.persistent)
             .map(|profile| profile.name.as_str());
+
+        let show_group_panel = state.active_tab_is_group() && state.session.show_group_panel;
 
         let center_panel: Element<'_, Message> = if is_app_home {
             crate::app_home::app_home_view(
@@ -4575,6 +6558,30 @@ impl TermchatApp {
                 state.pending_profile_import_name.as_deref(),
                 state.backup_operation,
             )
+        } else if show_group_panel && show_deaddrop_panel && state.session.show_logs {
+            column![chat_panel, group_panel, deaddrop_panel, log_panel]
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if show_group_panel && show_deaddrop_panel {
+            column![chat_panel, group_panel, deaddrop_panel]
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if show_group_panel && state.session.show_logs {
+            column![chat_panel, group_panel, log_panel]
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if show_group_panel {
+            column![chat_panel, group_panel]
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else if show_deaddrop_panel && state.session.show_logs {
             column![chat_panel, deaddrop_panel, log_panel]
                 .spacing(8)
@@ -4618,7 +6625,39 @@ impl TermchatApp {
             message_input
         };
 
-        let message_input_panel = container(message_input)
+        let reply_preview: Element<'_, Message> = if let Some(reply) = &state.session.reply_to {
+            let preview = compact_reply_preview(&reply.text, 140);
+            container(
+                row![
+                    column![
+                        text(format!("Replying to {}", reply.author))
+                            .size(11)
+                            .color(Color::from_rgb8(170, 170, 178)),
+                        text(preview)
+                            .size(12)
+                            .color(Color::from_rgb8(210, 210, 216))
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text("x").size(11))
+                        .padding([2, 6])
+                        .style(copy_bubble_button_style)
+                        .on_press(Message::CancelReplyPressed),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([6, 8])
+            .style(|_| reply_preview_style())
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
+        let message_input_panel = container(column![reply_preview, message_input].spacing(6))
             .width(Length::Fill)
             .padding(8)
             .style(container::rounded_box);
@@ -4658,12 +6697,31 @@ impl TermchatApp {
                 .padding([6, 10])
                 .style(app_button_style)
                 .on_press(Message::ToggleLogsPressed),
-            )
-            .push(
-                button(text(TermchatApp::action_label(GuiAction::Help)).size(13))
-                    .padding([6, 10])
-                    .style(app_button_style),
             );
+
+        let actions_row = if state.active_tab_is_group() {
+            actions_row.push(
+                button(
+                    text(if state.session.show_group_panel {
+                        "Hide Group"
+                    } else {
+                        "Show Group"
+                    })
+                    .size(13),
+                )
+                .padding([6, 10])
+                .style(app_button_style)
+                .on_press(Message::ToggleGroupPanelPressed),
+            )
+        } else {
+            actions_row
+        };
+
+        let actions_row = actions_row.push(
+            button(text(TermchatApp::action_label(GuiAction::Help)).size(13))
+                .padding([6, 10])
+                .style(app_button_style),
+        );
 
         let command_panel_content = if let Some(action) = state.session.pending_action {
             if TermchatApp::action_needs_param(action) {
@@ -4781,6 +6839,10 @@ impl TermchatApp {
     }
 
     fn generate_msg_id(&self) -> u64 {
+        Self::generate_msg_id_value()
+    }
+
+    fn generate_msg_id_value() -> u64 {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -4798,6 +6860,42 @@ impl TermchatApp {
         }
     }
 
+    fn heartbeat_nonce() -> String {
+        format!("{:016x}", Self::generate_msg_id_value())
+    }
+
+    fn heartbeat_ping_frame() -> Frame {
+        Frame {
+            msg_type: MsgType::S,
+            msg_id: Self::generate_msg_id_value(),
+            payload: format!("{HEARTBEAT_PING_PREFIX}{}", Self::heartbeat_nonce()).into_bytes(),
+        }
+    }
+
+    fn heartbeat_pong_frame(nonce: &str) -> Frame {
+        Frame {
+            msg_type: MsgType::S,
+            msg_id: Self::generate_msg_id_value(),
+            payload: format!("{HEARTBEAT_PONG_PREFIX}{nonce}").into_bytes(),
+        }
+    }
+
+    fn heartbeat_ping_task(tab_id: u64, conn: LiveConnection) -> Task<Message> {
+        let frame = Self::heartbeat_ping_frame();
+        Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
+            move |result| Message::SendFinished(tab_id, result),
+        )
+    }
+
+    fn heartbeat_pong_task(tab_id: u64, conn: LiveConnection, nonce: String) -> Task<Message> {
+        let frame = Self::heartbeat_pong_frame(&nonce);
+        Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
+            move |result| Message::SendFinished(tab_id, result),
+        )
+    }
+
     fn reset_connection_state(&mut self) {
         self.set_active_live_conn(None);
         self.set_active_pending_conn(None);
@@ -4809,6 +6907,8 @@ impl TermchatApp {
         self.session.live_ready = false;
         self.session.offline_mode = false;
         self.session.network_status = NetworkStatus::LocalOk;
+        self.session.heartbeat_last_rx_ms = 0;
+        self.session.heartbeat_last_ping_ms = 0;
         self.session.call_blink_on = true;
         self.session.call_blink_ticks = 0;
         self.clear_tofu_runtime_status();
@@ -4833,6 +6933,804 @@ impl TermchatApp {
         self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
         self.session.profile = profile_name.to_string();
         self.refresh_visible_from_active_tab();
+    }
+
+    fn open_or_focus_tab_for_group(&mut self, group_key: &str) {
+        self.store_active_runtime();
+
+        let profile_name = format!("group:{group_key}");
+        if let Some(real_idx) = self
+            .opened_tabs
+            .iter()
+            .position(|t| t.meta.kind == TabKind::Group && t.meta.profile_name == profile_name)
+        {
+            self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
+            self.session.profile = self.opened_tabs[real_idx].meta.profile_name.clone();
+            self.session.selected_group_idx = self
+                .session
+                .groups
+                .iter()
+                .position(|group| storage::group_storage_key(group) == group_key);
+            self.session.group_display_name_input = self
+                .session
+                .selected_group_idx
+                .and_then(|idx| self.session.groups.get(idx))
+                .map(|group| group.my_name.clone())
+                .unwrap_or_default();
+            self.refresh_visible_from_active_tab();
+            return;
+        }
+
+        let Some(group_meta) = self
+            .session
+            .groups
+            .iter()
+            .find(|group| storage::group_storage_key(group) == group_key)
+            .cloned()
+        else {
+            self.session.group_status = format!("Group not found: {group_key}");
+            return;
+        };
+
+        self.opened_tabs.push(self.new_opened_group_tab(group_meta));
+        let real_idx = self.opened_tabs.len() - 1;
+        self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
+        self.session.profile = profile_name;
+        self.session.selected_group_idx = self
+            .session
+            .groups
+            .iter()
+            .position(|group| storage::group_storage_key(group) == group_key);
+        self.session.group_display_name_input = self
+            .session
+            .selected_group_idx
+            .and_then(|idx| self.session.groups.get(idx))
+            .map(|group| group.my_name.clone())
+            .unwrap_or_default();
+        self.refresh_visible_from_active_tab();
+    }
+
+    fn export_group_invite_file(path: &Path, group: &GroupMeta) -> Result<GroupMeta, String> {
+        let (updated_group, invite) = Self::issue_group_invite(group)?;
+        let text = serde_json::to_string_pretty(&invite).map_err(|e| e.to_string())?;
+        std::fs::write(path, text).map_err(|e| e.to_string())?;
+        Ok(updated_group)
+    }
+
+    fn encode_group_invite_string(group: &GroupMeta) -> Result<(GroupMeta, String), String> {
+        let (updated_group, invite) = Self::issue_group_invite(group)?;
+        let json = serde_json::to_vec(&invite).map_err(|e| e.to_string())?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json).map_err(|e| e.to_string())?;
+        let compressed = encoder.finish().map_err(|e| e.to_string())?;
+        let encoded = general_purpose::URL_SAFE_NO_PAD.encode(compressed);
+        Ok((
+            updated_group,
+            format!("{GROUP_INVITE_STRING_PREFIX}{encoded}"),
+        ))
+    }
+
+    fn import_group_invite_string(value: &str) -> Result<String, String> {
+        let trimmed = value.trim();
+        let encoded = trimmed
+            .strip_prefix(GROUP_INVITE_STRING_PREFIX)
+            .ok_or_else(|| "invite string has wrong prefix".to_string())?;
+
+        let compressed = general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let mut decoder = GzDecoder::new(Cursor::new(compressed));
+        let mut json = Vec::new();
+        decoder.read_to_end(&mut json).map_err(|e| e.to_string())?;
+        let invite: GroupInvite = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+        Self::merge_group_invite(invite)
+    }
+
+    fn group_invite_from_meta(group: &GroupMeta) -> Result<GroupInvite, String> {
+        Self::group_invite_from_meta_with_token(group, None)
+    }
+
+    fn issue_group_invite(group: &GroupMeta) -> Result<(GroupMeta, GroupInvite), String> {
+        if group.my_b32.is_none() {
+            return Err("open this group once before exporting its invite".into());
+        }
+        if !Self::group_is_admin(group) {
+            return Err("only the group admin can issue invites".into());
+        }
+
+        let token = Self::generate_group_invite_token();
+        let mut updated_group = group.clone();
+        Self::sign_group_roster_if_admin(&mut updated_group)?;
+        updated_group.issued_invites.push(GroupIssuedInvite {
+            token: token.clone(),
+            redeemed_b32: None,
+        });
+        storage::save_group_meta(&updated_group).map_err(|e| e.to_string())?;
+
+        let invite = Self::group_invite_from_meta_with_token(&updated_group, Some(token))?;
+        Ok((updated_group, invite))
+    }
+
+    fn group_invite_from_meta_with_token(
+        group: &GroupMeta,
+        invite_token: Option<String>,
+    ) -> Result<GroupInvite, String> {
+        let Some(inviter_b32) = group.my_b32.clone() else {
+            return Err("open this group once before exporting its invite".into());
+        };
+
+        Ok(GroupInvite {
+            format: "icedcomm-i2p-group-invite".into(),
+            version: 1,
+            group_name: group.name.clone(),
+            inviter_name: Self::group_self_display_name(group),
+            inviter_b32,
+            owner_b32: group.owner_b32.clone().or_else(|| group.my_b32.clone()),
+            invite_token,
+            roster_version: group.roster_version,
+            members: group.members.clone(),
+            roster_signing_pubkey: group.roster_signing_pubkey.clone(),
+            roster_signature: group.roster_signature.clone(),
+        })
+    }
+
+    fn generate_group_invite_token() -> String {
+        let token: [u8; 32] = random();
+        general_purpose::URL_SAFE_NO_PAD.encode(token)
+    }
+
+    fn group_self_display_name(group: &GroupMeta) -> String {
+        let trimmed = group.my_name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+
+        format!("member-{}", short_b32(group.my_b32.as_deref()))
+    }
+
+    fn group_is_admin(group: &GroupMeta) -> bool {
+        match (group.my_b32.as_deref(), group.owner_b32.as_deref()) {
+            (Some(my_b32), Some(owner_b32)) => my_b32.eq_ignore_ascii_case(owner_b32),
+            _ => false,
+        }
+    }
+
+    fn validate_group_display_name(name: &str) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("Group display name cannot be empty.".into());
+        }
+        if name.chars().count() > 32 {
+            return Err("Group display name must be 32 characters or less.".into());
+        }
+        if name.chars().any(char::is_control) {
+            return Err("Group display name cannot contain control characters.".into());
+        }
+        Ok(())
+    }
+
+    fn apply_group_member_rename(
+        group: &mut GroupMeta,
+        member_b32: &str,
+        display_name: String,
+    ) -> Result<bool, String> {
+        Self::validate_group_display_name(&display_name)?;
+
+        let Some(existing) = group
+            .members
+            .iter_mut()
+            .find(|existing| existing.b32.eq_ignore_ascii_case(member_b32))
+        else {
+            return Err("group member is not in the roster".into());
+        };
+
+        if existing.name == display_name {
+            return Ok(false);
+        }
+
+        existing.name = display_name;
+        group.roster_version = group.roster_version.saturating_add(1);
+        Self::sign_group_roster_if_admin(group)?;
+        Ok(true)
+    }
+
+    fn canonical_group_members(group: &GroupMeta) -> Vec<GroupMember> {
+        let mut members = group.members.clone();
+        if let (Some(my_b32), Some(owner_b32)) =
+            (group.my_b32.as_deref(), group.owner_b32.as_deref())
+        {
+            if my_b32.eq_ignore_ascii_case(owner_b32)
+                && !members
+                    .iter()
+                    .any(|member| member.b32.eq_ignore_ascii_case(owner_b32))
+            {
+                members.push(GroupMember {
+                    name: Self::group_self_display_name(group),
+                    b32: owner_b32.to_string(),
+                });
+            }
+        }
+        members.sort_by(|a, b| {
+            a.b32
+                .to_lowercase()
+                .cmp(&b.b32.to_lowercase())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        members
+    }
+
+    fn group_roster_signature_payload(group: &GroupMeta) -> Result<Vec<u8>, String> {
+        let Some(owner_b32) = group.owner_b32.clone() else {
+            return Err("group owner address is not known".into());
+        };
+
+        let payload = GroupRosterSignaturePayload {
+            format: "icedcomm-i2p-group-roster-signature".into(),
+            version: 1,
+            group_name: group.name.clone(),
+            owner_b32,
+            roster_version: group.roster_version,
+            members: Self::canonical_group_members(group),
+        };
+
+        serde_json::to_vec(&payload).map_err(|e| e.to_string())
+    }
+
+    fn ensure_group_roster_signing_key(group: &mut GroupMeta) -> Result<(), String> {
+        if group.roster_signing_secret.is_some() && group.roster_signing_pubkey.is_some() {
+            return Ok(());
+        }
+
+        let secret: [u8; 32] = random();
+        let signing_key = SigningKey::from_bytes(&secret);
+        group.roster_signing_secret = Some(general_purpose::STANDARD.encode(secret));
+        group.roster_signing_pubkey =
+            Some(general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes()));
+        Ok(())
+    }
+
+    fn sign_group_roster_if_admin(group: &mut GroupMeta) -> Result<(), String> {
+        if !Self::group_is_admin(group) {
+            return Ok(());
+        }
+
+        Self::ensure_group_roster_signing_key(group)?;
+
+        let Some(secret_b64) = group.roster_signing_secret.as_deref() else {
+            return Err("group roster signing secret is missing".into());
+        };
+        let secret = general_purpose::STANDARD
+            .decode(secret_b64.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let secret: [u8; 32] = secret
+            .try_into()
+            .map_err(|_| "group roster signing secret has invalid length".to_string())?;
+
+        let signing_key = SigningKey::from_bytes(&secret);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        group.roster_signing_pubkey = Some(general_purpose::STANDARD.encode(pubkey));
+
+        let payload = Self::group_roster_signature_payload(group)?;
+        let signature = signing_key.sign(&payload);
+        group.roster_signature = Some(general_purpose::STANDARD.encode(signature.to_bytes()));
+        Ok(())
+    }
+
+    fn verify_group_roster_signature(
+        group_name: &str,
+        owner_b32: &str,
+        roster_version: u64,
+        members: &[GroupMember],
+        pubkey_b64: &str,
+        signature_b64: &str,
+    ) -> Result<(), String> {
+        let pubkey = general_purpose::STANDARD
+            .decode(pubkey_b64.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let pubkey: [u8; 32] = pubkey
+            .try_into()
+            .map_err(|_| "group roster signing public key has invalid length".to_string())?;
+        let verifying_key = VerifyingKey::from_bytes(&pubkey).map_err(|e| e.to_string())?;
+
+        let signature = general_purpose::STANDARD
+            .decode(signature_b64.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let signature: [u8; 64] = signature
+            .try_into()
+            .map_err(|_| "group roster signature has invalid length".to_string())?;
+        let signature = Signature::from_bytes(&signature);
+
+        let mut sorted_members = members.to_vec();
+        sorted_members.sort_by(|a, b| {
+            a.b32
+                .to_lowercase()
+                .cmp(&b.b32.to_lowercase())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let payload = GroupRosterSignaturePayload {
+            format: "icedcomm-i2p-group-roster-signature".into(),
+            version: 1,
+            group_name: group_name.to_string(),
+            owner_b32: owner_b32.to_string(),
+            roster_version,
+            members: sorted_members,
+        };
+        let payload = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+
+        verifying_key
+            .verify(&payload, &signature)
+            .map_err(|e| e.to_string())
+    }
+
+    fn group_roster_sync_from_meta(group: &GroupMeta) -> Result<GroupRosterSync, String> {
+        let Some(owner_b32) = group.owner_b32.clone() else {
+            return Err("group owner address is not known".into());
+        };
+        let Some(pubkey) = group.roster_signing_pubkey.clone() else {
+            return Err("group roster signing public key is missing".into());
+        };
+        let Some(signature) = group.roster_signature.clone() else {
+            return Err("group roster signature is missing".into());
+        };
+
+        Ok(GroupRosterSync {
+            format: "icedcomm-i2p-group-roster".into(),
+            version: 1,
+            group_name: group.name.clone(),
+            owner_b32,
+            roster_version: group.roster_version,
+            members: Self::canonical_group_members(group),
+            roster_signing_pubkey: pubkey,
+            roster_signature: signature,
+        })
+    }
+
+    fn import_group_invite_file(path: &Path) -> Result<String, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let invite: GroupInvite = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        Self::merge_group_invite(invite)
+    }
+
+    fn merge_group_invite(invite: GroupInvite) -> Result<String, String> {
+        if invite.format != "icedcomm-i2p-group-invite" || invite.version != 1 {
+            return Err("unsupported group invite".into());
+        }
+
+        if invite.group_name.trim().is_empty() {
+            return Err("invite group name is empty".into());
+        }
+
+        if !Self::is_valid_b32_address(&invite.inviter_b32) {
+            return Err("invite contains invalid inviter address".into());
+        }
+        if let Some(owner_b32) = invite.owner_b32.as_deref() {
+            if !Self::is_valid_b32_address(owner_b32) {
+                return Err("invite contains invalid owner address".into());
+            }
+        }
+
+        let incoming_owner = invite
+            .owner_b32
+            .clone()
+            .unwrap_or_else(|| invite.inviter_b32.clone());
+
+        let mut group = match storage::load_group_meta(&incoming_owner) {
+            Ok(group) => group,
+            Err(_) => {
+                let mut group =
+                    storage::create_group(&invite.group_name).map_err(|e| e.to_string())?;
+                let old_key = storage::group_storage_key(&group);
+                group.id = incoming_owner.clone();
+                group.owner_b32 = Some(incoming_owner.clone());
+                storage::save_group_meta(&group).map_err(|e| e.to_string())?;
+                if old_key != incoming_owner {
+                    let _ = storage::delete_group(&old_key);
+                }
+                group
+            }
+        };
+
+        if group.owner_b32.is_none() {
+            group.owner_b32 = Some(incoming_owner.clone());
+        }
+        group.id = incoming_owner.clone();
+
+        let incoming_version = invite.roster_version;
+        let invite_token = invite.invite_token.clone();
+        let roster_signing_pubkey = invite.roster_signing_pubkey.clone();
+        let roster_signature = invite.roster_signature.clone();
+        if let Some(invite_owner) = invite.owner_b32.as_deref() {
+            if !incoming_owner.eq_ignore_ascii_case(invite_owner) {
+                return Err("invite owner does not match stored group owner".into());
+            }
+        }
+
+        let mut incoming_members = Vec::new();
+        incoming_members.push(GroupMember {
+            name: invite.inviter_name,
+            b32: invite.inviter_b32,
+        });
+        incoming_members.extend(
+            invite
+                .members
+                .into_iter()
+                .filter(|member| Self::is_valid_b32_address(&member.b32)),
+        );
+
+        if let (Some(pubkey), Some(signature)) = (
+            roster_signing_pubkey.as_deref(),
+            roster_signature.as_deref(),
+        ) {
+            if !incoming_members
+                .iter()
+                .any(|member| member.b32.eq_ignore_ascii_case(&incoming_owner))
+            {
+                return Err("signed invite roster does not contain the group owner".into());
+            }
+            if let Some(existing_pubkey) = group.roster_signing_pubkey.as_deref() {
+                if existing_pubkey != pubkey {
+                    return Err("invite roster signing key does not match stored group key".into());
+                }
+            }
+            Self::verify_group_roster_signature(
+                &invite.group_name,
+                &incoming_owner,
+                incoming_version,
+                &incoming_members,
+                pubkey,
+                signature,
+            )?;
+            group.roster_signing_pubkey = Some(pubkey.to_string());
+            group.roster_signature = Some(signature.to_string());
+        } else if group.roster_signing_pubkey.is_some() {
+            return Err("incoming invite roster is unsigned".into());
+        }
+
+        if incoming_version > group.roster_version {
+            let my_b32 = group.my_b32.clone();
+            group.members.clear();
+            for member in incoming_members {
+                if my_b32
+                    .as_ref()
+                    .map(|my_b32| my_b32.eq_ignore_ascii_case(&member.b32))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                Self::merge_group_member(&mut group, member);
+            }
+            group.roster_version = incoming_version;
+        } else {
+            for member in incoming_members {
+                Self::merge_group_member(&mut group, member);
+            }
+            group.roster_version = group.roster_version.max(incoming_version);
+        }
+
+        if invite_token.is_some() {
+            group.join_token = invite_token;
+        }
+
+        storage::save_group_meta(&group).map_err(|e| e.to_string())?;
+        Ok(storage::group_storage_key(&group))
+    }
+
+    fn merge_group_roster_sync(roster: GroupRosterSync) -> Result<String, String> {
+        if roster.format != "icedcomm-i2p-group-roster" || roster.version != 1 {
+            return Err("unsupported group roster sync".into());
+        }
+
+        if roster.group_name.trim().is_empty() {
+            return Err("group roster name is empty".into());
+        }
+        if !Self::is_valid_b32_address(&roster.owner_b32) {
+            return Err("group roster owner address is invalid".into());
+        }
+
+        let mut group = storage::load_group_meta(&roster.owner_b32).map_err(|e| e.to_string())?;
+        if let Some(existing_owner) = group.owner_b32.as_deref() {
+            if !existing_owner.eq_ignore_ascii_case(&roster.owner_b32) {
+                return Err("group roster owner does not match stored group owner".into());
+            }
+        } else {
+            group.owner_b32 = Some(roster.owner_b32.clone());
+        }
+        group.id = roster.owner_b32.clone();
+
+        if let Some(existing_pubkey) = group.roster_signing_pubkey.as_deref() {
+            if existing_pubkey != roster.roster_signing_pubkey.as_str() {
+                return Err("group roster signing key does not match stored group key".into());
+            }
+        }
+
+        let valid_members = roster
+            .members
+            .iter()
+            .filter(|member| Self::is_valid_b32_address(&member.b32))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Self::verify_group_roster_signature(
+            &roster.group_name,
+            &roster.owner_b32,
+            roster.roster_version,
+            &valid_members,
+            &roster.roster_signing_pubkey,
+            &roster.roster_signature,
+        )?;
+
+        if roster.roster_version > group.roster_version {
+            let my_b32 = group.my_b32.clone();
+            let self_removed = my_b32
+                .as_ref()
+                .map(|my_b32| {
+                    !my_b32.eq_ignore_ascii_case(&roster.owner_b32)
+                        && !valid_members
+                            .iter()
+                            .any(|member| member.b32.eq_ignore_ascii_case(my_b32))
+                })
+                .unwrap_or(false);
+
+            if self_removed {
+                group.members.clear();
+                group.join_token = None;
+                group.roster_version = roster.roster_version;
+                group.roster_signing_pubkey = Some(roster.roster_signing_pubkey);
+                group.roster_signature = Some(roster.roster_signature);
+                storage::save_group_meta(&group).map_err(|e| e.to_string())?;
+                return Ok(storage::group_storage_key(&group));
+            }
+
+            group.members.clear();
+            for member in valid_members {
+                if my_b32
+                    .as_ref()
+                    .map(|my_b32| my_b32.eq_ignore_ascii_case(&member.b32))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                Self::merge_group_member(&mut group, member);
+            }
+            group.roster_version = roster.roster_version;
+            group.roster_signing_pubkey = Some(roster.roster_signing_pubkey);
+            group.roster_signature = Some(roster.roster_signature);
+            storage::save_group_meta(&group).map_err(|e| e.to_string())?;
+        }
+
+        Ok(storage::group_storage_key(&group))
+    }
+
+    fn merge_group_member(group: &mut GroupMeta, member: GroupMember) {
+        if group
+            .my_b32
+            .as_ref()
+            .map(|my_b32| my_b32.eq_ignore_ascii_case(&member.b32))
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        if let Some(existing) = group
+            .members
+            .iter_mut()
+            .find(|existing| existing.b32.eq_ignore_ascii_case(&member.b32))
+        {
+            if !member.name.trim().is_empty() {
+                existing.name = member.name;
+            }
+        } else {
+            group.members.push(member);
+        }
+    }
+
+    fn redeem_group_invite_token(
+        group: &mut GroupMeta,
+        token: &str,
+        member: GroupMember,
+    ) -> Result<(), String> {
+        Self::validate_group_display_name(&member.name)?;
+
+        let Some(invite) = group
+            .issued_invites
+            .iter_mut()
+            .find(|invite| invite.token == token)
+        else {
+            return Err("invite token is unknown".into());
+        };
+
+        let mut changed = false;
+
+        match &invite.redeemed_b32 {
+            Some(redeemed_b32) if !redeemed_b32.eq_ignore_ascii_case(&member.b32) => {
+                return Err("invite token was already redeemed".into());
+            }
+            Some(_) => {}
+            None => {
+                invite.redeemed_b32 = Some(member.b32.clone());
+                changed = true;
+            }
+        }
+
+        if let Some(existing) = group
+            .members
+            .iter_mut()
+            .find(|existing| existing.b32.eq_ignore_ascii_case(&member.b32))
+        {
+            if existing.name != member.name {
+                existing.name = member.name;
+                changed = true;
+            }
+        } else {
+            group.members.push(member);
+            changed = true;
+        }
+
+        if changed {
+            group.roster_version = group.roster_version.saturating_add(1);
+            Self::sign_group_roster_if_admin(group)?;
+        }
+
+        Ok(())
+    }
+
+    fn send_active_group_roster_sync_task(&mut self) -> Task<Message> {
+        let Some(tab_id) = self.active_tab().map(|tab| tab.id) else {
+            return Task::none();
+        };
+
+        self.send_group_roster_sync_task(tab_id)
+    }
+
+    fn send_group_roster_sync_for_group_task(&mut self, group_key: &str) -> Task<Message> {
+        let Some(tab_id) = self
+            .opened_tabs
+            .iter()
+            .find(|tab| {
+                tab.meta.kind == TabKind::Group
+                    && tab
+                        .group
+                        .as_ref()
+                        .map(|group| storage::group_storage_key(&group.meta) == group_key)
+                        .unwrap_or(false)
+            })
+            .map(|tab| tab.id)
+        else {
+            return Task::none();
+        };
+
+        self.send_group_roster_sync_task(tab_id)
+    }
+
+    fn send_group_rename_request_task(
+        &mut self,
+        group_key: &str,
+        display_name: String,
+    ) -> Task<Message> {
+        let Some(tab_id) = self
+            .opened_tabs
+            .iter()
+            .find(|tab| {
+                tab.meta.kind == TabKind::Group
+                    && tab
+                        .group
+                        .as_ref()
+                        .map(|group| storage::group_storage_key(&group.meta) == group_key)
+                        .unwrap_or(false)
+            })
+            .map(|tab| tab.id)
+        else {
+            self.session.group_status =
+                "Saved name locally. Open the group to send rename request.".into();
+            return Task::none();
+        };
+
+        let Some(idx) = self.find_tab_index_by_id(tab_id) else {
+            return Task::none();
+        };
+
+        let Some(group) = self.opened_tabs[idx].group.as_ref() else {
+            return Task::none();
+        };
+
+        let (Some(my_b32), Some(owner_b32)) =
+            (group.meta.my_b32.clone(), group.meta.owner_b32.clone())
+        else {
+            self.session.group_status =
+                "Saved name locally. Group owner address is not known yet.".into();
+            return Task::none();
+        };
+
+        if my_b32.eq_ignore_ascii_case(&owner_b32) {
+            return Task::none();
+        }
+
+        let Some(owner_peer) = group.peers.iter().find(|peer| {
+            peer.ready && peer.authorized && peer.member.b32.eq_ignore_ascii_case(&owner_b32)
+        }) else {
+            self.session.group_status =
+                "Saved name locally. Rename request will send when owner is online.".into();
+            return Task::none();
+        };
+
+        let Some(conn) = owner_peer.conn.clone() else {
+            self.session.group_status =
+                "Saved name locally. Rename request will send when owner is online.".into();
+            return Task::none();
+        };
+
+        let control = GroupControlMessage {
+            kind: GROUP_CONTROL_RENAME_REQUEST.into(),
+            token: String::new(),
+            b32: my_b32,
+            name: display_name.clone(),
+        };
+
+        let payload = match serde_json::to_vec(&control) {
+            Ok(payload) => owner_peer.e2e.encrypt(&payload),
+            Err(err) => {
+                self.session.group_status = format!("Group rename request encode failed: {err}");
+                return Task::none();
+            }
+        };
+
+        let frame = Frame {
+            msg_type: MsgType::L,
+            msg_id: Self::generate_msg_id_value(),
+            payload,
+        };
+
+        self.session.group_status =
+            format!("Saved name locally. Sent rename request: {display_name}");
+        Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
+            move |result| Message::SendFinished(tab_id, result),
+        )
+    }
+
+    fn send_group_roster_sync_task(&mut self, tab_id: u64) -> Task<Message> {
+        let Some(idx) = self.find_tab_index_by_id(tab_id) else {
+            return Task::none();
+        };
+
+        let Some(group) = self.opened_tabs[idx].group.as_ref() else {
+            return Task::none();
+        };
+
+        if !Self::group_is_admin(&group.meta) {
+            return Task::none();
+        }
+
+        let roster = match Self::group_roster_sync_from_meta(&group.meta) {
+            Ok(roster) => roster,
+            Err(_) => return Task::none(),
+        };
+
+        let payload = match serde_json::to_vec(&roster) {
+            Ok(payload) => payload,
+            Err(_) => return Task::none(),
+        };
+
+        let mut tasks = Vec::new();
+        for peer in &group.peers {
+            if !peer.ready || !peer.authorized {
+                continue;
+            }
+            let Some(conn) = peer.conn.clone() else {
+                continue;
+            };
+
+            let frame = Frame {
+                msg_type: MsgType::L,
+                msg_id: self.generate_msg_id(),
+                payload: peer.e2e.encrypt(&payload),
+            };
+            tasks.push(Task::perform(
+                async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
+                move |result| Message::SendFinished(tab_id, result),
+            ));
+        }
+
+        Task::batch(tasks)
     }
 
     fn sync_active_tab_flags(&mut self) {
@@ -4881,6 +7779,18 @@ impl TermchatApp {
             let tab_id = tab.id;
             let live = tab.live_conn.clone();
             let pending = tab.pending_conn.clone();
+            let group_conns: Vec<LiveConnection> = tab
+                .group
+                .as_ref()
+                .map(|group| {
+                    group
+                        .peers
+                        .iter()
+                        .flat_map(|peer| [peer.conn.clone(), peer.pending_conn.clone()])
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut sam = tab.sam.clone();
 
             let quit_live = Frame {
@@ -4906,6 +7816,17 @@ impl TermchatApp {
                     if let Some(conn) = pending {
                         let _ = conn.send_frame(&quit_pending).await;
                         sleep(Duration::from_millis(120)).await;
+                        let _ = conn.close().await;
+                    }
+
+                    for conn in group_conns {
+                        let quit_group = Frame {
+                            msg_type: MsgType::S,
+                            msg_id: 0,
+                            payload: b"__SIGNAL__:QUIT".to_vec(),
+                        };
+                        let _ = conn.send_frame(&quit_group).await;
+                        sleep(Duration::from_millis(30)).await;
                         let _ = conn.close().await;
                     }
 
@@ -5099,6 +8020,17 @@ impl TermchatApp {
         self.copy_text_to_clipboard(peer_b32, "peer b32 address");
     }
 
+    fn compose_reply_text(reply: Option<&ReplyDraft>, text: &str) -> String {
+        let Some(reply) = reply else {
+            return text.to_string();
+        };
+
+        format!(
+            "{REPLY_BEGIN_MARKER}\n{}\n{REPLY_QUOTE_MARKER}\n{}\n{REPLY_END_MARKER}\n{}",
+            reply.author, reply.text, text
+        )
+    }
+
     fn mock_connect(&mut self, peer: String) {
         self.session.current_peer_addr = Some(peer.clone());
         self.session.peer_b32 = Some(peer.clone());
@@ -5199,6 +8131,8 @@ impl TermchatApp {
         tab.session.pq_active = false;
         tab.session.tofu_verified = false;
         tab.session.tofu_mismatch = false;
+        tab.session.heartbeat_last_rx_ms = 0;
+        tab.session.heartbeat_last_ping_ms = 0;
 
         tab.session.call_blink_on = true;
         tab.session.call_blink_ticks = 0;
@@ -5350,6 +8284,10 @@ impl TermchatApp {
     fn available_actions(&self) -> Vec<GuiAction> {
         let mut out = Vec::new();
 
+        if self.active_tab_is_group() {
+            return out;
+        }
+
         if self.session.pending_peer_addr.is_some() {
             out.push(GuiAction::Accept);
             out.push(GuiAction::Decline);
@@ -5454,11 +8392,24 @@ impl TermchatApp {
     }
 
     fn message_input_enabled(&self) -> bool {
+        if self.active_tab_is_group() {
+            return self.active_group_ready_count() > 0;
+        }
+
         (self.session.live_ready && self.active_live_conn().is_some())
             || self.can_send_offline_now()
     }
 
     fn tick_one_tab(&mut self, idx: usize) -> Vec<Task<Message>> {
+        if self
+            .opened_tabs
+            .get(idx)
+            .map(|tab| tab.meta.kind == TabKind::Group)
+            .unwrap_or(false)
+        {
+            return self.tick_group_tab(idx);
+        }
+
         let mut tasks = Vec::new();
         //let is_active = self.session.active_tab_idx == Some(idx);
         let is_active = self.session.active_tab_idx == Some(Self::real_to_visible_tab_index(idx));
@@ -5485,7 +8436,9 @@ impl TermchatApp {
             }
 
             if let Some(conn) = tab.live_conn.clone() {
+                let now_ms = Self::now_epoch_millis();
                 while let Some(frame) = conn.try_recv_frame() {
+                    tab.session.heartbeat_last_rx_ms = now_ms;
                     match frame.msg_type {
                         MsgType::F => {
                             let plain = tab.e2e.decrypt(&frame.payload);
@@ -5796,6 +8749,8 @@ impl TermchatApp {
                                 timestamp_utc: Self::now_utc_hms(),
                                 msg_id: None,
                                 delivered: false,
+                                group_expected_acks: Vec::new(),
+                                group_received_acks: Vec::new(),
                             });
 
                             push_log(
@@ -5907,6 +8862,8 @@ impl TermchatApp {
 
                             if tab.e2e.ready() {
                                 tab.session.live_ready = true;
+                                tab.session.heartbeat_last_rx_ms = now_ms;
+                                tab.session.heartbeat_last_ping_ms = now_ms;
                                 push_log(tab, "Secure session established.".to_string());
 
                                 secure_session_just_established = true;
@@ -5928,6 +8885,8 @@ impl TermchatApp {
                                     tab.session.network_status = NetworkStatus::LocalOk;
                                     tab.session.tofu_verified = false;
                                     tab.session.tofu_mismatch = false;
+                                    tab.session.heartbeat_last_rx_ms = 0;
+                                    tab.session.heartbeat_last_ping_ms = 0;
                                     tab.e2e = E2E::new(tab.session.pq_enabled);
                                     Self::clear_outgoing_image_state(tab);
                                     Self::clear_incoming_image_state(tab);
@@ -5943,6 +8902,19 @@ impl TermchatApp {
                                         move |result| Message::IncomingAccepted(tab_id, result),
                                     ));
                                     break;
+                                }
+
+                                if let Some(nonce) = body.strip_prefix(HEARTBEAT_PING_PREFIX) {
+                                    tasks.push(Self::heartbeat_pong_task(
+                                        tab_id,
+                                        conn.clone(),
+                                        nonce.to_string(),
+                                    ));
+                                    continue;
+                                }
+
+                                if body.strip_prefix(HEARTBEAT_PONG_PREFIX).is_some() {
+                                    continue;
                                 }
 
                                 if body == OFFLINE_SECRET_REQUEST_SIGNAL {
@@ -5991,6 +8963,8 @@ impl TermchatApp {
                                             tab.session.live_ready = false;
                                             tab.session.offline_mode = false;
                                             tab.session.network_status = NetworkStatus::LocalOk;
+                                            tab.session.heartbeat_last_rx_ms = 0;
+                                            tab.session.heartbeat_last_ping_ms = 0;
                                             Self::clear_outgoing_image_state(tab);
                                             Self::clear_incoming_image_state(tab);
                                         }
@@ -6157,6 +9131,53 @@ impl TermchatApp {
                     }
                 }
 
+                if tab.session.live_ready {
+                    if tab.session.heartbeat_last_rx_ms == 0 {
+                        tab.session.heartbeat_last_rx_ms = now_ms;
+                    }
+
+                    if now_ms.saturating_sub(tab.session.heartbeat_last_rx_ms)
+                        >= HEARTBEAT_TIMEOUT_MS
+                    {
+                        tab.live_conn = None;
+                        tab.session.current_peer_addr = None;
+                        tab.session.current_peer_dest_b64 = None;
+                        tab.session.peer_b32 = None;
+                        tab.session.live_ready = false;
+                        tab.session.offline_mode = false;
+                        tab.session.network_status = NetworkStatus::LocalOk;
+                        tab.session.tofu_verified = false;
+                        tab.session.tofu_mismatch = false;
+                        tab.session.heartbeat_last_rx_ms = 0;
+                        tab.session.heartbeat_last_ping_ms = 0;
+                        tab.e2e = E2E::new(tab.session.pq_enabled);
+                        Self::clear_outgoing_image_state(tab);
+                        Self::clear_incoming_image_state(tab);
+                        push_log(tab, "Peer heartbeat timed out.".to_string());
+                        tab.session.accept_armed = true;
+                        push_log(tab, "Incoming accept loop re-armed.".to_string());
+
+                        let sam = tab.sam.clone();
+                        tasks.push(Task::perform(
+                            async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
+                            move |result| Message::IncomingAccepted(tab_id, result),
+                        ));
+
+                        let close_conn = conn.clone();
+                        tasks.push(Task::perform(
+                            async move { close_conn.close().await.map_err(|e| e.to_string()) },
+                            move |result| Message::CloseFinished(tab_id, result),
+                        ));
+                    } else if now_ms.saturating_sub(tab.session.heartbeat_last_ping_ms)
+                        >= HEARTBEAT_PING_INTERVAL_MS
+                        && now_ms.saturating_sub(tab.session.heartbeat_last_rx_ms)
+                            >= HEARTBEAT_PING_INTERVAL_MS
+                    {
+                        tab.session.heartbeat_last_ping_ms = now_ms;
+                        tasks.push(Self::heartbeat_ping_task(tab_id, conn.clone()));
+                    }
+                }
+
                 if conn.is_closed() && !conn.has_pending_frames() {
                     tab.live_conn = None;
                     tab.session.current_peer_addr = None;
@@ -6167,6 +9188,8 @@ impl TermchatApp {
                     tab.session.network_status = NetworkStatus::LocalOk;
                     tab.session.tofu_verified = false;
                     tab.session.tofu_mismatch = false;
+                    tab.session.heartbeat_last_rx_ms = 0;
+                    tab.session.heartbeat_last_ping_ms = 0;
                     tab.e2e = E2E::new(tab.session.pq_enabled);
                     Self::clear_outgoing_image_state(tab);
                     Self::clear_incoming_image_state(tab);
@@ -6180,8 +9203,9 @@ impl TermchatApp {
                         move |result| Message::IncomingAccepted(tab_id, result),
                     ));
 
+                    let close_conn = conn.clone();
                     tasks.push(Task::perform(
-                        async move { conn.close().await.map_err(|e| e.to_string()) },
+                        async move { close_conn.close().await.map_err(|e| e.to_string()) },
                         move |result| Message::CloseFinished(tab_id, result),
                     ));
                 }
@@ -6552,6 +9576,542 @@ impl TermchatApp {
         tasks
     }
 
+    fn tick_group_tab(&mut self, idx: usize) -> Vec<Task<Message>> {
+        let mut tasks = Vec::new();
+        let is_active = self.session.active_tab_idx == Some(Self::real_to_visible_tab_index(idx));
+        let tab_id;
+        let mut roster_sync_needed = false;
+        let mut received_roster_groups: Vec<String> = Vec::new();
+        let now_ms = Self::now_epoch_millis();
+
+        {
+            let Some(tab) = self.opened_tabs.get_mut(idx) else {
+                return tasks;
+            };
+
+            tab_id = tab.id;
+            let Some(group) = tab.group.as_mut() else {
+                return tasks;
+            };
+            let is_group_admin = Self::group_is_admin(&group.meta);
+
+            let mut any_ready = false;
+
+            for peer in &mut group.peers {
+                let Some(conn) = peer.conn.clone() else {
+                    continue;
+                };
+
+                while let Some(frame) = conn.try_recv_frame() {
+                    peer.heartbeat_last_rx_ms = now_ms;
+                    match frame.msg_type {
+                        MsgType::S => match String::from_utf8(frame.payload) {
+                            Ok(body) => {
+                                if body == "__SIGNAL__:QUIT" {
+                                    peer.conn = None;
+                                    peer.ready = false;
+                                    peer.heartbeat_last_rx_ms = 0;
+                                    peer.heartbeat_last_ping_ms = 0;
+                                    tab.session.log_lines.push(format!(
+                                        "Group member disconnected: {}",
+                                        peer.member.name
+                                    ));
+                                    continue;
+                                }
+
+                                if let Some(nonce) = body.strip_prefix(HEARTBEAT_PING_PREFIX) {
+                                    tasks.push(Self::heartbeat_pong_task(
+                                        tab_id,
+                                        conn.clone(),
+                                        nonce.to_string(),
+                                    ));
+                                    continue;
+                                }
+
+                                if body.strip_prefix(HEARTBEAT_PONG_PREFIX).is_some() {
+                                    continue;
+                                }
+
+                                match SamClient::destination_to_b32(&body) {
+                                    Ok(peer_b32) if peer_b32 == peer.member.b32 => {
+                                        tab.session.log_lines.push(format!(
+                                            "Group member identity verified: {}",
+                                            peer.member.name
+                                        ));
+                                    }
+                                    Ok(peer_b32) => {
+                                        tab.session.log_lines.push(format!(
+                                            "Group identity mismatch for {}: {}",
+                                            peer.member.name, peer_b32
+                                        ));
+                                        peer.conn = None;
+                                        peer.ready = false;
+                                        peer.heartbeat_last_rx_ms = 0;
+                                        peer.heartbeat_last_ping_ms = 0;
+                                    }
+                                    Err(err) => {
+                                        tab.session.log_lines.push(format!(
+                                            "Invalid group identity from {}: {err}",
+                                            peer.member.name
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                tab.session
+                                    .log_lines
+                                    .push("Invalid UTF-8 group identity payload.".into());
+                            }
+                        },
+                        MsgType::K => {
+                            peer.e2e.receive_peer_key(&frame.payload);
+                            if peer.e2e.ready() {
+                                peer.ready = true;
+                                peer.heartbeat_last_rx_ms = now_ms;
+                                peer.heartbeat_last_ping_ms = now_ms;
+                                if is_group_admin {
+                                    roster_sync_needed = true;
+                                }
+                                tab.session.log_lines.push(format!(
+                                    "Group secure session ready: {}",
+                                    peer.member.name
+                                ));
+
+                                if let (Some(my_b32), Some(owner_b32)) =
+                                    (group.meta.my_b32.clone(), group.meta.owner_b32.clone())
+                                {
+                                    if !peer.member.b32.eq_ignore_ascii_case(&owner_b32) {
+                                        continue;
+                                    }
+
+                                    let control = if let Some(token) = group.meta.join_token.clone()
+                                    {
+                                        GroupControlMessage {
+                                            kind: GROUP_CONTROL_JOIN_PROOF.into(),
+                                            token,
+                                            b32: my_b32,
+                                            name: Self::group_self_display_name(&group.meta),
+                                        }
+                                    } else if !is_group_admin
+                                        && !group.meta.my_name.trim().is_empty()
+                                    {
+                                        GroupControlMessage {
+                                            kind: GROUP_CONTROL_RENAME_REQUEST.into(),
+                                            token: String::new(),
+                                            b32: my_b32,
+                                            name: Self::group_self_display_name(&group.meta),
+                                        }
+                                    } else {
+                                        continue;
+                                    };
+
+                                    match serde_json::to_vec(&control) {
+                                        Ok(payload) => {
+                                            let frame = Frame {
+                                                msg_type: MsgType::L,
+                                                msg_id: Self::generate_msg_id_value(),
+                                                payload: peer.e2e.encrypt(&payload),
+                                            };
+                                            let conn = conn.clone();
+                                            tasks.push(Task::perform(
+                                                async move {
+                                                    conn.send_frame(&frame)
+                                                        .await
+                                                        .map_err(|e| e.to_string())
+                                                },
+                                                move |result| Message::SendFinished(tab_id, result),
+                                            ));
+                                            if control.kind == GROUP_CONTROL_JOIN_PROOF {
+                                                tab.session.log_lines.push(format!(
+                                                    "Sent group invite proof to {}.",
+                                                    peer.member.name
+                                                ));
+                                            } else {
+                                                tab.session.log_lines.push(format!(
+                                                    "Sent group rename request to {}.",
+                                                    peer.member.name
+                                                ));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tab.session.log_lines.push(format!(
+                                                "Group invite proof encode failed: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            } else {
+                                tab.session
+                                    .log_lines
+                                    .push(format!("Received group key: {}", peer.member.name));
+                            }
+                        }
+                        MsgType::L => {
+                            if !peer.ready {
+                                continue;
+                            }
+
+                            let plain = peer.e2e.decrypt(&frame.payload);
+                            if let Ok(control) =
+                                serde_json::from_slice::<GroupControlMessage>(&plain)
+                            {
+                                if control.kind == GROUP_CONTROL_JOIN_PROOF {
+                                    if !control.b32.eq_ignore_ascii_case(&peer.member.b32) {
+                                        tab.session.log_lines.push(format!(
+                                            "Rejected group invite proof b32 mismatch from {}.",
+                                            peer.member.name
+                                        ));
+                                        peer.conn = None;
+                                        peer.ready = false;
+                                        peer.authorized = false;
+                                        peer.heartbeat_last_rx_ms = 0;
+                                        peer.heartbeat_last_ping_ms = 0;
+                                        continue;
+                                    }
+
+                                    let member = GroupMember {
+                                        name: control.name,
+                                        b32: control.b32,
+                                    };
+
+                                    match Self::redeem_group_invite_token(
+                                        &mut group.meta,
+                                        &control.token,
+                                        member.clone(),
+                                    ) {
+                                        Ok(()) => {
+                                            peer.member = member.clone();
+                                            peer.authorized = true;
+                                            if is_group_admin {
+                                                roster_sync_needed = true;
+                                            }
+                                            match storage::save_group_meta(&group.meta) {
+                                                Ok(()) => {
+                                                    received_roster_groups.push(
+                                                        storage::group_storage_key(&group.meta),
+                                                    );
+                                                    tab.session.log_lines.push(format!(
+                                                        "Redeemed group invite for {}.",
+                                                        peer.member.name
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    tab.session.log_lines.push(format!(
+                                                        "Group invite redeemed but save failed: {err}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tab.session.log_lines.push(format!(
+                                                "Rejected group invite proof from {}: {err}",
+                                                peer.member.name
+                                            ));
+                                            peer.conn = None;
+                                            peer.ready = false;
+                                            peer.authorized = false;
+                                            peer.heartbeat_last_rx_ms = 0;
+                                            peer.heartbeat_last_ping_ms = 0;
+                                        }
+                                    }
+
+                                    continue;
+                                }
+
+                                if control.kind == GROUP_CONTROL_RENAME_REQUEST {
+                                    if !control.b32.eq_ignore_ascii_case(&peer.member.b32) {
+                                        tab.session.log_lines.push(format!(
+                                            "Rejected group rename request b32 mismatch from {}.",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    }
+
+                                    if !is_group_admin {
+                                        tab.session.log_lines.push(format!(
+                                            "Ignored group rename request from {}: not owner.",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    }
+
+                                    match Self::apply_group_member_rename(
+                                        &mut group.meta,
+                                        &control.b32,
+                                        control.name.clone(),
+                                    ) {
+                                        Ok(changed) => {
+                                            if changed {
+                                                peer.member.name = control.name.clone();
+                                                roster_sync_needed = true;
+                                                match storage::save_group_meta(&group.meta) {
+                                                    Ok(()) => {
+                                                        received_roster_groups.push(
+                                                            storage::group_storage_key(&group.meta),
+                                                        );
+                                                        tab.session.log_lines.push(format!(
+                                                            "Accepted group rename request: {}.",
+                                                            peer.member.name
+                                                        ));
+                                                    }
+                                                    Err(err) => {
+                                                        tab.session.log_lines.push(format!(
+                                                            "Group rename accepted but save failed: {err}"
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                tab.session.log_lines.push(format!(
+                                                    "Group rename request unchanged: {}.",
+                                                    peer.member.name
+                                                ));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tab.session.log_lines.push(format!(
+                                                "Rejected group rename request from {}: {err}",
+                                                peer.member.name
+                                            ));
+                                        }
+                                    }
+
+                                    continue;
+                                }
+                            }
+
+                            if !peer.authorized {
+                                tab.session.log_lines.push(format!(
+                                    "Ignored group roster from unauthorised caller: {}",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            match serde_json::from_slice::<GroupRosterSync>(&plain) {
+                                Ok(roster) => match Self::merge_group_roster_sync(roster) {
+                                    Ok(group_name) => {
+                                        received_roster_groups.push(group_name);
+                                        tab.session.log_lines.push(format!(
+                                            "Merged group roster from {}.",
+                                            peer.member.name
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        tab.session.log_lines.push(format!(
+                                            "Group roster sync failed from {}: {err}",
+                                            peer.member.name
+                                        ));
+                                    }
+                                },
+                                Err(err) => match serde_json::from_slice::<GroupInvite>(&plain) {
+                                    Ok(invite) => match Self::merge_group_invite(invite) {
+                                        Ok(group_name) => {
+                                            received_roster_groups.push(group_name);
+                                            tab.session.log_lines.push(format!(
+                                                "Merged legacy group roster from {}.",
+                                                peer.member.name
+                                            ));
+                                        }
+                                        Err(legacy_err) => {
+                                            tab.session.log_lines.push(format!(
+                                                "Group roster sync failed from {}: {legacy_err}",
+                                                peer.member.name
+                                            ));
+                                        }
+                                    },
+                                    Err(_) => {
+                                        tab.session.log_lines.push(format!(
+                                            "Invalid group roster sync from {}: {err}",
+                                            peer.member.name
+                                        ));
+                                    }
+                                },
+                            }
+                        }
+                        MsgType::U => {
+                            if !peer.ready || !peer.authorized {
+                                tab.session.log_lines.push(format!(
+                                    "Ignored group message before authorised secure session: {}",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            let plain = peer.e2e.decrypt(&frame.payload);
+                            match String::from_utf8(plain) {
+                                Ok(body) => {
+                                    tab.session.bubbles.push(Bubble {
+                                        author: peer.member.name.clone(),
+                                        content: BubbleContent::Text(body),
+                                        mine: false,
+                                        offline: false,
+                                        timestamp_utc: Self::now_utc_hms(),
+                                        msg_id: Some(frame.msg_id),
+                                        delivered: false,
+                                        group_expected_acks: Vec::new(),
+                                        group_received_acks: Vec::new(),
+                                    });
+                                    let ack = Frame {
+                                        msg_type: MsgType::D,
+                                        msg_id: Self::generate_msg_id_value(),
+                                        payload: frame.msg_id.to_be_bytes().to_vec(),
+                                    };
+                                    let conn_for_ack = conn.clone();
+                                    tasks.push(Task::perform(
+                                        async move {
+                                            conn_for_ack
+                                                .send_frame(&ack)
+                                                .await
+                                                .map_err(|e| e.to_string())
+                                        },
+                                        move |result| Message::SendFinished(tab_id, result),
+                                    ));
+                                }
+                                Err(_) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Invalid UTF-8 group message from {}.",
+                                        peer.member.name
+                                    ));
+                                }
+                            }
+                        }
+                        MsgType::D => {
+                            if !peer.ready || !peer.authorized {
+                                continue;
+                            }
+
+                            if frame.payload.len() == 8 {
+                                let mut bytes = [0u8; 8];
+                                bytes.copy_from_slice(&frame.payload);
+                                let delivered_id = u64::from_be_bytes(bytes);
+                                Self::mark_group_delivered(
+                                    &mut tab.session.bubbles,
+                                    delivered_id,
+                                    &peer.member.b32,
+                                );
+                            } else {
+                                tab.session.log_lines.push(format!(
+                                    "Invalid group delivery ACK from {}.",
+                                    peer.member.name
+                                ));
+                            }
+                        }
+                        _ => {
+                            tab.session.log_lines.push(format!(
+                                "Ignored unsupported group frame from {}.",
+                                peer.member.name
+                            ));
+                        }
+                    }
+                }
+
+                if conn.is_closed() && !conn.has_pending_frames() {
+                    let was_ready = peer.ready;
+                    peer.conn = None;
+                    peer.ready = false;
+                    peer.connecting = false;
+                    peer.heartbeat_last_rx_ms = 0;
+                    peer.heartbeat_last_ping_ms = 0;
+
+                    if was_ready {
+                        tab.session
+                            .log_lines
+                            .push(format!("Group member disconnected: {}", peer.member.name));
+                    }
+
+                    continue;
+                }
+
+                if peer.ready && peer.authorized {
+                    if peer.heartbeat_last_rx_ms == 0 {
+                        peer.heartbeat_last_rx_ms = now_ms;
+                    }
+
+                    if now_ms.saturating_sub(peer.heartbeat_last_rx_ms) >= HEARTBEAT_TIMEOUT_MS {
+                        peer.conn = None;
+                        peer.ready = false;
+                        peer.connecting = false;
+                        peer.heartbeat_last_rx_ms = 0;
+                        peer.heartbeat_last_ping_ms = 0;
+                        tab.session.log_lines.push(format!(
+                            "Group member heartbeat timed out: {}",
+                            peer.member.name
+                        ));
+                        let close_conn = conn.clone();
+                        tasks.push(Task::perform(
+                            async move { close_conn.close().await.map_err(|e| e.to_string()) },
+                            move |result| Message::CloseFinished(tab_id, result),
+                        ));
+                        continue;
+                    } else if now_ms.saturating_sub(peer.heartbeat_last_ping_ms)
+                        >= HEARTBEAT_PING_INTERVAL_MS
+                        && now_ms.saturating_sub(peer.heartbeat_last_rx_ms)
+                            >= HEARTBEAT_PING_INTERVAL_MS
+                    {
+                        peer.heartbeat_last_ping_ms = now_ms;
+                        tasks.push(Self::heartbeat_ping_task(tab_id, conn.clone()));
+                    }
+                }
+
+                if peer.ready && peer.authorized {
+                    any_ready = true;
+                }
+            }
+
+            tab.session.live_ready = any_ready;
+            tab.session.network_status = if any_ready {
+                NetworkStatus::Visible
+            } else if tab.meta.initialized {
+                NetworkStatus::LocalOk
+            } else {
+                NetworkStatus::Initializing
+            };
+            tab.meta.connected = any_ready;
+            tab.meta.has_incoming = false;
+        }
+
+        for group_key in received_roster_groups {
+            if let Ok(group) = storage::load_group_meta(&group_key) {
+                if let Some(idx) = self.session.groups.iter().position(|existing| {
+                    storage::group_storage_key(existing) == storage::group_storage_key(&group)
+                }) {
+                    self.session.groups[idx] = group.clone();
+                } else {
+                    self.session.groups.push(group.clone());
+                    self.session
+                        .groups
+                        .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                }
+                self.update_open_group_roster(&group);
+            }
+        }
+
+        if is_active {
+            self.load_active_runtime();
+        }
+
+        let should_connect = self
+            .opened_tabs
+            .get(idx)
+            .and_then(|tab| tab.group.as_ref())
+            .map(|group| {
+                group.peers.iter().any(|peer| {
+                    peer.authorized && !peer.ready && !peer.connecting && peer.conn.is_none()
+                })
+            })
+            .unwrap_or(false);
+
+        if should_connect {
+            tasks.extend(self.group_connect_tasks(tab_id));
+        }
+
+        if roster_sync_needed {
+            tasks.push(self.send_group_roster_sync_task(tab_id));
+        }
+
+        tasks
+    }
+
     fn action_placeholder(action: GuiAction) -> &'static str {
         match action {
             GuiAction::Connect => "Enter peer b32.i2p address...",
@@ -6578,6 +10138,8 @@ impl TermchatApp {
             timestamp_utc: Self::now_utc_hms(),
             msg_id: None,
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         };
 
         let idx = self.session.bubbles.len();
@@ -6750,6 +10312,8 @@ impl TermchatApp {
             timestamp_utc: Self::now_utc_hms(),
             msg_id: None,
             delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
         };
 
         let idx = tab.session.bubbles.len();
@@ -6776,24 +10340,65 @@ impl TermchatApp {
         }
     }
 
+    fn mark_group_delivered(bubbles: &mut [Bubble], delivered_id: u64, peer_b32: &str) {
+        let peer_b32 = peer_b32.to_ascii_lowercase();
+
+        for bubble in bubbles.iter_mut().rev() {
+            if !bubble.mine
+                || bubble.msg_id != Some(delivered_id)
+                || bubble.group_expected_acks.is_empty()
+            {
+                continue;
+            }
+
+            if !bubble
+                .group_expected_acks
+                .iter()
+                .any(|b32| b32.eq_ignore_ascii_case(&peer_b32))
+            {
+                break;
+            }
+
+            if !bubble
+                .group_received_acks
+                .iter()
+                .any(|b32| b32.eq_ignore_ascii_case(&peer_b32))
+            {
+                bubble.group_received_acks.push(peer_b32);
+            }
+
+            bubble.delivered = bubble.group_received_acks.len() >= bubble.group_expected_acks.len();
+            break;
+        }
+    }
+
     fn left_status_indicators<'a>(session: &'a SessionState) -> iced::widget::Row<'a, Message> {
-        let mut row_acc = row![
-            mode_indicator(&session.profile),
-            profile_indicator(&session.profile),
-            indicator(
-                if session.stored_peer.is_some() {
-                    "LOCK"
-                } else {
-                    "UNLOCK"
-                },
-                if session.stored_peer.is_some() {
-                    PY_GREEN
-                } else {
-                    PY_RED
-                }
-            ),
-        ]
-        .spacing(6);
+        let mut row_acc = if session.profile.starts_with("group:") {
+            row![
+                mode_indicator(&session.profile),
+                bold_indicator("G", PY_GREEN),
+                owned_profile_indicator(Self::group_status_display_name(session)),
+            ]
+            .spacing(6)
+        } else {
+            row![
+                mode_indicator(&session.profile),
+                profile_indicator(&session.profile),
+                indicator(
+                    if session.stored_peer.is_some() {
+                        "LOCK"
+                    } else {
+                        "UNLOCK"
+                    },
+                    if session.stored_peer.is_some() {
+                        PY_GREEN
+                    } else {
+                        PY_RED
+                    }
+                ),
+            ]
+            .spacing(6)
+        };
 
         if !session.offline_mode && (session.live_ready || session.pending_peer_addr.is_some()) {
             if session.tofu_mismatch {
@@ -6828,6 +10433,38 @@ impl TermchatApp {
         row_acc
     }
 
+    fn group_status_display_name(session: &SessionState) -> String {
+        let active_group_key = session.profile.strip_prefix("group:");
+
+        let active_group = active_group_key
+            .and_then(|key| {
+                session
+                    .groups
+                    .iter()
+                    .find(|group| storage::group_storage_key(group) == key)
+            })
+            .or_else(|| {
+                session
+                    .selected_group_idx
+                    .and_then(|idx| session.groups.get(idx))
+            });
+
+        if let Some(group) = active_group {
+            return Self::group_self_display_name(group);
+        }
+
+        let trimmed = session.group_display_name_input.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+
+        if session.my_b32.is_some() {
+            return format!("member-{}", short_b32(session.my_b32.as_deref()));
+        }
+
+        active_group_key.unwrap_or("group").to_string()
+    }
+
     fn has_active_connection_attempt(&self) -> bool {
         self.active_live_conn().is_some() || self.active_pending_conn().is_some()
     }
@@ -6857,10 +10494,80 @@ impl TermchatApp {
         }
     }
 
+    fn active_tab_is_group(&self) -> bool {
+        self.active_tab()
+            .map(|tab| tab.meta.kind == TabKind::Group)
+            .unwrap_or(false)
+    }
+
+    fn active_group_ready_count(&self) -> usize {
+        self.active_tab()
+            .and_then(|tab| tab.group.as_ref())
+            .map(|group| {
+                group
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.ready && peer.authorized)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     fn is_profile_open_in_any_tab(&self, profile_name: &str) -> bool {
         self.opened_tabs
             .iter()
             .any(|tab| tab.meta.profile_name == profile_name)
+    }
+
+    fn is_group_open_in_any_tab(&self, group_key: &str) -> bool {
+        let profile_name = format!("group:{group_key}");
+        self.opened_tabs
+            .iter()
+            .any(|tab| tab.meta.kind == TabKind::Group && tab.meta.profile_name == profile_name)
+    }
+
+    fn update_open_group_roster(&mut self, group: &GroupMeta) {
+        for tab in &mut self.opened_tabs {
+            let Some(runtime) = tab.group.as_mut() else {
+                continue;
+            };
+
+            if storage::group_storage_key(&runtime.meta) != storage::group_storage_key(group) {
+                continue;
+            }
+
+            runtime.meta = group.clone();
+            runtime.peers.retain(|peer| {
+                group
+                    .members
+                    .iter()
+                    .any(|member| member.b32.eq_ignore_ascii_case(&peer.member.b32))
+            });
+
+            for member in &group.members {
+                if let Some(peer) = runtime
+                    .peers
+                    .iter_mut()
+                    .find(|peer| peer.member.b32.eq_ignore_ascii_case(&member.b32))
+                {
+                    peer.member.name = member.name.clone();
+                    continue;
+                }
+
+                runtime.peers.push(GroupPeerRuntime {
+                    member: member.clone(),
+                    conn: None,
+                    pending_conn: None,
+                    e2e: E2E::new(false),
+                    ready: false,
+                    authorized: true,
+                    connecting: false,
+                    last_connect_attempt_ms: 0,
+                    heartbeat_last_rx_ms: 0,
+                    heartbeat_last_ping_ms: 0,
+                });
+            }
+        }
     }
 
     fn offline_state_peer_b32_for_session(session: &SessionState) -> Option<&str> {
@@ -7082,6 +10789,26 @@ impl TermchatApp {
         }
 
         let host = &server[..server.len() - 8];
+
+        if !matches!(host.len(), 52 | 56) {
+            return false;
+        }
+
+        host.chars().all(|ch| matches!(ch, 'a'..='z' | '2'..='7'))
+    }
+
+    fn is_valid_b32_address(address: &str) -> bool {
+        let address = address.trim().to_lowercase();
+
+        if address.is_empty() {
+            return false;
+        }
+
+        if !address.ends_with(".b32.i2p") {
+            return false;
+        }
+
+        let host = &address[..address.len() - 8];
 
         if !matches!(host.len(), 52 | 56) {
             return false;
@@ -7678,8 +11405,7 @@ fn bubble_timestamp_row<'a>(bubble: &'a Bubble) -> Element<'a, Message> {
         text(&bubble.timestamp_utc)
             .size(10)
             .color(Color::from_rgb8(140, 140, 140)),
-        if bubble.mine && bubble.delivered {
-            let mark = if bubble.offline { " ✓" } else { " ✓✓" };
+        if let Some(mark) = bubble_delivery_mark(bubble) {
             container(text(mark).size(11).color(Color::from_rgb8(0, 200, 0))).padding(
                 iced::Padding {
                     top: 0.0,
@@ -7698,18 +11424,153 @@ fn bubble_timestamp_row<'a>(bubble: &'a Bubble) -> Element<'a, Message> {
     .into()
 }
 
-fn message_row<'a>(bubble: &'a Bubble) -> Element<'a, Message> {
+fn bubble_timestamp_inline<'a>(bubble: &'a Bubble) -> Element<'a, Message> {
+    row![
+        text(&bubble.timestamp_utc)
+            .size(10)
+            .color(Color::from_rgb8(140, 140, 140)),
+        if let Some(mark) = bubble_delivery_mark(bubble) {
+            container(text(mark).size(11).color(Color::from_rgb8(0, 200, 0))).padding(
+                iced::Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 1.0,
+                    left: 0.0,
+                },
+            )
+        } else {
+            container(text(""))
+        },
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn bubble_delivery_mark(bubble: &Bubble) -> Option<String> {
+    if !bubble.mine {
+        return None;
+    }
+
+    if !bubble.group_expected_acks.is_empty() {
+        return Some(format!(
+            " ✓ {}/{}",
+            bubble
+                .group_received_acks
+                .len()
+                .min(bubble.group_expected_acks.len()),
+            bubble.group_expected_acks.len()
+        ));
+    }
+
+    if bubble.delivered {
+        return Some(if bubble.offline { " ✓" } else { " ✓✓" }.into());
+    }
+
+    None
+}
+
+fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
     let (body, max_width): (Element<'a, Message>, f32) = match &bubble.content {
         BubbleContent::Text(value) => {
-            let body_width = text_bubble_body_width(value, bubble.mine && bubble.delivered);
-
-            (
-                column![
+            let show_author = should_show_bubble_author(bubble);
+            let mut body_width =
+                text_bubble_body_width(value, bubble_delivery_mark(bubble).is_some());
+            if show_author {
+                let author_width = bubble.author.chars().count() as f32 * 7.0 + 4.0;
+                body_width = body_width
+                    .max(author_width)
+                    .min(TEXT_BUBBLE_MAX_WIDTH - 24.0);
+            }
+            let message_body: Element<'a, Message> =
+                if let Some(reply) = parse_reply_text(value.as_str()) {
+                    column![
+                        container(
+                            column![
+                                text(format!("Reply to {}", reply.author))
+                                    .size(10)
+                                    .color(Color::from_rgb8(155, 155, 164)),
+                                text(reply.quote)
+                                    .size(11)
+                                    .color(Color::from_rgb8(178, 178, 186))
+                                    .width(Length::Fill)
+                                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                            ]
+                            .spacing(2),
+                        )
+                        .width(Length::Fill)
+                        .padding([5, 7])
+                        .style(|_| quoted_reply_style()),
+                        text(reply.body)
+                            .size(12)
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                    ]
+                    .spacing(6)
+                    .into()
+                } else {
                     text(value)
                         .size(12)
                         .width(Length::Fill)
-                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                    bubble_timestamp_row(bubble),
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .into()
+                };
+            let author_label: Element<'a, Message> = if show_author {
+                text(&bubble.author)
+                    .size(10)
+                    .color(Color::from_rgb8(155, 155, 164))
+                    .width(Length::Fill)
+                    .into()
+            } else {
+                Space::new().height(0).into()
+            };
+
+            (
+                column![
+                    author_label,
+                    message_body,
+                    row![
+                        button(
+                            text("\u{e14d}")
+                                .font(Font {
+                                    family: font::Family::Name(APP_ICON_FONT_FAMILY),
+                                    ..Font::default()
+                                })
+                                .size(12)
+                        )
+                        .width(20)
+                        .height(16)
+                        .padding(iced::Padding {
+                            top: 0.0,
+                            right: 2.0,
+                            bottom: 2.0,
+                            left: 4.0,
+                        })
+                        .style(copy_bubble_button_style)
+                        .on_press(Message::CopyBubbleTextPressed(idx)),
+                        button(
+                            text("\u{e15e}")
+                                .font(Font {
+                                    family: font::Family::Name(APP_ICON_FONT_FAMILY),
+                                    ..Font::default()
+                                })
+                                .size(12)
+                        )
+                        .width(20)
+                        .height(16)
+                        .padding(iced::Padding {
+                            top: 0.0,
+                            right: 2.0,
+                            bottom: 2.0,
+                            left: 4.0,
+                        })
+                        .style(copy_bubble_button_style)
+                        .on_press(Message::ReplyBubblePressed(idx)),
+                        Space::new().width(Length::Fill),
+                        bubble_timestamp_inline(bubble),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
                 ]
                 .spacing(6)
                 .width(body_width)
@@ -7836,23 +11697,80 @@ fn image_display_size(width: u32, height: u32) -> (f32, f32) {
 }
 
 fn text_bubble_body_width(value: &str, delivered: bool) -> f32 {
-    let longest_line_chars = value
+    let display_value = display_reply_text(value);
+    let longest_line_chars = display_value
         .lines()
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(0) as f32;
 
     let estimated_text_width = longest_line_chars * 8.0 + 4.0;
-    let footer_width = if delivered {
-        TEXT_BUBBLE_MIN_BODY_WIDTH
-    } else {
-        64.0
-    };
+    let footer_width = if delivered { 160.0 } else { 144.0 };
     let max_body_width = TEXT_BUBBLE_MAX_WIDTH - 24.0;
 
     estimated_text_width
         .max(footer_width)
         .clamp(TEXT_BUBBLE_MIN_BODY_WIDTH, max_body_width)
+}
+
+fn should_show_bubble_author(bubble: &Bubble) -> bool {
+    if bubble.mine {
+        return false;
+    }
+
+    !matches!(
+        bubble.author.as_str(),
+        "Peer" | "Peer-Offline" | "Me" | "Me-Offline"
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ParsedReply {
+    author: String,
+    quote: String,
+    body: String,
+}
+
+fn parse_reply_text(value: &str) -> Option<ParsedReply> {
+    let rest = value.strip_prefix(REPLY_BEGIN_MARKER)?.strip_prefix('\n')?;
+    let (author, rest) = rest.split_once('\n')?;
+    let rest = rest.strip_prefix(REPLY_QUOTE_MARKER)?.strip_prefix('\n')?;
+    let end_marker = format!("\n{REPLY_END_MARKER}\n");
+    let (quote, body) = rest.split_once(end_marker.as_str())?;
+
+    Some(ParsedReply {
+        author: author.to_string(),
+        quote: quote.to_string(),
+        body: body.to_string(),
+    })
+}
+
+fn display_reply_text(value: &str) -> String {
+    if let Some(reply) = parse_reply_text(value) {
+        format!("Reply to {}\n{}\n{}", reply.author, reply.quote, reply.body)
+    } else {
+        value.to_string()
+    }
+}
+
+fn reply_source_text(value: &str) -> String {
+    if let Some(reply) = parse_reply_text(value) {
+        reply.body
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_reply_preview(value: &str, max_chars: usize) -> String {
+    let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if flattened.chars().count() <= max_chars {
+        return flattened;
+    }
+
+    let mut out = flattened.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn short_b32(addr: Option<&str>) -> String {
@@ -7894,6 +11812,13 @@ fn mode_indicator<'a>(profile: &'a str) -> iced::widget::Container<'a, Message> 
 }
 
 fn profile_indicator<'a>(profile: &'a str) -> iced::widget::Container<'a, Message> {
+    let name = profile.to_uppercase();
+    container(text(name).size(13).font(indicator_font()))
+        .padding([4, 10])
+        .style(|_| indicator_style(Color::from_rgb8(35, 35, 40), Color::WHITE))
+}
+
+fn owned_profile_indicator<'a>(profile: String) -> iced::widget::Container<'a, Message> {
     let name = profile.to_uppercase();
     container(text(name).size(13).font(indicator_font()))
         .padding([4, 10])
@@ -8216,6 +12141,18 @@ fn status_address_button_style(
     }
 }
 
+fn status_address_container_style() -> container::Style {
+    container::Style {
+        background: None,
+        border: border::Border {
+            color: Color::from_rgb8(70, 70, 80),
+            width: 1.5,
+            radius: border::Radius::from(3.0),
+        },
+        ..Default::default()
+    }
+}
+
 fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool) -> Element<'a, Message> {
     if tab.initializing {
         let frame = APP_TAB_SPINNER_FRAMES
@@ -8285,6 +12222,13 @@ fn sidebar_panel_style() -> container::Style {
     }
 }
 
+fn sidebar_divider_style() -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb8(76, 76, 84))),
+        ..Default::default()
+    }
+}
+
 fn message_panel_style() -> container::Style {
     container::Style {
         background: Some(Background::Color(Color::from_rgb8(15, 15, 20))),
@@ -8304,6 +12248,30 @@ fn log_panel_style() -> container::Style {
             color: Color::from_rgb8(180, 180, 180),
             width: 1.0,
             radius: border::Radius::from(6.0),
+        },
+        ..Default::default()
+    }
+}
+
+fn reply_preview_style() -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb8(20, 20, 25))),
+        border: border::Border {
+            color: Color::from_rgb8(74, 74, 84),
+            width: 1.0,
+            radius: border::Radius::from(4.0),
+        },
+        ..Default::default()
+    }
+}
+
+fn quoted_reply_style() -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb8(18, 18, 22))),
+        border: border::Border {
+            color: Color::from_rgb8(82, 82, 92),
+            width: 1.0,
+            radius: border::Radius::from(4.0),
         },
         ..Default::default()
     }
@@ -8338,6 +12306,45 @@ pub fn app_button_style(
         background: Some(Background::Color(bg)),
         text_color,
         border: border::rounded(3),
+        ..Default::default()
+    }
+}
+
+fn copy_bubble_button_style(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let (bg, text_color, border_color) = match status {
+        iced::widget::button::Status::Active => (
+            Color::from_rgba8(80, 80, 88, 0.35),
+            Color::from_rgb8(178, 178, 184),
+            Color::from_rgba8(130, 130, 140, 0.35),
+        ),
+        iced::widget::button::Status::Hovered => (
+            Color::from_rgba8(96, 96, 106, 0.55),
+            Color::from_rgb8(210, 210, 216),
+            Color::from_rgba8(160, 160, 170, 0.65),
+        ),
+        iced::widget::button::Status::Pressed => (
+            Color::from_rgba8(70, 70, 78, 0.65),
+            Color::from_rgb8(230, 230, 235),
+            Color::from_rgba8(180, 180, 190, 0.75),
+        ),
+        iced::widget::button::Status::Disabled => (
+            Color::from_rgba8(60, 60, 66, 0.20),
+            Color::from_rgb8(120, 120, 126),
+            Color::from_rgba8(100, 100, 108, 0.20),
+        ),
+    };
+
+    iced::widget::button::Style {
+        background: Some(Background::Color(bg)),
+        text_color,
+        border: border::Border {
+            color: border_color,
+            width: 1.0,
+            radius: border::Radius::from(3.0),
+        },
         ..Default::default()
     }
 }

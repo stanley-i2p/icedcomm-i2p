@@ -15,6 +15,8 @@ use constants::APP_FONT_FAMILY;
 use iced::{Font, Theme, application, window};
 
 const INTER_FONT_BYTES: &[u8] = include_bytes!("../fonts/Inter-VariableFont_opsz,wght.ttf");
+const MATERIAL_SYMBOLS_ROUNDED_BYTES: &[u8] =
+    include_bytes!("../fonts/MaterialSymbolsRounded[FILL,GRAD,opsz,wght].ttf");
 
 fn app_title(_: &TermchatApp) -> String {
     String::from("IcedComm-I2P")
@@ -35,6 +37,7 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .font(INTER_FONT_BYTES)
+        .font(MATERIAL_SYMBOLS_ROUNDED_BYTES)
         .default_font(Font::with_name(APP_FONT_FAMILY))
         .run()
 }

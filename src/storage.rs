@@ -5,6 +5,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -50,6 +51,67 @@ pub struct ContactMeta {
     pub pq_enabled: bool,
     #[serde(default)]
     pub deaddrop_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub name: String,
+    pub b32: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupIssuedInvite {
+    pub token: String,
+    #[serde(default)]
+    pub redeemed_b32: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMeta {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub my_dest_b64: Option<String>,
+    #[serde(default)]
+    pub my_b32: Option<String>,
+    #[serde(default)]
+    pub my_name: String,
+    #[serde(default)]
+    pub owner_b32: Option<String>,
+    #[serde(default)]
+    pub roster_version: u64,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+    #[serde(default)]
+    pub join_token: Option<String>,
+    #[serde(default)]
+    pub issued_invites: Vec<GroupIssuedInvite>,
+    #[serde(default)]
+    pub roster_signing_pubkey: Option<String>,
+    #[serde(default)]
+    pub roster_signing_secret: Option<String>,
+    #[serde(default)]
+    pub roster_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupInvite {
+    pub format: String,
+    pub version: u32,
+    pub group_name: String,
+    pub inviter_name: String,
+    pub inviter_b32: String,
+    #[serde(default)]
+    pub owner_b32: Option<String>,
+    #[serde(default)]
+    pub invite_token: Option<String>,
+    pub roster_version: u64,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+    #[serde(default)]
+    pub roster_signing_pubkey: Option<String>,
+    #[serde(default)]
+    pub roster_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +199,48 @@ impl ContactMeta {
     }
 }
 
+impl GroupMeta {
+    pub fn new(name: String) -> Self {
+        Self {
+            id: temporary_group_id(&name),
+            name,
+            my_dest_b64: None,
+            my_b32: None,
+            my_name: String::new(),
+            owner_b32: None,
+            roster_version: 1,
+            members: Vec::new(),
+            join_token: None,
+            issued_invites: Vec::new(),
+            roster_signing_pubkey: None,
+            roster_signing_secret: None,
+            roster_signature: None,
+        }
+    }
+}
+
+pub fn temporary_group_id(name: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("tmp_{}_{}", name.trim(), nanos)
+}
+
+pub fn group_storage_key(meta: &GroupMeta) -> String {
+    if !meta.id.trim().is_empty() {
+        return meta.id.clone();
+    }
+
+    if let Some(owner_b32) = meta.owner_b32.as_deref() {
+        if !owner_b32.trim().is_empty() {
+            return owner_b32.to_string();
+        }
+    }
+
+    temporary_group_id(&meta.name)
+}
+
 pub struct AppLock {
     file: File,
 }
@@ -175,8 +279,16 @@ pub fn contacts_dir() -> PathBuf {
     base_dir().join("profiles")
 }
 
+pub fn groups_dir() -> PathBuf {
+    base_dir().join("groups")
+}
+
 pub fn contact_dir(name: &str) -> PathBuf {
     contacts_dir().join(name)
+}
+
+pub fn group_dir(key: &str) -> PathBuf {
+    groups_dir().join(key)
 }
 
 pub fn contact_dat_path(name: &str) -> PathBuf {
@@ -185,6 +297,10 @@ pub fn contact_dat_path(name: &str) -> PathBuf {
 
 pub fn deaddrop_stats_path(name: &str) -> PathBuf {
     contact_dir(name).join("deaddrop_stats.json")
+}
+
+pub fn group_meta_path(key: &str) -> PathBuf {
+    group_dir(key).join("group.json")
 }
 
 pub fn app_lock_path() -> PathBuf {
@@ -198,6 +314,7 @@ pub fn app_config_path() -> PathBuf {
 pub fn ensure_base_layout() -> Result<(), StorageError> {
     create_dir_secure_all(&base_dir())?;
     create_dir_secure_all(&contacts_dir())?;
+    create_dir_secure_all(&groups_dir())?;
     create_dir_secure_all(&files_dir())?;
     Ok(())
 }
@@ -307,6 +424,108 @@ pub fn create_contact(name: &str) -> Result<ContactMeta, StorageError> {
     let meta = ContactMeta::new(name.to_string());
     save_contact_meta(&meta)?;
     Ok(meta)
+}
+
+pub fn load_groups() -> Result<Vec<GroupMeta>, StorageError> {
+    ensure_base_layout()?;
+
+    let mut out = Vec::new();
+    let entries = fs::read_dir(groups_dir()).map_err(|e| StorageError::Io(e.to_string()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| StorageError::Io(e.to_string()))?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(key) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        let meta_path = group_meta_path(key);
+        if meta_path.exists() {
+            let mut meta = load_group_meta(key)?;
+            if meta.id.trim().is_empty() {
+                meta.id = key.to_string();
+                save_group_meta(&meta)?;
+            }
+            out.push(meta);
+        } else {
+            let mut meta = GroupMeta::new(key.to_string());
+            meta.id = key.to_string();
+            save_group_meta(&meta)?;
+            out.push(meta);
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| group_storage_key(a).cmp(&group_storage_key(b)))
+    });
+    Ok(out)
+}
+
+pub fn create_group(name: &str) -> Result<GroupMeta, StorageError> {
+    validate_contact_name(name)?;
+    ensure_base_layout()?;
+
+    let meta = GroupMeta::new(name.to_string());
+    let dir = group_dir(&meta.id);
+    if dir.exists() {
+        return Err(StorageError::InvalidName("group already exists".into()));
+    }
+
+    create_dir_secure_all(&dir)?;
+
+    save_group_meta(&meta)?;
+    Ok(meta)
+}
+
+pub fn delete_group(key: &str) -> Result<(), StorageError> {
+    validate_contact_name(key)?;
+
+    let dir = group_dir(key);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| StorageError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+pub fn load_group_meta(key: &str) -> Result<GroupMeta, StorageError> {
+    validate_contact_name(key)?;
+
+    let path = group_meta_path(key);
+    let mut f = File::open(&path).map_err(|e| StorageError::Io(e.to_string()))?;
+
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+
+    let mut meta: GroupMeta =
+        serde_json::from_str(&s).map_err(|e| StorageError::Serde(e.to_string()))?;
+    if meta.id.trim().is_empty() {
+        meta.id = key.to_string();
+    }
+    Ok(meta)
+}
+
+pub fn save_group_meta(meta: &GroupMeta) -> Result<(), StorageError> {
+    validate_contact_name(&meta.name)?;
+    let key = group_storage_key(meta);
+    validate_contact_name(&key)?;
+
+    let dir = group_dir(&key);
+    create_dir_secure_all(&dir)?;
+
+    let path = group_meta_path(&key);
+    let text =
+        serde_json::to_string_pretty(meta).map_err(|e| StorageError::Serde(e.to_string()))?;
+
+    atomic_write_text(&path, &text)
 }
 
 pub fn delete_contact(name: &str) -> Result<(), StorageError> {
