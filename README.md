@@ -2,7 +2,7 @@
 
 **An Iced-powered, maximum-security GUI messaging tool for one-to-one communication over I2P.**
 
-Current version: **1.0.0-beta.1**
+Current version: **1.0.0-beta.2**
 
 
 ### GUI Implementation Notice
