@@ -547,6 +547,7 @@ pub struct SessionState {
     pub show_deaddrop_panel: bool,
     pub show_group_panel: bool,
     pub deaddrop_server_input: String,
+    pub deaddrop_delete_confirm: Option<DdServerDeleteConfirm>,
     pub log_lines: Vec<String>,
     pub messages_scroll_id: ScrollableId,
     pub logs_scroll_id: ScrollableId,
@@ -561,6 +562,12 @@ pub struct SessionState {
     pub drop_window: u32,
     pub consumed_drop_recv: Vec<u64>,
     pub seen_drop_msgs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DdServerDeleteConfirm {
+    pub index: usize,
+    pub server: String,
 }
 
 #[derive(Debug, Clone)]
@@ -627,6 +634,7 @@ impl Default for SessionState {
             show_deaddrop_panel: false,
             show_group_panel: false,
             deaddrop_server_input: String::new(),
+            deaddrop_delete_confirm: None,
             log_lines: vec![
                 format!("{APP_NAME} {APP_VERSION}"),
                 "Application ready.".into(),
@@ -764,6 +772,8 @@ pub enum Message {
     DdServerInputChanged(String),
     DdServerAddPressed,
     DdServerDeletePressed(usize),
+    DdServerDeleteConfirmed,
+    DdServerDeleteCancelled,
     DdServerSharePressed,
     GroupSelected(usize),
     GroupNameInputChanged(String),
@@ -3534,13 +3544,62 @@ impl TermchatApp {
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
-                let removed = state.session.deaddrop_servers.remove(index);
+                state.session.deaddrop_delete_confirm = Some(DdServerDeleteConfirm {
+                    index,
+                    server: state.session.deaddrop_servers[index].clone(),
+                });
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::DdServerDeleteConfirmed => {
+                let Some(confirm) = state.session.deaddrop_delete_confirm.clone() else {
+                    return Task::none();
+                };
+                state.session.deaddrop_delete_confirm = None;
+
+                if !Self::deaddrop_panel_allowed(&state.session) {
+                    state.post_system(
+                        "Deaddrop servers are available only for persistent locked profiles.",
+                    );
+                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                }
+
+                let remove_index = if state
+                    .session
+                    .deaddrop_servers
+                    .get(confirm.index)
+                    .map(|server| server == &confirm.server)
+                    .unwrap_or(false)
+                {
+                    Some(confirm.index)
+                } else {
+                    state
+                        .session
+                        .deaddrop_servers
+                        .iter()
+                        .position(|server| server == &confirm.server)
+                };
+
+                let Some(remove_index) = remove_index else {
+                    state.post_system("Deaddrop server is already removed.");
+                    state.store_active_runtime();
+                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                };
+
+                let removed = state.session.deaddrop_servers.remove(remove_index);
                 state.session.deaddrop_stats.remove(&removed);
                 state.post_system(format!("Removed deaddrop server: {removed}"));
                 state.store_active_runtime();
                 state.sync_active_deaddrop_servers();
                 state.save_active_contact_meta();
                 return operation::snap_to_end(state.session.logs_scroll_id.clone());
+            }
+
+            Message::DdServerDeleteCancelled => {
+                state.session.deaddrop_delete_confirm = None;
+                state.store_active_runtime();
+                return Task::none();
             }
 
             Message::DdServerSharePressed => {
@@ -6200,6 +6259,7 @@ impl TermchatApp {
         let show_deaddrop_panel =
             state.session.show_deaddrop_panel && Self::deaddrop_panel_allowed(&state.session);
 
+        let dd_delete_confirm = state.session.deaddrop_delete_confirm.clone();
         let deaddrop_rows = if state.session.deaddrop_servers.is_empty() {
             column![
                 text("No deaddrop servers configured.")
@@ -6243,14 +6303,39 @@ impl TermchatApp {
                         button(text("Delete").size(12))
                             .padding([4, 8])
                             .style(app_button_style)
-                            .on_press(Message::DdServerDeletePressed(idx)),
+                            .on_press_maybe(
+                                dd_delete_confirm
+                                    .is_none()
+                                    .then_some(Message::DdServerDeletePressed(idx))
+                            ),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)
                     .width(Length::Fill);
 
+                    let server_confirm = match &dd_delete_confirm {
+                        Some(confirm) if confirm.index == idx && confirm.server == *server => {
+                            column![
+                                text("Delete this deaddrop server?").size(12),
+                                row![
+                                    button(text("Yes").size(12))
+                                        .padding([4, 8])
+                                        .style(app_button_style)
+                                        .on_press(Message::DdServerDeleteConfirmed),
+                                    button(text("No").size(12))
+                                        .padding([4, 8])
+                                        .style(app_button_style)
+                                        .on_press(Message::DdServerDeleteCancelled),
+                                ]
+                                .spacing(6)
+                            ]
+                            .spacing(6)
+                        }
+                        _ => column![],
+                    };
+
                     col.push(
-                        container(server_record)
+                        container(column![server_record, server_confirm].spacing(8))
                             .padding(12)
                             .width(Length::Fill)
                             .style(|_| operation_panel_style()),
