@@ -1601,10 +1601,14 @@ impl TermchatApp {
 
         Task::perform(
             async move {
-                let session_label: String = profile_name
-                    .chars()
-                    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-                    .collect();
+                let session_label = if tab_kind == TabKind::Group {
+                    group_sam_session_label(&profile_name)
+                } else {
+                    profile_name
+                        .chars()
+                        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                        .collect()
+                };
                 let session_id = format!(
                     "chat_{}_{}",
                     session_label,
@@ -11869,6 +11873,25 @@ fn short_b32(addr: Option<&str>) -> String {
     } else {
         "----".into()
     }
+}
+
+fn group_sam_session_label(profile_name: &str) -> String {
+    let clean_key = profile_name
+        .strip_prefix("group:")
+        .unwrap_or(profile_name)
+        .trim()
+        .trim_end_matches(".b32.i2p")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+
+    let compact = if clean_key.len() > 12 {
+        format!("{}_{}", &clean_key[..6], &clean_key[clean_key.len() - 6..])
+    } else {
+        clean_key
+    };
+
+    format!("group_{}", compact)
 }
 
 fn short_peer_b32(addr: Option<&str>, is_active: bool) -> String {
