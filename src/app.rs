@@ -137,6 +137,7 @@ const REPLY_QUOTE_MARKER: &str = "[ICEDCOMM-QUOTE]";
 const REPLY_END_MARKER: &str = "[/ICEDCOMM-REPLY]";
 const IMAGE_TRANSFER_MAX_DIMENSION: u32 = 1280;
 const IMAGE_TRANSFER_JPEG_QUALITY: u8 = 82;
+const GROUP_IMAGE_TRANSFER_MAX_BYTES: usize = 2 * 1024 * 1024;
 const GROUP_INVITE_STRING_PREFIX: &str = "ICEDCOMM-GROUP-INVITE-v1:";
 const GROUP_CONTROL_JOIN_PROOF: &str = "join_proof";
 const GROUP_CONTROL_RENAME_REQUEST: &str = "rename_request";
@@ -229,6 +230,12 @@ pub struct GroupPeerRuntime {
     pub last_connect_attempt_ms: u64,
     pub heartbeat_last_rx_ms: u64,
     pub heartbeat_last_ping_ms: u64,
+    pub incoming_image_name: Option<String>,
+    pub incoming_image_mime: Option<String>,
+    pub incoming_image_expected: u64,
+    pub incoming_image_received: u64,
+    pub incoming_image_msg_id: u64,
+    pub incoming_image_bytes: Vec<u8>,
 }
 
 pub struct GroupRuntime {
@@ -1092,18 +1099,7 @@ impl TermchatApp {
             .members
             .iter()
             .cloned()
-            .map(|member| GroupPeerRuntime {
-                member,
-                conn: None,
-                pending_conn: None,
-                e2e: E2E::new(false),
-                ready: false,
-                authorized: true,
-                connecting: false,
-                last_connect_attempt_ms: 0,
-                heartbeat_last_rx_ms: 0,
-                heartbeat_last_ping_ms: 0,
-            })
+            .map(|member| Self::new_group_peer_runtime(member, true))
             .collect();
 
         tab.group = Some(GroupRuntime {
@@ -1113,6 +1109,38 @@ impl TermchatApp {
         });
 
         tab
+    }
+
+    fn new_group_peer_runtime(member: GroupMember, authorized: bool) -> GroupPeerRuntime {
+        GroupPeerRuntime {
+            member,
+            conn: None,
+            pending_conn: None,
+            e2e: E2E::new(false),
+            ready: false,
+            authorized,
+            connecting: false,
+            last_connect_attempt_ms: 0,
+            heartbeat_last_rx_ms: 0,
+            heartbeat_last_ping_ms: 0,
+            incoming_image_name: None,
+            incoming_image_mime: None,
+            incoming_image_expected: 0,
+            incoming_image_received: 0,
+            incoming_image_msg_id: 0,
+            incoming_image_bytes: Vec::new(),
+        }
+    }
+
+    fn group_local_prefers_outbound(my_b32: Option<&str>, peer_b32: &str) -> bool {
+        let Some(my_b32) = my_b32 else {
+            return false;
+        };
+
+        my_b32
+            .to_ascii_lowercase()
+            .cmp(&peer_b32.to_ascii_lowercase())
+            .is_lt()
     }
 
     pub fn subscription(_state: &Self) -> Subscription<Message> {
@@ -3297,7 +3325,12 @@ impl TermchatApp {
                 }
 
                 GuiAction::SendImage => {
-                    if !state.session.live_ready {
+                    if state.active_tab_is_group() {
+                        if state.active_group_ready_count() == 0 {
+                            state.post_system("Image send requires a ready group member.");
+                            return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                        }
+                    } else if !state.session.live_ready {
                         state.post_system("Image send requires an active live connection.");
                         return operation::snap_to_end(state.session.logs_scroll_id.clone());
                     }
@@ -3850,11 +3883,16 @@ impl TermchatApp {
                         let msg_id_s = state.generate_msg_id();
                         let msg_id_k = state.generate_msg_id();
                         let mut send_task: Option<Task<Message>> = None;
+                        let mut close_task: Option<Task<Message>> = None;
 
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
                             let Some(group) = tab.group.as_mut() else {
                                 return Task::none();
                             };
+
+                            let my_b32 = group.meta.my_b32.as_deref();
+                            let prefer_outbound =
+                                Self::group_local_prefers_outbound(my_b32, &member_b32);
 
                             let Some(peer) = group
                                 .peers
@@ -3865,42 +3903,79 @@ impl TermchatApp {
                             };
 
                             peer.connecting = false;
-                            peer.pending_conn = None;
-                            peer.e2e = E2E::new(false);
-                            peer.conn = Some(conn.clone());
-                            peer.ready = false;
-                            peer.heartbeat_last_rx_ms = 0;
-                            peer.heartbeat_last_ping_ms = 0;
 
-                            tab.session
-                                .log_lines
-                                .push(format!("Group handshake sent to {}.", peer.member.name));
-
-                            if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
-                                let line = format!("{my_dest_b64}\n");
-                                let frame_s = Frame {
-                                    msg_type: MsgType::S,
-                                    msg_id: msg_id_s,
-                                    payload: my_dest_b64.into_bytes(),
-                                };
-                                let frame_k = Frame {
-                                    msg_type: MsgType::K,
-                                    msg_id: msg_id_k,
-                                    payload: peer.e2e.public_bytes(),
-                                };
-
-                                send_task = Some(Task::perform(
-                                    async move {
-                                        conn.send_raw_line(&line)
-                                            .await
-                                            .map_err(|e| e.to_string())?;
-                                        conn.send_frame(&frame_s)
-                                            .await
-                                            .map_err(|e| e.to_string())?;
-                                        conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
-                                    },
-                                    move |result| Message::SendFinished(tab_id, result),
+                            if peer.ready && peer.conn.is_some() {
+                                tab.session.log_lines.push(format!(
+                                    "Group connection collision: kept ready session with {}.",
+                                    peer.member.name
                                 ));
+                                close_task = Some(Task::perform(
+                                    async move { conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                ));
+                            } else if peer.conn.is_some() && !prefer_outbound {
+                                tab.session.log_lines.push(format!(
+                                    "Group connection collision: kept inbound session with {}.",
+                                    peer.member.name
+                                ));
+                                close_task = Some(Task::perform(
+                                    async move { conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                ));
+                            } else {
+                                if peer.conn.is_some() {
+                                    tab.session.log_lines.push(format!(
+                                        "Group connection collision: kept outbound session with {}.",
+                                        peer.member.name
+                                    ));
+                                }
+
+                                let old_conn = peer.conn.replace(conn.clone());
+                                peer.pending_conn = None;
+                                peer.e2e = E2E::new(false);
+                                peer.ready = false;
+                                peer.heartbeat_last_rx_ms = 0;
+                                peer.heartbeat_last_ping_ms = 0;
+
+                                if let Some(old_conn) = old_conn {
+                                    close_task = Some(Task::perform(
+                                        async move { old_conn.close().await.map_err(|e| e.to_string()) },
+                                        move |result| Message::CloseFinished(tab_id, result),
+                                    ));
+                                }
+
+                                tab.session
+                                    .log_lines
+                                    .push(format!("Group handshake sent to {}.", peer.member.name));
+
+                                if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
+                                    let line = format!("{my_dest_b64}\n");
+                                    let frame_s = Frame {
+                                        msg_type: MsgType::S,
+                                        msg_id: msg_id_s,
+                                        payload: my_dest_b64.into_bytes(),
+                                    };
+                                    let frame_k = Frame {
+                                        msg_type: MsgType::K,
+                                        msg_id: msg_id_k,
+                                        payload: peer.e2e.public_bytes(),
+                                    };
+
+                                    send_task = Some(Task::perform(
+                                        async move {
+                                            conn.send_raw_line(&line)
+                                                .await
+                                                .map_err(|e| e.to_string())?;
+                                            conn.send_frame(&frame_s)
+                                                .await
+                                                .map_err(|e| e.to_string())?;
+                                            conn.send_frame(&frame_k)
+                                                .await
+                                                .map_err(|e| e.to_string())
+                                        },
+                                        move |result| Message::SendFinished(tab_id, result),
+                                    ));
+                                }
                             }
                         }
 
@@ -3908,8 +3983,15 @@ impl TermchatApp {
                             state.load_active_runtime();
                         }
 
+                        let mut tasks = Vec::new();
+                        if let Some(task) = close_task {
+                            tasks.push(task);
+                        }
                         if let Some(task) = send_task {
-                            return task;
+                            tasks.push(task);
+                        }
+                        if !tasks.is_empty() {
+                            return Task::batch(tasks);
                         }
                     }
                     Err(err) => {
@@ -4027,12 +4109,16 @@ impl TermchatApp {
                     let msg_id_k = state.generate_msg_id();
                     let mut accepted_conn: Option<LiveConnection> = None;
                     let mut frames: Option<(String, Frame, Frame)> = None;
+                    let mut close_tasks: Vec<Task<Message>> = Vec::new();
                     let is_active = state.active_tab().map(|t| t.id) == Some(tab_id);
 
                     if let Some(tab) = state.tab_by_id_mut(tab_id) {
                         let Some(group) = tab.group.as_mut() else {
                             return Task::none();
                         };
+                        let my_b32 = group.meta.my_b32.as_deref();
+                        let prefer_outbound =
+                            Self::group_local_prefers_outbound(my_b32, &incoming.peer_b32);
 
                         let peer_idx = if let Some(peer_idx) = group
                             .peers
@@ -4056,49 +4142,80 @@ impl TermchatApp {
                                 "Provisional group caller {member_name}; awaiting invite proof."
                             ));
 
-                            group.peers.push(GroupPeerRuntime {
-                                member,
-                                conn: None,
-                                pending_conn: None,
-                                e2e: E2E::new(false),
-                                ready: false,
-                                authorized: false,
-                                connecting: false,
-                                last_connect_attempt_ms: 0,
-                                heartbeat_last_rx_ms: 0,
-                                heartbeat_last_ping_ms: 0,
-                            });
+                            group
+                                .peers
+                                .push(Self::new_group_peer_runtime(member, false));
 
                             group.peers.len() - 1
                         };
 
                         let peer = &mut group.peers[peer_idx];
-                        peer.pending_conn = None;
-                        peer.conn = Some(incoming.conn.clone());
-                        peer.e2e = E2E::new(false);
-                        peer.ready = false;
-                        peer.connecting = false;
-                        peer.heartbeat_last_rx_ms = 0;
-                        peer.heartbeat_last_ping_ms = 0;
+                        let has_existing_conn = peer.conn.is_some();
+                        let has_collision = has_existing_conn || peer.connecting;
 
-                        if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
-                            let line = format!("{my_dest_b64}\n");
-                            let frame_s = Frame {
-                                msg_type: MsgType::S,
-                                msg_id: msg_id_s,
-                                payload: my_dest_b64.into_bytes(),
-                            };
-                            let frame_k = Frame {
-                                msg_type: MsgType::K,
-                                msg_id: msg_id_k,
-                                payload: peer.e2e.public_bytes(),
-                            };
-                            accepted_conn = Some(incoming.conn.clone());
-                            frames = Some((line, frame_s, frame_k));
+                        if peer.ready && has_existing_conn {
+                            tab.session.log_lines.push(format!(
+                                "Group connection collision: kept ready session with {}.",
+                                peer.member.name
+                            ));
+                            let conn_to_close = incoming.conn.clone();
+                            close_tasks.push(Task::perform(
+                                async move { conn_to_close.close().await.map_err(|e| e.to_string()) },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            ));
+                        } else if has_collision && prefer_outbound {
+                            tab.session.log_lines.push(format!(
+                                "Group connection collision: kept outbound session with {}.",
+                                peer.member.name
+                            ));
+                            let conn_to_close = incoming.conn.clone();
+                            close_tasks.push(Task::perform(
+                                async move { conn_to_close.close().await.map_err(|e| e.to_string()) },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            ));
+                        } else {
+                            if has_existing_conn {
+                                tab.session.log_lines.push(format!(
+                                    "Group connection collision: kept inbound session with {}.",
+                                    peer.member.name
+                                ));
+                            }
+
+                            let old_conn = peer.conn.replace(incoming.conn.clone());
+                            peer.pending_conn = None;
+                            peer.e2e = E2E::new(false);
+                            peer.ready = false;
+                            peer.connecting = false;
+                            peer.heartbeat_last_rx_ms = 0;
+                            peer.heartbeat_last_ping_ms = 0;
+
+                            if let Some(old_conn) = old_conn {
+                                close_tasks.push(Task::perform(
+                                    async move { old_conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                ));
+                            }
+
+                            if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
+                                let line = format!("{my_dest_b64}\n");
+                                let frame_s = Frame {
+                                    msg_type: MsgType::S,
+                                    msg_id: msg_id_s,
+                                    payload: my_dest_b64.into_bytes(),
+                                };
+                                let frame_k = Frame {
+                                    msg_type: MsgType::K,
+                                    msg_id: msg_id_k,
+                                    payload: peer.e2e.public_bytes(),
+                                };
+                                accepted_conn = Some(incoming.conn.clone());
+                                frames = Some((line, frame_s, frame_k));
+                            }
                         }
                     }
 
                     let mut tasks = vec![state.group_accept_task(tab_id)];
+                    tasks.extend(close_tasks);
                     if let (Some(conn), Some((line, frame_s, frame_k))) = (accepted_conn, frames) {
                         tasks.push(Task::perform(
                             async move {
@@ -4371,15 +4488,17 @@ impl TermchatApp {
                 };
 
                 if let Some(tab) = state.active_tab() {
-                    if tab.live_conn.is_none() || !tab.session.live_ready {
-                        state.post_system("Image send requires a live secure chat.");
-                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
-                    }
-
                     if tab.outgoing_phase != OutgoingFilePhase::Idle
                         || tab.outgoing_image_phase != OutgoingImagePhase::Idle
                     {
                         state.post_system("Another transfer is already in progress.");
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+
+                    if tab.meta.kind != TabKind::Group
+                        && (tab.live_conn.is_none() || !tab.session.live_ready)
+                    {
+                        state.post_system("Image send requires a live secure chat.");
                         return operation::snap_to_end(state.session.logs_scroll_id.clone());
                     }
                 } else {
@@ -4419,6 +4538,80 @@ impl TermchatApp {
                 }
 
                 let msg_id = state.generate_msg_id();
+
+                if state.active_tab_is_group() {
+                    if bytes.len() > GROUP_IMAGE_TRANSFER_MAX_BYTES {
+                        state.post_system(format!(
+                            "Group image preview too large ({} bytes). Maximum is {} bytes.",
+                            bytes.len(),
+                            GROUP_IMAGE_TRANSFER_MAX_BYTES
+                        ));
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+
+                    let tab_id = match state.active_tab() {
+                        Some(tab) => tab.id,
+                        None => return Task::none(),
+                    };
+
+                    let mut tasks = Vec::new();
+                    let mut expected_acks = Vec::new();
+
+                    if let Some(tab) = state.active_tab_mut() {
+                        let Some(group) = tab.group.as_mut() else {
+                            return Task::none();
+                        };
+
+                        for peer in &group.peers {
+                            if !peer.ready || !peer.authorized {
+                                continue;
+                            }
+
+                            let Some(conn) = peer.conn.clone() else {
+                                continue;
+                            };
+
+                            expected_acks.push(peer.member.b32.to_ascii_lowercase());
+                            let e2e = peer.e2e.clone();
+                            let filename = filename.clone();
+                            let mime = mime.clone();
+                            let bytes = bytes.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    Self::send_group_image_sequence(
+                                        conn, e2e, filename, mime, bytes, msg_id,
+                                    )
+                                    .await
+                                },
+                                move |result| Message::SendFinished(tab_id, result),
+                            ));
+                        }
+                    }
+
+                    if expected_acks.is_empty() {
+                        state.post_system("No ready group members.");
+                        state.store_active_runtime();
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+
+                    state.session.bubbles.push(Bubble {
+                        author: "Me".into(),
+                        content: BubbleContent::Image(Self::image_bubble_data(bytes.clone())),
+                        mine: true,
+                        offline: false,
+                        timestamp_utc: Self::now_utc_hms(),
+                        msg_id: Some(msg_id),
+                        delivered: false,
+                        group_expected_acks: expected_acks,
+                        group_received_acks: Vec::new(),
+                    });
+
+                    state.store_active_runtime();
+                    tasks.push(operation::snap_to_end(
+                        state.session.messages_scroll_id.clone(),
+                    ));
+                    return Task::batch(tasks);
+                }
 
                 state.session.bubbles.push(Bubble {
                     author: "Me".into(),
@@ -8445,6 +8638,9 @@ impl TermchatApp {
         let mut out = Vec::new();
 
         if self.active_tab_is_group() {
+            if self.active_group_ready_count() > 0 {
+                out.push(GuiAction::SendImage);
+            }
             return out;
         }
 
@@ -10088,6 +10284,216 @@ impl TermchatApp {
                                 },
                             }
                         }
+                        MsgType::J => {
+                            if !peer.ready || !peer.authorized {
+                                tab.session.log_lines.push(format!(
+                                    "Ignored group image header before authorised secure session: {}",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            let plain = peer.e2e.decrypt(&frame.payload);
+                            match String::from_utf8(plain) {
+                                Ok(body) => {
+                                    let mut parts = body.split('|');
+                                    let Some(filename_raw) = parts.next() else {
+                                        tab.session.log_lines.push(format!(
+                                            "Invalid group image header from {}.",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    };
+                                    let Some(mime_raw) = parts.next() else {
+                                        tab.session.log_lines.push(format!(
+                                            "Invalid group image header from {}.",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    };
+                                    let Some(size_raw) = parts.next() else {
+                                        tab.session.log_lines.push(format!(
+                                            "Invalid group image header from {}.",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    };
+
+                                    let filename = PathBuf::from(filename_raw)
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("image")
+                                        .to_string();
+
+                                    let total_bytes: u64 = match size_raw.parse() {
+                                        Ok(v) => v,
+                                        Err(_) => {
+                                            tab.session.log_lines.push(format!(
+                                                "Invalid group image size from {}.",
+                                                peer.member.name
+                                            ));
+                                            continue;
+                                        }
+                                    };
+
+                                    if total_bytes == 0
+                                        || total_bytes > GROUP_IMAGE_TRANSFER_MAX_BYTES as u64
+                                    {
+                                        tab.session.log_lines.push(format!(
+                                            "Rejected group image size from {}: {} bytes.",
+                                            peer.member.name, total_bytes
+                                        ));
+                                        continue;
+                                    }
+
+                                    if !Self::is_supported_image_mime(mime_raw) {
+                                        tab.session.log_lines.push(format!(
+                                            "Unsupported group image type from {}: {mime_raw}",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    }
+
+                                    Self::clear_group_peer_incoming_image_state(peer);
+                                    peer.incoming_image_name = Some(filename);
+                                    peer.incoming_image_mime = Some(mime_raw.to_string());
+                                    peer.incoming_image_expected = total_bytes;
+                                    peer.incoming_image_received = 0;
+                                    peer.incoming_image_msg_id = frame.msg_id;
+                                    peer.incoming_image_bytes =
+                                        Vec::with_capacity(total_bytes as usize);
+                                }
+                                Err(_) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Invalid UTF-8 group image header from {}.",
+                                        peer.member.name
+                                    ));
+                                }
+                            }
+                        }
+                        MsgType::G => {
+                            if !peer.ready || !peer.authorized {
+                                continue;
+                            }
+
+                            if peer.incoming_image_name.is_none() {
+                                tab.session.log_lines.push(format!(
+                                    "Group image chunk without header from {}.",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            if peer.incoming_image_msg_id != frame.msg_id {
+                                tab.session.log_lines.push(format!(
+                                    "Group image chunk transfer id mismatch from {}.",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            let plain = peer.e2e.decrypt(&frame.payload);
+                            match general_purpose::STANDARD.decode(&plain) {
+                                Ok(chunk) => {
+                                    let next_total =
+                                        peer.incoming_image_received + chunk.len() as u64;
+
+                                    if next_total > peer.incoming_image_expected
+                                        || next_total > GROUP_IMAGE_TRANSFER_MAX_BYTES as u64
+                                    {
+                                        tab.session.log_lines.push(format!(
+                                            "Group image transfer overflow from {}.",
+                                            peer.member.name
+                                        ));
+                                        Self::clear_group_peer_incoming_image_state(peer);
+                                        continue;
+                                    }
+
+                                    peer.incoming_image_bytes.extend_from_slice(&chunk);
+                                    peer.incoming_image_received = next_total;
+                                }
+                                Err(err) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Group image chunk decode failed from {}: {err}",
+                                        peer.member.name
+                                    ));
+                                    Self::clear_group_peer_incoming_image_state(peer);
+                                }
+                            }
+                        }
+                        MsgType::Z => {
+                            if !peer.ready || !peer.authorized {
+                                continue;
+                            }
+
+                            if peer.incoming_image_name.is_none() {
+                                tab.session.log_lines.push(format!(
+                                    "Group image end without header from {}.",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            if peer.incoming_image_msg_id != frame.msg_id {
+                                tab.session.log_lines.push(format!(
+                                    "Group image end transfer id mismatch from {}.",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            if peer.incoming_image_received != peer.incoming_image_expected {
+                                tab.session.log_lines.push(format!(
+                                    "Incomplete group image from {}: {}/{} bytes.",
+                                    peer.member.name,
+                                    peer.incoming_image_received,
+                                    peer.incoming_image_expected
+                                ));
+                                Self::clear_group_peer_incoming_image_state(peer);
+                                continue;
+                            }
+
+                            let image_name = peer
+                                .incoming_image_name
+                                .clone()
+                                .unwrap_or_else(|| "image".into());
+                            let image_bytes = std::mem::take(&mut peer.incoming_image_bytes);
+
+                            tab.session.bubbles.push(Bubble {
+                                author: peer.member.name.clone(),
+                                content: BubbleContent::Image(Self::image_bubble_data(image_bytes)),
+                                mine: false,
+                                offline: false,
+                                timestamp_utc: Self::now_utc_hms(),
+                                msg_id: Some(frame.msg_id),
+                                delivered: false,
+                                group_expected_acks: Vec::new(),
+                                group_received_acks: Vec::new(),
+                            });
+
+                            tab.session.log_lines.push(format!(
+                                "Group image received from {}: {image_name} ({} bytes)",
+                                peer.member.name, peer.incoming_image_received
+                            ));
+
+                            Self::clear_group_peer_incoming_image_state(peer);
+
+                            let ack = Frame {
+                                msg_type: MsgType::D,
+                                msg_id: Self::generate_msg_id_value(),
+                                payload: frame.msg_id.to_be_bytes().to_vec(),
+                            };
+                            let conn_for_ack = conn.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    conn_for_ack
+                                        .send_frame(&ack)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                },
+                                move |result| Message::SendFinished(tab_id, result),
+                            ));
+                        }
                         MsgType::U => {
                             if !peer.ready || !peer.authorized {
                                 tab.session.log_lines.push(format!(
@@ -10357,6 +10763,50 @@ impl TermchatApp {
         tab.incoming_image_received = 0;
         tab.incoming_image_msg_id = 0;
         tab.incoming_image_bytes.clear();
+    }
+
+    fn clear_group_peer_incoming_image_state(peer: &mut GroupPeerRuntime) {
+        peer.incoming_image_name = None;
+        peer.incoming_image_mime = None;
+        peer.incoming_image_expected = 0;
+        peer.incoming_image_received = 0;
+        peer.incoming_image_msg_id = 0;
+        peer.incoming_image_bytes.clear();
+    }
+
+    async fn send_group_image_sequence(
+        conn: LiveConnection,
+        e2e: E2E,
+        filename: String,
+        mime: String,
+        bytes: Vec<u8>,
+        msg_id: u64,
+    ) -> Result<(), String> {
+        let total = bytes.len() as u64;
+        let frame_j = Frame {
+            msg_type: MsgType::J,
+            msg_id,
+            payload: e2e.encrypt(format!("{filename}|{mime}|{total}").as_bytes()),
+        };
+        conn.send_frame(&frame_j).await.map_err(|e| e.to_string())?;
+
+        for chunk in bytes.chunks(4096) {
+            let encoded = general_purpose::STANDARD.encode(chunk);
+            let frame_g = Frame {
+                msg_type: MsgType::G,
+                msg_id,
+                payload: e2e.encrypt(encoded.as_bytes()),
+            };
+            conn.send_frame(&frame_g).await.map_err(|e| e.to_string())?;
+        }
+
+        let frame_z = Frame {
+            msg_type: MsgType::Z,
+            msg_id,
+            payload: Vec::new(),
+        };
+        conn.send_frame(&frame_z).await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn image_mime_for_path(path: &Path) -> Option<&'static str> {
@@ -10667,7 +11117,7 @@ impl TermchatApp {
                 group
                     .peers
                     .iter()
-                    .filter(|peer| peer.ready && peer.authorized)
+                    .filter(|peer| peer.ready && peer.authorized && peer.conn.is_some())
                     .count()
             })
             .unwrap_or(0)
@@ -10714,18 +11164,9 @@ impl TermchatApp {
                     continue;
                 }
 
-                runtime.peers.push(GroupPeerRuntime {
-                    member: member.clone(),
-                    conn: None,
-                    pending_conn: None,
-                    e2e: E2E::new(false),
-                    ready: false,
-                    authorized: true,
-                    connecting: false,
-                    last_connect_attempt_ms: 0,
-                    heartbeat_last_rx_ms: 0,
-                    heartbeat_last_ping_ms: 0,
-                });
+                runtime
+                    .peers
+                    .push(Self::new_group_peer_runtime(member.clone(), true));
             }
         }
     }
