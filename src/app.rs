@@ -12,7 +12,8 @@ use iced::border;
 use iced::widget::Id as ScrollableId;
 use iced::widget::operation;
 use iced::widget::{
-    Space, button, column, container, image, progress_bar, row, scrollable, stack, text, text_input,
+    Space, button, column, container, image, progress_bar, row, scrollable, stack, text,
+    text_editor, text_input,
 };
 use iced::{
     Alignment, Background, Color, ContentFit, Element, Font, Length, Subscription, Task, exit,
@@ -540,6 +541,7 @@ pub struct SessionState {
     pub action_param: String,
 
     pub input: String,
+    pub input_editor: text_editor::Content,
     pub reply_to: Option<ReplyDraft>,
     pub bubbles: Vec<Bubble>,
     pub status_lines: Vec<String>,
@@ -623,6 +625,7 @@ impl Default for SessionState {
             call_blink_ticks: 0,
             action_param: String::new(),
             input: String::new(),
+            input_editor: text_editor::Content::new(),
             reply_to: None,
             bubbles: vec![],
             status_lines: vec![
@@ -705,7 +708,7 @@ pub enum BackupOperation {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    InputChanged(String),
+    InputChanged(text_editor::Action),
     SendPressed,
 
     UnlockInputChanged(String),
@@ -1474,7 +1477,21 @@ impl TermchatApp {
         let active_idx = self.session.active_tab_idx;
 
         if let Some(snapshot) = self.active_tab().map(|t| t.session.clone()) {
+            let preserve_editor = self.session.active_tab_idx == active_idx
+                && self.session.profile == snapshot.profile
+                && self.session.input == snapshot.input;
+            let preserved_editor = if preserve_editor {
+                Some(std::mem::take(&mut self.session.input_editor))
+            } else {
+                None
+            };
+
             self.session = snapshot;
+            if let Some(input_editor) = preserved_editor {
+                self.session.input_editor = input_editor;
+            } else {
+                self.session.input_editor = Self::message_editor_with_text(&self.session.input);
+            }
             self.session.profiles = sidebar_profiles;
             self.session.selected_profile_idx = sidebar_selected;
             self.session.profile_name_input = sidebar_input;
@@ -1494,6 +1511,14 @@ impl TermchatApp {
     }
 
     fn refresh_visible_from_active_tab(&mut self) {
+        self.refresh_visible_from_active_tab_with_editor(true);
+    }
+
+    fn refresh_visible_from_active_tab_reset_editor(&mut self) {
+        self.refresh_visible_from_active_tab_with_editor(false);
+    }
+
+    fn refresh_visible_from_active_tab_with_editor(&mut self, preserve_editor: bool) {
         let sidebar_profiles = self.session.profiles.clone();
         let sidebar_selected = self.session.selected_profile_idx;
         let sidebar_input = self.session.profile_name_input.clone();
@@ -1536,8 +1561,22 @@ impl TermchatApp {
                         self.opened_tabs.get(real_idx).map(|t| t.session.clone())
                     {
                         let tabs = self.session.tabs.clone();
+                        let can_preserve_editor = preserve_editor
+                            && self.session.profile == snapshot.profile
+                            && self.session.input == snapshot.input;
+                        let preserved_editor = if can_preserve_editor {
+                            Some(std::mem::take(&mut self.session.input_editor))
+                        } else {
+                            None
+                        };
 
                         self.session = snapshot;
+                        if let Some(input_editor) = preserved_editor {
+                            self.session.input_editor = input_editor;
+                        } else {
+                            self.session.input_editor =
+                                Self::message_editor_with_text(&self.session.input);
+                        }
                         self.session.profiles = sidebar_profiles.clone();
                         self.session.selected_profile_idx = sidebar_selected;
                         self.session.profile_name_input = sidebar_input.clone();
@@ -1674,11 +1713,24 @@ impl TermchatApp {
         operation::snap_to_end(self.session.logs_scroll_id.clone())
     }
 
+    fn clear_message_draft(session: &mut SessionState) {
+        session.input.clear();
+        session.input_editor = text_editor::Content::new();
+    }
+
+    fn message_editor_with_text(value: &str) -> text_editor::Content {
+        let mut content = text_editor::Content::with_text(value);
+        content.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        content
+    }
+
     pub fn update(state: &mut Self, message: Message) -> Task<Message> {
         match message {
-            Message::InputChanged(value) => {
-                let should_snap_messages = state.session.input.is_empty() && !value.is_empty();
-                state.session.input = value;
+            Message::InputChanged(action) => {
+                let was_empty = state.session.input.is_empty();
+                state.session.input_editor.perform(action);
+                state.session.input = state.session.input_editor.text();
+                let should_snap_messages = was_empty && !state.session.input.is_empty();
                 state.store_active_runtime();
                 if should_snap_messages {
                     return operation::snap_to_end(state.session.messages_scroll_id.clone());
@@ -2295,7 +2347,7 @@ impl TermchatApp {
                 if idx == 0 {
                     state.session.active_tab_idx = Some(0);
                     state.session.profile = "__app__".into();
-                    state.refresh_visible_from_active_tab();
+                    state.refresh_visible_from_active_tab_reset_editor();
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
@@ -2338,7 +2390,7 @@ impl TermchatApp {
                         }
                     }
 
-                    state.refresh_visible_from_active_tab();
+                    state.refresh_visible_from_active_tab_reset_editor();
 
                     return Task::batch(vec![
                         operation::snap_to_end(state.session.logs_scroll_id.clone()),
@@ -2488,7 +2540,7 @@ impl TermchatApp {
                         _ => {}
                     }
 
-                    state.refresh_visible_from_active_tab();
+                    state.refresh_visible_from_active_tab_reset_editor();
                     return Task::batch(tasks);
                 }
             }
@@ -2761,11 +2813,11 @@ impl TermchatApp {
             }
 
             Message::SendPressed => {
-                let trimmed = state.session.input.trim().to_string();
+                let draft_text = state.session.input.clone();
 
-                if !trimmed.is_empty() {
+                if !draft_text.trim().is_empty() {
                     let outgoing_text =
-                        Self::compose_reply_text(state.session.reply_to.as_ref(), &trimmed);
+                        Self::compose_reply_text(state.session.reply_to.as_ref(), &draft_text);
 
                     if state.active_tab_is_group() {
                         let tab_id = match state.active_tab() {
@@ -2819,7 +2871,7 @@ impl TermchatApp {
                             msg_id,
                             expected_acks,
                         ));
-                        state.session.input.clear();
+                        Self::clear_message_draft(&mut state.session);
                         state.session.reply_to = None;
                         state.store_active_runtime();
 
@@ -2859,7 +2911,7 @@ impl TermchatApp {
                             .bubbles
                             .push(Bubble::me_with_id(outgoing_text, msg_id));
 
-                        state.session.input.clear();
+                        Self::clear_message_draft(&mut state.session);
                         state.session.reply_to = None;
                         state.store_active_runtime();
 
@@ -2975,7 +3027,7 @@ impl TermchatApp {
                             offline_msg_id,
                         ));
 
-                        state.session.input.clear();
+                        Self::clear_message_draft(&mut state.session);
                         state.session.reply_to = None;
                         state.store_active_runtime();
 
@@ -6694,24 +6746,35 @@ impl TermchatApp {
         };
 
         let message_input_enabled = state.message_input_enabled();
-        let message_input = text_input(
-            if message_input_enabled {
-                "Type message..."
-            } else {
-                "Chat is not connected or offline-ready."
-            },
-            &state.session.input,
-        )
-        .padding(12)
-        .size(16)
-        .width(Length::Fill);
+        let message_input_placeholder = if message_input_enabled {
+            "Type message..."
+        } else {
+            "Chat is not connected or offline-ready."
+        };
+
+        let message_input = text_editor(&state.session.input_editor)
+            .placeholder(message_input_placeholder)
+            .padding(12)
+            .size(16)
+            .height(Length::Fixed(82.0))
+            .min_height(52.0)
+            .max_height(140.0)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
 
         let message_input = if message_input_enabled {
-            message_input
-                .on_input(Message::InputChanged)
-                .on_submit(Message::SendPressed)
+            message_input.on_action(Message::InputChanged)
         } else {
             message_input
+        };
+
+        let send_button_enabled = message_input_enabled && !state.session.input.trim().is_empty();
+        let send_button = button(text("Send").size(13))
+            .padding([8, 14])
+            .style(app_button_style);
+        let send_button = if send_button_enabled {
+            send_button.on_press(Message::SendPressed)
+        } else {
+            send_button
         };
 
         let reply_preview: Element<'_, Message> = if let Some(reply) = &state.session.reply_to {
@@ -6746,10 +6809,18 @@ impl TermchatApp {
             Space::new().height(0).into()
         };
 
-        let message_input_panel = container(column![reply_preview, message_input].spacing(6))
-            .width(Length::Fill)
-            .padding(8)
-            .style(container::rounded_box);
+        let message_input_panel = container(
+            column![
+                reply_preview,
+                row![container(message_input).width(Length::Fill), send_button,]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+            ]
+            .spacing(6),
+        )
+        .width(Length::Fill)
+        .padding(8)
+        .style(container::rounded_box);
 
         let actions_row = state
             .available_actions()
@@ -7013,7 +7084,7 @@ impl TermchatApp {
         {
             self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
             self.session.profile = self.opened_tabs[real_idx].meta.profile_name.clone();
-            self.refresh_visible_from_active_tab();
+            self.refresh_visible_from_active_tab_reset_editor();
             return;
         }
 
@@ -7021,7 +7092,7 @@ impl TermchatApp {
         let real_idx = self.opened_tabs.len() - 1;
         self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
         self.session.profile = profile_name.to_string();
-        self.refresh_visible_from_active_tab();
+        self.refresh_visible_from_active_tab_reset_editor();
     }
 
     fn open_or_focus_tab_for_group(&mut self, group_key: &str) {
@@ -7046,7 +7117,7 @@ impl TermchatApp {
                 .and_then(|idx| self.session.groups.get(idx))
                 .map(|group| group.my_name.clone())
                 .unwrap_or_default();
-            self.refresh_visible_from_active_tab();
+            self.refresh_visible_from_active_tab_reset_editor();
             return;
         }
 
@@ -7076,7 +7147,7 @@ impl TermchatApp {
             .and_then(|idx| self.session.groups.get(idx))
             .map(|group| group.my_name.clone())
             .unwrap_or_default();
-        self.refresh_visible_from_active_tab();
+        self.refresh_visible_from_active_tab_reset_editor();
     }
 
     fn export_group_invite_file(path: &Path, group: &GroupMeta) -> Result<GroupMeta, String> {
