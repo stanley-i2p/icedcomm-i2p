@@ -5,6 +5,7 @@ mod deaddrop;
 mod e2e;
 mod protocol;
 mod sam;
+mod sam_runtime;
 mod storage;
 mod vault;
 

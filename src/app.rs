@@ -6,6 +6,7 @@ use crate::deaddrop::{DeadDropClient, DeaddropOpStat};
 use crate::e2e::E2E;
 use crate::protocol::{Frame, MsgType};
 use crate::sam::{AcceptedIncoming, LiveConnection, SamClient, SamInitResult};
+use crate::sam_runtime::SamRuntime;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use iced::border;
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::storage::{
     self, AppLock, ContactMeta, GroupInvite, GroupIssuedInvite, GroupMember, GroupMeta,
@@ -124,7 +125,8 @@ const DD_STATS_EMA_ALPHA: f64 = 0.30;
 const DD_FAILURE_PENALTY: f64 = 2500.0;
 const DD_UNKNOWN_SERVER_SCORE: f64 = -1e18;
 const DD_STATS_SAVE_INTERVAL_MS: u64 = 15_000;
-const DEADDROP_PANEL_HEIGHT_PORTION: u16 = 2;
+const DEADDROP_PANEL_HEIGHT_PORTION: u16 = 3;
+const GROUP_PANEL_HEIGHT_PORTION: u16 = 3;
 const OFFLINE_SECRET_REQUEST_SIGNAL: &str = "__SIGNAL__:OFFLINE_SECRET_REQUEST";
 const TEXT_BUBBLE_MAX_WIDTH: f32 = 460.0;
 const TEXT_BUBBLE_MIN_BODY_WIDTH: f32 = 92.0;
@@ -142,6 +144,9 @@ const GROUP_INVITE_STRING_PREFIX: &str = "ICEDCOMM-GROUP-INVITE-v1:";
 const GROUP_CONTROL_JOIN_PROOF: &str = "join_proof";
 const GROUP_CONTROL_RENAME_REQUEST: &str = "rename_request";
 const SHUTDOWN_NOTIFY_GRACE_MS: u64 = 1_200;
+const GROUP_STREAM_CLOSE_TIMEOUT_MS: u64 = 120;
+const SAM_CONNECT_CANCEL_GRACE_MS: u64 = 4_500;
+const SAM_LIFECYCLE_DEBUG: bool = true;
 const HEARTBEAT_PING_INTERVAL_MS: u64 = 10_000;
 const HEARTBEAT_TIMEOUT_MS: u64 = 35_000;
 const HEARTBEAT_PING_PREFIX: &str = "__SIGNAL__:PING:";
@@ -168,6 +173,7 @@ pub struct ChatTab {
     pub has_unread: bool,
     pub has_incoming: bool,
     pub connected: bool,
+    pub closing: bool,
     pub initializing: bool,
     pub initialized: bool,
 }
@@ -176,7 +182,7 @@ pub struct OpenedTab {
     pub id: u64,
     pub meta: ChatTab,
     pub session: SessionState,
-    pub sam: SamClient,
+    pub sam_runtime: SamRuntime,
     pub e2e: E2E,
     pub deaddrop: std::sync::Arc<TokioMutex<DeadDropClient>>,
     pub deaddrop_started: bool,
@@ -767,6 +773,7 @@ pub enum Message {
 
     TabSelected(usize),
     TabClosed(usize),
+    FinalizeTabClosed(u64),
 
     ActionPressed(GuiAction),
     ActionParamChanged(String),
@@ -985,6 +992,7 @@ impl TermchatApp {
                 has_unread: false,
                 has_incoming: false,
                 connected: false,
+                closing: false,
                 initializing: false,
                 initialized: false,
             },
@@ -1009,7 +1017,7 @@ impl TermchatApp {
             deaddrop_poll_queue: vec![],
             deaddrop_put_in_flight: false,
             deaddrop_last_poll_ms: 0,
-            sam: SamClient::new(sam_host.clone(), sam_port),
+            sam_runtime: SamRuntime::new(sam_host.clone(), sam_port),
             e2e: E2E::new(false),
             live_conn: None,
             pending_conn: None,
@@ -1216,7 +1224,7 @@ impl TermchatApp {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut sam = tab.sam.clone();
+            let (registered_conns, mut sam) = tab.sam_runtime.shutdown_parts();
             let dd = if tab.deaddrop_started {
                 Some(std::sync::Arc::clone(&tab.deaddrop))
             } else {
@@ -1260,11 +1268,16 @@ impl TermchatApp {
                         let _ = conn.close().await;
                     }
 
+                    for conn in registered_conns {
+                        let _ = conn.close().await;
+                    }
+
                     if let Some(dd) = dd {
                         let mut dd = dd.lock().await;
                         dd.close().await;
                     }
 
+                    sleep(Duration::from_millis(SAM_CONNECT_CANCEL_GRACE_MS)).await;
                     sam.close().await.map_err(|e| e.to_string())
                 },
                 move |result| Message::SamCloseFinished(tab_id, result),
@@ -1298,6 +1311,7 @@ impl TermchatApp {
                 }
                 group.accept_armed = false;
             }
+            tab.sam_runtime.clear_registered_streams();
         }
 
         self.reset_connection_state();
@@ -1305,7 +1319,10 @@ impl TermchatApp {
 
         tasks.push(Task::perform(
             async move {
-                sleep(Duration::from_millis(SHUTDOWN_NOTIFY_GRACE_MS)).await;
+                sleep(Duration::from_millis(
+                    SHUTDOWN_NOTIFY_GRACE_MS + SAM_CONNECT_CANCEL_GRACE_MS,
+                ))
+                .await;
                 target
             },
             Message::ExitAfterNotify,
@@ -1314,15 +1331,19 @@ impl TermchatApp {
     }
 
     fn accept_task(&self, tab_id: u64) -> Task<Message> {
-        let sam = self
+        let accept = self
             .opened_tabs
             .iter()
             .find(|t| t.id == tab_id)
-            .map(|t| t.sam.clone());
+            .and_then(|t| t.sam_runtime.accept_parts());
 
-        if let Some(sam) = sam {
+        if let Some((sam, cancelled)) = accept {
             Task::perform(
-                async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
+                async move {
+                    sam.stream_accept_cancelled(cancelled)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
                 move |result| Message::IncomingAccepted(tab_id, result),
             )
         } else {
@@ -1331,20 +1352,42 @@ impl TermchatApp {
     }
 
     fn group_accept_task(&self, tab_id: u64) -> Task<Message> {
-        let sam = self
+        let Some(tab) = self
             .opened_tabs
             .iter()
             .find(|t| t.id == tab_id)
-            .map(|t| t.sam.clone());
+        else {
+            return Task::none();
+        };
 
-        if let Some(sam) = sam {
-            Task::perform(
-                async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
+        if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+            let task = Task::perform(
+                async move {
+                    sam.stream_accept_cancelled(cancelled)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
                 move |result| Message::GroupIncomingAccepted(tab_id, result),
-            )
+            );
+            tab.sam_runtime.track_accept_task(task)
         } else {
             Task::none()
         }
+    }
+
+    fn incoming_accept_task_from_parts(
+        tab_id: u64,
+        sam: SamClient,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                sam.stream_accept_cancelled(cancelled)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |result| Message::IncomingAccepted(tab_id, result),
+        )
     }
 
     fn group_connect_tasks(&mut self, tab_id: u64) -> Vec<Task<Message>> {
@@ -1352,7 +1395,7 @@ impl TermchatApp {
             return Vec::new();
         };
 
-        let sam = self.opened_tabs[idx].sam.clone();
+        let sam_runtime = self.opened_tabs[idx].sam_runtime.clone();
         let Some(group) = self.opened_tabs[idx].group.as_mut() else {
             return Vec::new();
         };
@@ -1375,14 +1418,20 @@ impl TermchatApp {
                 continue;
             }
 
+            let Some((sam, connect_cancelled)) = sam_runtime.connect_parts() else {
+                break;
+            };
+
             peer.connecting = true;
             peer.last_connect_attempt_ms = now_ms;
             let peer_b32 = peer.member.b32.clone();
-            let sam_clone = sam.clone();
-            tasks.push(Task::perform(
+            Self::sam_lifecycle_log(format!(
+                "group connect task start tab={tab_id} peer={peer_b32}"
+            ));
+            let task = Task::perform(
                 async move {
-                    let conn = sam_clone
-                        .stream_connect(&peer_b32)
+                    let conn = sam
+                        .stream_connect_cancelled(&peer_b32, connect_cancelled)
                         .await
                         .map_err(|e| e.to_string())?;
                     Ok((peer_b32.clone(), conn))
@@ -1391,7 +1440,8 @@ impl TermchatApp {
                     let peer_b32 = peer.member.b32.clone();
                     move |result| Message::GroupConnectFinished(tab_id, peer_b32.clone(), result)
                 },
-            ));
+            );
+            tasks.push(sam_runtime.track_connect_task(task));
         }
 
         tasks
@@ -1468,6 +1518,7 @@ impl TermchatApp {
             tab.session = snapshot;
             tab.meta.connected = tab.session.live_ready;
             tab.meta.has_incoming = tab.session.pending_peer_addr.is_some();
+            tab.meta.closing = tab.sam_runtime.is_closing();
         }
 
         self.session.profiles = sidebar_profiles;
@@ -1655,8 +1706,8 @@ impl TermchatApp {
                     tab.id,
                     tab.meta.kind,
                     tab.session.profile.clone(),
-                    tab.sam.sam_host.clone(),
-                    tab.sam.sam_port,
+                    tab.sam_runtime.client.sam_host.clone(),
+                    tab.sam_runtime.client.sam_port,
                     tab.group
                         .as_ref()
                         .and_then(|group| group.meta.my_dest_b64.clone())
@@ -1818,8 +1869,7 @@ impl TermchatApp {
                     state.session.group_display_name_input =
                         state.session.groups[idx].my_name.clone();
                     state.session.group_generated_invite_string.clear();
-                    state.session.group_status =
-                        format!("Selected group: {}", state.session.groups[idx].name);
+                    state.session.group_status.clear();
                 }
                 return Task::none();
             }
@@ -2253,9 +2303,7 @@ impl TermchatApp {
                 };
 
                 let group_key = storage::group_storage_key(&group);
-                let group_name = group.name.clone();
                 state.open_or_focus_tab_for_group(&group_key);
-                state.session.group_status = format!("Opened group: {group_name}");
 
                 if let Some(visible_idx) = state.session.active_tab_idx {
                     if let Some(real_idx) = Self::visible_to_real_tab_index(visible_idx) {
@@ -2382,6 +2430,10 @@ impl TermchatApp {
                 let real_idx = idx - 1;
 
                 if real_idx < state.opened_tabs.len() {
+                    if state.opened_tabs[real_idx].sam_runtime.is_closing() {
+                        return Task::none();
+                    }
+
                     state.session.active_tab_idx = Some(idx);
 
                     if let Some(tab) = state.opened_tabs.get_mut(real_idx) {
@@ -2435,9 +2487,19 @@ impl TermchatApp {
                 let idx = idx - 1;
 
                 if idx < state.opened_tabs.len() {
+                    if state.opened_tabs[idx].sam_runtime.is_closing() {
+                        return Task::none();
+                    }
+
                     state.store_active_runtime();
 
+                    if let Some(tab) = state.opened_tabs.get_mut(idx) {
+                        tab.sam_runtime.begin_closing();
+                        tab.meta.closing = true;
+                    }
+
                     let mut tasks = state.close_tab_runtime_tasks(idx);
+                    let tab_id = state.opened_tabs[idx].id;
 
                     if let Some(tab) = state.opened_tabs.get_mut(idx) {
                         tab.live_conn = None;
@@ -2455,6 +2517,7 @@ impl TermchatApp {
                         tab.session.tofu_mismatch = false;
                         tab.meta.connected = false;
                         tab.meta.has_incoming = false;
+                        tab.meta.closing = true;
                         tab.meta.initialized = false;
                         tab.meta.initializing = false;
 
@@ -2491,6 +2554,31 @@ impl TermchatApp {
                             tab.deaddrop_poll_queue.clear();
                             tab.deaddrop_put_in_flight = false;
                         }
+                    }
+
+                    tasks.push(Task::perform(
+                        async move {
+                            sleep(Duration::from_millis(
+                                SHUTDOWN_NOTIFY_GRACE_MS + SAM_CONNECT_CANCEL_GRACE_MS,
+                            ))
+                            .await;
+                            tab_id
+                        },
+                        Message::FinalizeTabClosed,
+                    ));
+
+                    state.sync_active_tab_flags();
+                    return Task::batch(tasks);
+                }
+
+                return Task::none();
+            }
+
+            Message::FinalizeTabClosed(tab_id) => {
+                if let Some(idx) = state.find_tab_index_by_id(tab_id) {
+                    if let Some(tab) = state.opened_tabs.get_mut(idx) {
+                        tab.sam_runtime.clear_shutdown_state();
+                        tab.meta.closing = false;
                     }
 
                     let _removed = state.opened_tabs.remove(idx);
@@ -2569,8 +2657,10 @@ impl TermchatApp {
                     }
 
                     state.refresh_visible_from_active_tab_reset_editor();
-                    return Task::batch(tasks);
+                    return Task::none();
                 }
+
+                return Task::none();
             }
 
             Message::CreateProfilePressed => {
@@ -2859,6 +2949,7 @@ impl TermchatApp {
                         let mut expected_acks = Vec::new();
 
                         if let Some(tab) = state.active_tab_mut() {
+                            let sam_runtime = tab.sam_runtime.clone();
                             let Some(group) = tab.group.as_mut() else {
                                 return Task::none();
                             };
@@ -2879,12 +2970,13 @@ impl TermchatApp {
                                 };
                                 sent_count += 1;
                                 expected_acks.push(peer.member.b32.to_ascii_lowercase());
-                                tasks.push(Task::perform(
+                                let task = Task::perform(
                                     async move {
                                         conn.send_frame(&frame).await.map_err(|e| e.to_string())
                                     },
                                     move |result| Message::SendFinished(tab_id, result),
-                                ));
+                                );
+                                tasks.push(sam_runtime.track_send_task(task));
                             }
                         }
 
@@ -3098,12 +3190,13 @@ impl TermchatApp {
                 GuiAction::Connect => {
                     if state.session.profile != "default" {
                         if let Some(peer) = state.session.stored_peer.clone() {
-                            let sam = state
-                                .active_tab()
-                                .map(|t| t.sam.clone())
-                                .unwrap_or_default();
-                            let tab_id = match state.active_tab() {
-                                Some(tab) => tab.id,
+                            let (tab_id, sam, connect_cancelled) = match state.active_tab() {
+                                Some(tab) => match tab.sam_runtime.connect_parts() {
+                                    Some((sam, connect_cancelled)) => {
+                                        (tab.id, sam, connect_cancelled)
+                                    }
+                                    None => return Task::none(),
+                                },
                                 None => return Task::none(),
                             };
 
@@ -3114,7 +3207,7 @@ impl TermchatApp {
 
                             return Task::perform(
                                 async move {
-                                    sam.stream_connect(&peer)
+                                    sam.stream_connect_cancelled(&peer, connect_cancelled)
                                         .await
                                         .map(|conn| (peer, conn))
                                         .map_err(|e| e.to_string())
@@ -3366,7 +3459,12 @@ impl TermchatApp {
                         return operation::snap_to_end(state.session.logs_scroll_id.clone());
                     }
 
-                    state.session.show_deaddrop_panel = !state.session.show_deaddrop_panel;
+                    let show_deaddrop_panel = !state.session.show_deaddrop_panel;
+                    state.session.show_deaddrop_panel = show_deaddrop_panel;
+                    if show_deaddrop_panel {
+                        state.session.show_logs = false;
+                        state.session.show_group_panel = false;
+                    }
                     state.store_active_runtime();
                     return operation::snap_to_end(state.session.messages_scroll_id.clone());
                 }
@@ -3437,13 +3535,14 @@ impl TermchatApp {
                     match action {
                         GuiAction::Connect => {
                             if !value.is_empty() {
-                                let sam = state
-                                    .active_tab()
-                                    .map(|t| t.sam.clone())
-                                    .unwrap_or_default();
                                 let peer = value.clone();
-                                let tab_id = match state.active_tab() {
-                                    Some(tab) => tab.id,
+                                let (tab_id, sam, connect_cancelled) = match state.active_tab() {
+                                    Some(tab) => match tab.sam_runtime.connect_parts() {
+                                        Some((sam, connect_cancelled)) => {
+                                            (tab.id, sam, connect_cancelled)
+                                        }
+                                        None => return Task::none(),
+                                    },
                                     None => return Task::none(),
                                 };
 
@@ -3454,7 +3553,7 @@ impl TermchatApp {
 
                                 return Task::perform(
                                     async move {
-                                        sam.stream_connect(&peer)
+                                        sam.stream_connect_cancelled(&peer, connect_cancelled)
                                             .await
                                             .map(|conn| (peer, conn))
                                             .map_err(|e| e.to_string())
@@ -3556,7 +3655,12 @@ impl TermchatApp {
             }
 
             Message::ToggleLogsPressed => {
-                state.session.show_logs = !state.session.show_logs;
+                let show_logs = !state.session.show_logs;
+                state.session.show_logs = show_logs;
+                if show_logs {
+                    state.session.show_deaddrop_panel = false;
+                    state.session.show_group_panel = false;
+                }
                 state.store_active_runtime();
                 if state.session.show_logs {
                     return Task::batch(vec![
@@ -3569,7 +3673,12 @@ impl TermchatApp {
             }
 
             Message::ToggleGroupPanelPressed => {
-                state.session.show_group_panel = !state.session.show_group_panel;
+                let show_group_panel = !state.session.show_group_panel;
+                state.session.show_group_panel = show_group_panel;
+                if show_group_panel {
+                    state.session.show_logs = false;
+                    state.session.show_deaddrop_panel = false;
+                }
                 state.store_active_runtime();
                 return Task::none();
             }
@@ -3742,6 +3851,20 @@ impl TermchatApp {
 
             Message::SamInitialized(tab_id, result) => match result {
                 Ok((sam, init)) => {
+                    if state
+                        .opened_tabs
+                        .iter()
+                        .find(|tab| tab.id == tab_id)
+                        .map(|tab| tab.sam_runtime.is_closing())
+                        .unwrap_or(true)
+                    {
+                        let mut sam = sam;
+                        return Task::perform(
+                            async move { sam.close().await.map_err(|e| e.to_string()) },
+                            move |result| Message::SamCloseFinished(tab_id, result),
+                        );
+                    }
+
                     let mut profile_name: Option<String> = None;
                     let mut group_name: Option<String> = None;
                     let mut group_old_key: Option<String> = None;
@@ -3749,7 +3872,7 @@ impl TermchatApp {
                     if let Some(tab) = state.tab_by_id_mut(tab_id) {
                         profile_name = Some(tab.session.profile.clone());
 
-                        tab.sam = sam;
+                        tab.sam_runtime.client = sam;
                         tab.session.my_b32 = Some(init.my_b32.clone());
                         tab.session.my_dest_b64 = Some(init.my_dest_b64.clone());
                         tab.session.my_pub_dest_b64 = Some(init.my_pub_dest_b64.clone());
@@ -3880,14 +4003,36 @@ impl TermchatApp {
 
                 match result {
                     Ok((_peer, conn)) => {
+                        let closing = state
+                            .opened_tabs
+                            .iter()
+                            .find(|tab| tab.id == tab_id)
+                            .map(|tab| tab.sam_runtime.is_closing())
+                            .unwrap_or(true);
+                        Self::sam_lifecycle_log(format!(
+                            "group connect result ok tab={tab_id} peer={member_b32} closing={closing}"
+                        ));
                         let msg_id_s = state.generate_msg_id();
                         let msg_id_k = state.generate_msg_id();
                         let mut send_task: Option<Task<Message>> = None;
                         let mut close_task: Option<Task<Message>> = None;
 
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            if tab.sam_runtime.is_closing() {
+                                Self::sam_lifecycle_log(format!(
+                                    "group connect late close tab={tab_id} peer={member_b32}"
+                                ));
+                                return Task::perform(
+                                    async move { conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                );
+                            }
+
                             let Some(group) = tab.group.as_mut() else {
-                                return Task::none();
+                                return Task::perform(
+                                    async move { conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                );
                             };
 
                             let my_b32 = group.meta.my_b32.as_deref();
@@ -3899,7 +4044,10 @@ impl TermchatApp {
                                 .iter_mut()
                                 .find(|peer| peer.member.b32 == member_b32)
                             else {
-                                return Task::none();
+                                return Task::perform(
+                                    async move { conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                );
                             };
 
                             peer.connecting = false;
@@ -3930,6 +4078,7 @@ impl TermchatApp {
                                     ));
                                 }
 
+                                tab.sam_runtime.register_stream(&conn);
                                 let old_conn = peer.conn.replace(conn.clone());
                                 peer.pending_conn = None;
                                 peer.e2e = E2E::new(false);
@@ -3961,7 +4110,7 @@ impl TermchatApp {
                                         payload: peer.e2e.public_bytes(),
                                     };
 
-                                    send_task = Some(Task::perform(
+                                    let task = Task::perform(
                                         async move {
                                             conn.send_raw_line(&line)
                                                 .await
@@ -3974,9 +4123,18 @@ impl TermchatApp {
                                                 .map_err(|e| e.to_string())
                                         },
                                         move |result| Message::SendFinished(tab_id, result),
-                                    ));
+                                    );
+                                    send_task = Some(tab.sam_runtime.track_send_task(task));
                                 }
                             }
+                        } else {
+                            Self::sam_lifecycle_log(format!(
+                                "group connect result without tab; closing conn tab={tab_id} peer={member_b32}"
+                            ));
+                            return Task::perform(
+                                async move { conn.close().await.map_err(|e| e.to_string()) },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            );
                         }
 
                         if is_active {
@@ -3995,6 +4153,9 @@ impl TermchatApp {
                         }
                     }
                     Err(err) => {
+                        Self::sam_lifecycle_log(format!(
+                            "group connect result err tab={tab_id} peer={member_b32} err={err}"
+                        ));
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
                             if let Some(group) = tab.group.as_mut() {
                                 if let Some(peer) = group
@@ -4027,6 +4188,13 @@ impl TermchatApp {
                         let msg_id_k = state.generate_msg_id();
 
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            if tab.sam_runtime.is_closing() {
+                                return Task::perform(
+                                    async move { conn.close().await.map_err(|e| e.to_string()) },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                );
+                            }
+
                             tab.pending_conn = None;
                             tab.session.pending_peer_addr = None;
                             tab.session.pending_peer_dest_b64 = None;
@@ -4034,6 +4202,7 @@ impl TermchatApp {
                             tab.session.call_blink_on = true;
                             tab.session.call_blink_ticks = 0;
                             tab.e2e = E2E::new(tab.session.pq_enabled);
+                            tab.sam_runtime.register_stream(&conn);
                             tab.live_conn = Some(conn.clone());
 
                             tab.session.current_peer_addr = Some(peer.clone());
@@ -4082,7 +4251,10 @@ impl TermchatApp {
                                 )]);
                             }
                         } else {
-                            return Task::none();
+                            return Task::perform(
+                                async move { conn.close().await.map_err(|e| e.to_string()) },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            );
                         }
                     }
                     Err(err) => {
@@ -4105,6 +4277,26 @@ impl TermchatApp {
 
             Message::GroupIncomingAccepted(tab_id, result) => match result {
                 Ok(incoming) => {
+                    Self::sam_lifecycle_log(format!(
+                        "group accept result ok tab={tab_id} peer={}",
+                        incoming.peer_b32
+                    ));
+                    if state
+                        .tab_by_id_mut(tab_id)
+                        .map(|tab| tab.sam_runtime.accept_cancelled())
+                        .unwrap_or(true)
+                    {
+                        Self::sam_lifecycle_log(format!(
+                            "group accept cancelled close tab={tab_id} peer={}",
+                            incoming.peer_b32
+                        ));
+                        let conn_to_close = incoming.conn.clone();
+                        return Task::perform(
+                            async move { conn_to_close.close().await.map_err(|e| e.to_string()) },
+                            move |result| Message::CloseFinished(tab_id, result),
+                        );
+                    }
+
                     let msg_id_s = state.generate_msg_id();
                     let msg_id_k = state.generate_msg_id();
                     let mut accepted_conn: Option<LiveConnection> = None;
@@ -4114,7 +4306,15 @@ impl TermchatApp {
 
                     if let Some(tab) = state.tab_by_id_mut(tab_id) {
                         let Some(group) = tab.group.as_mut() else {
-                            return Task::none();
+                            Self::sam_lifecycle_log(format!(
+                                "group accept missing group close tab={tab_id} peer={}",
+                                incoming.peer_b32
+                            ));
+                            let conn_to_close = incoming.conn.clone();
+                            return Task::perform(
+                                async move { conn_to_close.close().await.map_err(|e| e.to_string()) },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            );
                         };
                         let my_b32 = group.meta.my_b32.as_deref();
                         let prefer_outbound =
@@ -4181,6 +4381,7 @@ impl TermchatApp {
                                 ));
                             }
 
+                            tab.sam_runtime.register_stream(&incoming.conn);
                             let old_conn = peer.conn.replace(incoming.conn.clone());
                             peer.pending_conn = None;
                             peer.e2e = E2E::new(false);
@@ -4212,19 +4413,30 @@ impl TermchatApp {
                                 frames = Some((line, frame_s, frame_k));
                             }
                         }
+                    } else {
+                        Self::sam_lifecycle_log(format!(
+                            "group accept result without tab; closing conn tab={tab_id} peer={}",
+                            incoming.peer_b32
+                        ));
+                        let conn_to_close = incoming.conn.clone();
+                        return Task::perform(
+                            async move { conn_to_close.close().await.map_err(|e| e.to_string()) },
+                            move |result| Message::CloseFinished(tab_id, result),
+                        );
                     }
 
                     let mut tasks = vec![state.group_accept_task(tab_id)];
                     tasks.extend(close_tasks);
                     if let (Some(conn), Some((line, frame_s, frame_k))) = (accepted_conn, frames) {
-                        tasks.push(Task::perform(
+                        let task = Task::perform(
                             async move {
                                 conn.send_raw_line(&line).await.map_err(|e| e.to_string())?;
                                 conn.send_frame(&frame_s).await.map_err(|e| e.to_string())?;
                                 conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
                             },
                             move |result| Message::SendFinished(tab_id, result),
-                        ));
+                        );
+                        tasks.push(state.track_group_send_task(tab_id, task));
                     }
 
                     if is_active {
@@ -4234,10 +4446,20 @@ impl TermchatApp {
                     return Task::batch(tasks);
                 }
                 Err(err) => {
+                    Self::sam_lifecycle_log(format!(
+                        "group accept result err tab={tab_id} err={err}"
+                    ));
                     if let Some(tab) = state.tab_by_id_mut(tab_id) {
-                        tab.session
-                            .log_lines
-                            .push(format!("Group accept failed: {err}"));
+                        let cancelled = tab.sam_runtime.accept_cancelled();
+                        if !cancelled {
+                            tab.session
+                                .log_lines
+                                .push(format!("Group accept failed: {err}"));
+                        } else {
+                            return Task::none();
+                        }
+                    } else {
+                        return Task::none();
                     }
 
                     if state.active_tab().map(|t| t.id) == Some(tab_id) {
@@ -4251,8 +4473,23 @@ impl TermchatApp {
             Message::IncomingAccepted(tab_id, result) => {
                 match result {
                     Ok(incoming) => {
+                        if state
+                            .tab_by_id_mut(tab_id)
+                            .map(|tab| tab.sam_runtime.accept_cancelled())
+                            .unwrap_or(true)
+                        {
+                            let conn_to_close = incoming.conn.clone();
+                            return Task::perform(
+                                async move {
+                                    conn_to_close.close().await.map_err(|e| e.to_string())
+                                },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            );
+                        }
+
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
                             tab.e2e = E2E::new(tab.session.pq_enabled);
+                            tab.sam_runtime.register_stream(&incoming.conn);
                             tab.pending_conn = Some(incoming.conn);
                             tab.session.pending_peer_addr = Some(incoming.peer_b32.clone());
                             tab.session.pending_peer_dest_b64 =
@@ -4294,7 +4531,10 @@ impl TermchatApp {
                     }
                     Err(err) => {
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
-                            tab.session.log_lines.push(format!("Accept failed: {err}"));
+                            let cancelled = tab.sam_runtime.accept_cancelled();
+                            if !cancelled {
+                                tab.session.log_lines.push(format!("Accept failed: {err}"));
+                            }
                         }
                     }
                 }
@@ -4558,6 +4798,7 @@ impl TermchatApp {
                     let mut expected_acks = Vec::new();
 
                     if let Some(tab) = state.active_tab_mut() {
+                        let sam_runtime = tab.sam_runtime.clone();
                         let Some(group) = tab.group.as_mut() else {
                             return Task::none();
                         };
@@ -4576,7 +4817,7 @@ impl TermchatApp {
                             let filename = filename.clone();
                             let mime = mime.clone();
                             let bytes = bytes.clone();
-                            tasks.push(Task::perform(
+                            let task = Task::perform(
                                 async move {
                                     Self::send_group_image_sequence(
                                         conn, e2e, filename, mime, bytes, msg_id,
@@ -4584,7 +4825,8 @@ impl TermchatApp {
                                     .await
                                 },
                                 move |result| Message::SendFinished(tab_id, result),
-                            ));
+                            );
+                            tasks.push(sam_runtime.track_send_task(task));
                         }
                     }
 
@@ -6322,36 +6564,54 @@ impl TermchatApp {
                 } else {
                     true
                 };
+                let tab_closing = if tab.kind == TabKind::AppHome || idx == 0 {
+                    false
+                } else {
+                    state
+                        .opened_tabs
+                        .get(idx - 1)
+                        .map(|opened| opened.sam_runtime.is_closing() || opened.meta.closing)
+                        .unwrap_or(false)
+                };
+                let tab_text_color = if tab_closing {
+                    APP_TAB_DISABLED_TEXT
+                } else {
+                    APP_TAB_TEXT
+                };
+                let tab_content = container(
+                    row![
+                        text(&tab.title).size(13),
+                        tab_status_marker(tab, blink_on, tab_closing),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([4, 10])
+                .style(move |_| tab_indicator_style(tab_text_color));
 
                 row_acc.push(if tab.kind == TabKind::AppHome {
                     row![
-                        button(
-                            container(
-                                row![text(&tab.title).size(13), tab_status_marker(tab, blink_on),]
-                                    .spacing(6)
-                                    .align_y(Alignment::Center)
-                            )
-                            .padding([4, 10])
-                            .style(|_| tab_indicator_style(APP_TAB_TEXT))
-                        )
-                        .style(move |theme, status| tab_button_style(theme, status, selected))
-                        .on_press(Message::TabSelected(idx)),
+                        button(tab_content)
+                            .style(move |theme, status| tab_button_style(theme, status, selected))
+                            .on_press(Message::TabSelected(idx)),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                } else if tab_closing {
+                    row![
+                        button(tab_content)
+                            .style(move |theme, status| tab_button_style(theme, status, selected)),
+                        button(text("x").size(11))
+                            .padding([2, 6])
+                            .style(tab_close_button_style),
                     ]
                     .spacing(4)
                     .align_y(Alignment::Center)
                 } else {
                     row![
-                        button(
-                            container(
-                                row![text(&tab.title).size(13), tab_status_marker(tab, blink_on),]
-                                    .spacing(6)
-                                    .align_y(Alignment::Center)
-                            )
-                            .padding([4, 10])
-                            .style(|_| tab_indicator_style(APP_TAB_TEXT))
-                        )
-                        .style(move |theme, status| tab_button_style(theme, status, selected))
-                        .on_press(Message::TabSelected(idx)),
+                        button(tab_content)
+                            .style(move |theme, status| tab_button_style(theme, status, selected))
+                            .on_press(Message::TabSelected(idx)),
                         button(text("x").size(11))
                             .padding([2, 6])
                             .style(tab_close_button_style)
@@ -6467,6 +6727,11 @@ impl TermchatApp {
 
         let status_bar = status_inner;
 
+        let show_deaddrop_panel =
+            state.session.show_deaddrop_panel && Self::deaddrop_panel_allowed(&state.session);
+        let show_group_panel = state.active_tab_is_group() && state.session.show_group_panel;
+        let bottom_panel_open = state.session.show_logs || show_deaddrop_panel || show_group_panel;
+
         let messages = state.session.bubbles.iter().enumerate().fold(
             column!().spacing(12).padding([8, 4]).width(Length::Fill),
             |col, (idx, bubble)| col.push(message_row(idx, bubble)),
@@ -6479,11 +6744,7 @@ impl TermchatApp {
                 .width(Length::Fill),
         )
         .width(Length::Fill)
-        .height(Length::FillPortion(if state.session.show_logs {
-            3
-        } else {
-            1
-        }))
+        .height(Length::FillPortion(if bottom_panel_open { 3 } else { 1 }))
         .padding(6)
         .style(|_| message_panel_style());
 
@@ -6504,9 +6765,6 @@ impl TermchatApp {
         .style(|_| log_panel_style());
 
         let log_panel = log_inner.height(Length::FillPortion(1));
-
-        let show_deaddrop_panel =
-            state.session.show_deaddrop_panel && Self::deaddrop_panel_allowed(&state.session);
 
         let dd_delete_confirm = state.session.deaddrop_delete_confirm.clone();
         let deaddrop_rows = if state.session.deaddrop_servers.is_empty() {
@@ -6756,6 +7014,12 @@ impl TermchatApp {
             .padding([6, 4])
             .width(Length::Fill)
         };
+        let group_status_line: Element<'_, Message> =
+            if state.session.group_status.trim().is_empty() {
+                Space::new().height(0).into()
+            } else {
+                text(&state.session.group_status).size(12).into()
+            };
 
         let group_panel = container(
             column![
@@ -6849,12 +7113,12 @@ impl TermchatApp {
                 scrollable(group_roster_rows)
                     .height(Length::Fill)
                     .width(Length::Fill),
-                text(&state.session.group_status).size(12),
+                group_status_line,
             ]
             .spacing(8),
         )
         .width(Length::Fill)
-        .height(Length::FillPortion(1))
+        .height(Length::FillPortion(GROUP_PANEL_HEIGHT_PORTION))
         .padding(6)
         .style(|_| log_panel_style());
 
@@ -6864,8 +7128,6 @@ impl TermchatApp {
             .get(state.session.selected_profile_idx)
             .filter(|profile| profile.persistent)
             .map(|profile| profile.name.as_str());
-
-        let show_group_panel = state.active_tab_is_group() && state.session.show_group_panel;
 
         let center_panel: Element<'_, Message> = if is_app_home {
             crate::app_home::app_home_view(
@@ -6892,32 +7154,8 @@ impl TermchatApp {
                 state.pending_profile_import_name.as_deref(),
                 state.backup_operation,
             )
-        } else if show_group_panel && show_deaddrop_panel && state.session.show_logs {
-            column![chat_panel, group_panel, deaddrop_panel, log_panel]
-                .spacing(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if show_group_panel && show_deaddrop_panel {
-            column![chat_panel, group_panel, deaddrop_panel]
-                .spacing(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if show_group_panel && state.session.show_logs {
-            column![chat_panel, group_panel, log_panel]
-                .spacing(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
         } else if show_group_panel {
             column![chat_panel, group_panel]
-                .spacing(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if show_deaddrop_panel && state.session.show_logs {
-            column![chat_panel, deaddrop_panel, log_panel]
                 .spacing(8)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -7191,6 +7429,12 @@ impl TermchatApp {
         format!("{:02}:{:02}:{:02} UTC", h, m, s)
     }
 
+    fn sam_lifecycle_log(line: impl AsRef<str>) {
+        if SAM_LIFECYCLE_DEBUG {
+            eprintln!("[{}][SAM-LIFE] {}", Self::now_utc_hms(), line.as_ref());
+        }
+    }
+
     fn generate_msg_id(&self) -> u64 {
         Self::generate_msg_id_value()
     }
@@ -7249,6 +7493,18 @@ impl TermchatApp {
         )
     }
 
+    fn track_group_send_task(&self, tab_id: u64, task: Task<Message>) -> Task<Message> {
+        if let Some(tab) = self
+            .opened_tabs
+            .iter()
+            .find(|tab| tab.id == tab_id && tab.meta.kind == TabKind::Group)
+        {
+            tab.sam_runtime.track_send_task(task)
+        } else {
+            task
+        }
+    }
+
     fn reset_connection_state(&mut self) {
         self.set_active_live_conn(None);
         self.set_active_pending_conn(None);
@@ -7275,6 +7531,15 @@ impl TermchatApp {
             .iter()
             .position(|t| t.meta.profile_name == profile_name)
         {
+            if self.opened_tabs[real_idx].sam_runtime.is_closing()
+                || self.opened_tabs[real_idx].meta.closing
+            {
+                self.post_system(format!(
+                    "Tab for {profile_name} is still closing. Wait for cleanup to finish."
+                ));
+                return;
+            }
+
             self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
             self.session.profile = self.opened_tabs[real_idx].meta.profile_name.clone();
             self.refresh_visible_from_active_tab_reset_editor();
@@ -7297,6 +7562,14 @@ impl TermchatApp {
             .iter()
             .position(|t| t.meta.kind == TabKind::Group && t.meta.profile_name == profile_name)
         {
+            if self.opened_tabs[real_idx].sam_runtime.is_closing()
+                || self.opened_tabs[real_idx].meta.closing
+            {
+                self.session.group_status =
+                    "Group tab is still closing. Wait for cleanup to finish.".into();
+                return;
+            }
+
             self.session.active_tab_idx = Some(Self::real_to_visible_tab_index(real_idx));
             self.session.profile = self.opened_tabs[real_idx].meta.profile_name.clone();
             self.session.selected_group_idx = self
@@ -8034,10 +8307,11 @@ impl TermchatApp {
 
         self.session.group_status =
             format!("Saved name locally. Sent rename request: {display_name}");
-        Task::perform(
+        let task = Task::perform(
             async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
             move |result| Message::SendFinished(tab_id, result),
-        )
+        );
+        self.track_group_send_task(tab_id, task)
     }
 
     fn send_group_roster_sync_task(&mut self, tab_id: u64) -> Task<Message> {
@@ -8077,10 +8351,11 @@ impl TermchatApp {
                 msg_id: self.generate_msg_id(),
                 payload: peer.e2e.encrypt(&payload),
             };
-            tasks.push(Task::perform(
+            let task = Task::perform(
                 async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
                 move |result| Message::SendFinished(tab_id, result),
-            ));
+            );
+            tasks.push(self.track_group_send_task(tab_id, task));
         }
 
         Task::batch(tasks)
@@ -8102,6 +8377,7 @@ impl TermchatApp {
         if let Some(tab) = self.opened_tabs.get_mut(idx) {
             tab.meta.connected = tab.session.live_ready;
             tab.meta.has_incoming = tab.session.pending_peer_addr.is_some();
+            tab.meta.closing = tab.sam_runtime.is_closing();
         }
     }
 
@@ -8125,11 +8401,15 @@ impl TermchatApp {
         }
     }
 
-    fn close_tab_runtime_tasks(&self, idx: usize) -> Vec<Task<Message>> {
+    fn close_tab_runtime_tasks(&mut self, idx: usize) -> Vec<Task<Message>> {
         let mut tasks = Vec::new();
+        let quit_live_msg_id = self.generate_msg_id();
+        let quit_pending_msg_id = self.generate_msg_id();
 
-        if let Some(tab) = self.opened_tabs.get(idx) {
+        if let Some(tab) = self.opened_tabs.get_mut(idx) {
             let tab_id = tab.id;
+            let tab_kind = tab.meta.kind;
+            let session_id = tab.session.sam_session_id.clone().unwrap_or_default();
             let live = tab.live_conn.clone();
             let pending = tab.pending_conn.clone();
             let group_conns: Vec<LiveConnection> = tab
@@ -8144,46 +8424,81 @@ impl TermchatApp {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut sam = tab.sam.clone();
+            let (registered_conns, mut sam) = tab.sam_runtime.shutdown_parts();
+            let group_count = group_conns.len();
+            let registered_count = registered_conns.len();
 
             let quit_live = Frame {
                 msg_type: MsgType::S,
-                msg_id: self.generate_msg_id(),
+                msg_id: quit_live_msg_id,
                 payload: b"__SIGNAL__:QUIT".to_vec(),
             };
 
             let quit_pending = Frame {
                 msg_type: MsgType::S,
-                msg_id: self.generate_msg_id(),
+                msg_id: quit_pending_msg_id,
                 payload: b"__SIGNAL__:QUIT".to_vec(),
             };
 
             tasks.push(Task::perform(
                 async move {
+                    Self::sam_lifecycle_log(format!(
+                        "tab close begin tab={tab_id} kind={tab_kind:?} session={session_id} group_streams={group_count} registered_streams={registered_count}"
+                    ));
+
                     if let Some(conn) = live {
+                        Self::sam_lifecycle_log(format!("tab close live close start tab={tab_id}"));
                         let _ = conn.send_frame(&quit_live).await;
                         sleep(Duration::from_millis(120)).await;
                         let _ = conn.close().await;
+                        Self::sam_lifecycle_log(format!("tab close live close done tab={tab_id}"));
                     }
 
                     if let Some(conn) = pending {
+                        Self::sam_lifecycle_log(format!("tab close pending close start tab={tab_id}"));
                         let _ = conn.send_frame(&quit_pending).await;
                         sleep(Duration::from_millis(120)).await;
                         let _ = conn.close().await;
+                        Self::sam_lifecycle_log(format!("tab close pending close done tab={tab_id}"));
                     }
 
-                    for conn in group_conns {
+                    for (stream_idx, conn) in group_conns.into_iter().enumerate() {
+                        Self::sam_lifecycle_log(format!(
+                            "tab close group stream close start tab={tab_id} stream={stream_idx}"
+                        ));
                         let quit_group = Frame {
                             msg_type: MsgType::S,
                             msg_id: 0,
                             payload: b"__SIGNAL__:QUIT".to_vec(),
                         };
-                        let _ = conn.send_frame(&quit_group).await;
-                        sleep(Duration::from_millis(30)).await;
+                        let _ = timeout(
+                            Duration::from_millis(GROUP_STREAM_CLOSE_TIMEOUT_MS),
+                            conn.send_frame(&quit_group),
+                        )
+                        .await;
                         let _ = conn.close().await;
+                        Self::sam_lifecycle_log(format!(
+                            "tab close group stream close done tab={tab_id} stream={stream_idx}"
+                        ));
                     }
 
-                    sam.close().await.map_err(|e| e.to_string())
+                    for (stream_idx, conn) in registered_conns.into_iter().enumerate() {
+                        Self::sam_lifecycle_log(format!(
+                            "tab close registered stream close start tab={tab_id} stream={stream_idx}"
+                        ));
+                        let _ = conn.close().await;
+                        Self::sam_lifecycle_log(format!(
+                            "tab close registered stream close done tab={tab_id} stream={stream_idx}"
+                        ));
+                    }
+
+                    sleep(Duration::from_millis(SAM_CONNECT_CANCEL_GRACE_MS)).await;
+                    Self::sam_lifecycle_log(format!("tab close SAM close start tab={tab_id}"));
+                    let result = sam.close().await.map_err(|e| e.to_string());
+                    Self::sam_lifecycle_log(format!(
+                        "tab close SAM close done tab={tab_id} result={result:?}"
+                    ));
+                    result
                 },
                 move |result| Message::SamCloseFinished(tab_id, result),
             ));
@@ -8760,6 +9075,15 @@ impl TermchatApp {
         if self
             .opened_tabs
             .get(idx)
+            .map(|tab| tab.sam_runtime.is_closing())
+            .unwrap_or(true)
+        {
+            return Vec::new();
+        }
+
+        if self
+            .opened_tabs
+            .get(idx)
             .map(|tab| tab.meta.kind == TabKind::Group)
             .unwrap_or(false)
         {
@@ -9250,13 +9574,13 @@ impl TermchatApp {
                                     tab.session.accept_armed = true;
                                     push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                                    let sam = tab.sam.clone();
-                                    tasks.push(Task::perform(
-                                        async move {
-                                            sam.stream_accept().await.map_err(|e| e.to_string())
-                                        },
-                                        move |result| Message::IncomingAccepted(tab_id, result),
-                                    ));
+                                    if let Some((sam, cancelled)) =
+                                        tab.sam_runtime.accept_parts()
+                                    {
+                                        tasks.push(Self::incoming_accept_task_from_parts(
+                                            tab_id, sam, cancelled,
+                                        ));
+                                    }
                                     break;
                                 }
 
@@ -9513,11 +9837,11 @@ impl TermchatApp {
                         tab.session.accept_armed = true;
                         push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                        let sam = tab.sam.clone();
-                        tasks.push(Task::perform(
-                            async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
-                            move |result| Message::IncomingAccepted(tab_id, result),
-                        ));
+                        if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                            tasks.push(Self::incoming_accept_task_from_parts(
+                                tab_id, sam, cancelled,
+                            ));
+                        }
 
                         let close_conn = conn.clone();
                         tasks.push(Task::perform(
@@ -9553,11 +9877,11 @@ impl TermchatApp {
                     tab.session.accept_armed = true;
                     push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                    let sam = tab.sam.clone();
-                    tasks.push(Task::perform(
-                        async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
-                        move |result| Message::IncomingAccepted(tab_id, result),
-                    ));
+                    if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                        tasks.push(Self::incoming_accept_task_from_parts(
+                            tab_id, sam, cancelled,
+                        ));
+                    }
 
                     let close_conn = conn.clone();
                     tasks.push(Task::perform(
@@ -9578,11 +9902,11 @@ impl TermchatApp {
                         &format!("Incoming caller disconnected: {}", caller),
                     );
 
-                    let sam = tab.sam.clone();
-                    tasks.push(Task::perform(
-                        async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
-                        move |result| Message::IncomingAccepted(tab_id, result),
-                    ));
+                    if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                        tasks.push(Self::incoming_accept_task_from_parts(
+                            tab_id, sam, cancelled,
+                        ));
+                    }
 
                     tab.meta.connected = tab.session.live_ready;
                     tab.meta.has_incoming = tab.session.pending_peer_addr.is_some();
@@ -9617,13 +9941,13 @@ impl TermchatApp {
                                     tab.session.accept_armed = true;
                                     push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                                    let sam = tab.sam.clone();
-                                    tasks.push(Task::perform(
-                                        async move {
-                                            sam.stream_accept().await.map_err(|e| e.to_string())
-                                        },
-                                        move |result| Message::IncomingAccepted(tab_id, result),
-                                    ));
+                                    if let Some((sam, cancelled)) =
+                                        tab.sam_runtime.accept_parts()
+                                    {
+                                        tasks.push(Self::incoming_accept_task_from_parts(
+                                            tab_id, sam, cancelled,
+                                        ));
+                                    }
                                     break;
                                 }
                             }
@@ -9683,11 +10007,11 @@ impl TermchatApp {
                         move |result| Message::CloseFinished(tab_id, result),
                     ));
 
-                    let sam = tab.sam.clone();
-                    tasks.push(Task::perform(
-                        async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
-                        move |result| Message::IncomingAccepted(tab_id, result),
-                    ));
+                    if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                        tasks.push(Self::incoming_accept_task_from_parts(
+                            tab_id, sam, cancelled,
+                        ));
+                    }
                 }
             } else if tab.session.network_status != NetworkStatus::Initializing
                 && !tab.session.accept_armed
@@ -9695,11 +10019,9 @@ impl TermchatApp {
                 tab.session.accept_armed = true;
                 push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                let sam = tab.sam.clone();
-                tasks.push(Task::perform(
-                    async move { sam.stream_accept().await.map_err(|e| e.to_string()) },
-                    move |result| Message::IncomingAccepted(tab_id, result),
-                ));
+                if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                    tasks.push(Self::incoming_accept_task_from_parts(tab_id, sam, cancelled));
+                }
             }
 
             if tab.live_conn.is_some()
@@ -9946,6 +10268,7 @@ impl TermchatApp {
             };
 
             tab_id = tab.id;
+            let sam_runtime = tab.sam_runtime.clone();
             let Some(group) = tab.group.as_mut() else {
                 return tasks;
             };
@@ -9972,15 +10295,23 @@ impl TermchatApp {
                                         "Group member disconnected: {}",
                                         peer.member.name
                                     ));
+                                    let close_conn = conn.clone();
+                                    tasks.push(Task::perform(
+                                        async move {
+                                            close_conn.close().await.map_err(|e| e.to_string())
+                                        },
+                                        move |result| Message::CloseFinished(tab_id, result),
+                                    ));
                                     continue;
                                 }
 
                                 if let Some(nonce) = body.strip_prefix(HEARTBEAT_PING_PREFIX) {
-                                    tasks.push(Self::heartbeat_pong_task(
+                                    let task = Self::heartbeat_pong_task(
                                         tab_id,
                                         conn.clone(),
                                         nonce.to_string(),
-                                    ));
+                                    );
+                                    tasks.push(sam_runtime.track_send_task(task));
                                     continue;
                                 }
 
@@ -10004,6 +10335,14 @@ impl TermchatApp {
                                         peer.ready = false;
                                         peer.heartbeat_last_rx_ms = 0;
                                         peer.heartbeat_last_ping_ms = 0;
+                                        let close_conn = conn.clone();
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                close_conn.close().await.map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
+                                        continue;
                                     }
                                     Err(err) => {
                                         tab.session.log_lines.push(format!(
@@ -10069,14 +10408,15 @@ impl TermchatApp {
                                                 payload: peer.e2e.encrypt(&payload),
                                             };
                                             let conn = conn.clone();
-                                            tasks.push(Task::perform(
+                                            let task = Task::perform(
                                                 async move {
                                                     conn.send_frame(&frame)
                                                         .await
                                                         .map_err(|e| e.to_string())
                                                 },
                                                 move |result| Message::SendFinished(tab_id, result),
-                                            ));
+                                            );
+                                            tasks.push(sam_runtime.track_send_task(task));
                                             if control.kind == GROUP_CONTROL_JOIN_PROOF {
                                                 tab.session.log_lines.push(format!(
                                                     "Sent group invite proof to {}.",
@@ -10122,6 +10462,13 @@ impl TermchatApp {
                                         peer.authorized = false;
                                         peer.heartbeat_last_rx_ms = 0;
                                         peer.heartbeat_last_ping_ms = 0;
+                                        let close_conn = conn.clone();
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                close_conn.close().await.map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
                                         continue;
                                     }
 
@@ -10168,6 +10515,16 @@ impl TermchatApp {
                                             peer.authorized = false;
                                             peer.heartbeat_last_rx_ms = 0;
                                             peer.heartbeat_last_ping_ms = 0;
+                                            let close_conn = conn.clone();
+                                            tasks.push(Task::perform(
+                                                async move {
+                                                    close_conn
+                                                        .close()
+                                                        .await
+                                                        .map_err(|e| e.to_string())
+                                                },
+                                                move |result| Message::CloseFinished(tab_id, result),
+                                            ));
                                         }
                                     }
 
@@ -10484,7 +10841,7 @@ impl TermchatApp {
                                 payload: frame.msg_id.to_be_bytes().to_vec(),
                             };
                             let conn_for_ack = conn.clone();
-                            tasks.push(Task::perform(
+                            let task = Task::perform(
                                 async move {
                                     conn_for_ack
                                         .send_frame(&ack)
@@ -10492,7 +10849,8 @@ impl TermchatApp {
                                         .map_err(|e| e.to_string())
                                 },
                                 move |result| Message::SendFinished(tab_id, result),
-                            ));
+                            );
+                            tasks.push(sam_runtime.track_send_task(task));
                         }
                         MsgType::U => {
                             if !peer.ready || !peer.authorized {
@@ -10523,7 +10881,7 @@ impl TermchatApp {
                                         payload: frame.msg_id.to_be_bytes().to_vec(),
                                     };
                                     let conn_for_ack = conn.clone();
-                                    tasks.push(Task::perform(
+                                    let task = Task::perform(
                                         async move {
                                             conn_for_ack
                                                 .send_frame(&ack)
@@ -10531,7 +10889,8 @@ impl TermchatApp {
                                                 .map_err(|e| e.to_string())
                                         },
                                         move |result| Message::SendFinished(tab_id, result),
-                                    ));
+                                    );
+                                    tasks.push(sam_runtime.track_send_task(task));
                                 }
                                 Err(_) => {
                                     tab.session.log_lines.push(format!(
@@ -10615,7 +10974,8 @@ impl TermchatApp {
                             >= HEARTBEAT_PING_INTERVAL_MS
                     {
                         peer.heartbeat_last_ping_ms = now_ms;
-                        tasks.push(Self::heartbeat_ping_task(tab_id, conn.clone()));
+                        let task = Self::heartbeat_ping_task(tab_id, conn.clone());
+                        tasks.push(sam_runtime.track_send_task(task));
                     }
                 }
 
@@ -11087,6 +11447,7 @@ impl TermchatApp {
             has_unread: false,
             has_incoming: false,
             connected: false,
+            closing: false,
             initializing: false,
             initialized: true,
         }
@@ -12773,8 +13134,13 @@ fn status_address_container_style() -> container::Style {
     }
 }
 
-fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool) -> Element<'a, Message> {
-    if tab.initializing {
+fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool, closing: bool) -> Element<'a, Message> {
+    if closing {
+        text("...")
+            .size(13)
+            .color(APP_TAB_DISABLED_TEXT)
+            .into()
+    } else if tab.initializing {
         let frame = APP_TAB_SPINNER_FRAMES
             [((TermchatApp::now_epoch_millis() / 120) as usize) % APP_TAB_SPINNER_FRAMES.len()];
 
