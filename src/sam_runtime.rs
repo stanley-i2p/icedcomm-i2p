@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SAM_RUNTIME_LIFECYCLE_DEBUG: bool = true;
+const SAM_RUNTIME_LIFECYCLE_DEBUG: bool = false;
 
 fn runtime_lifecycle_log(line: impl AsRef<str>) {
     if !SAM_RUNTIME_LIFECYCLE_DEBUG {
@@ -29,10 +29,13 @@ pub struct SamRuntime {
     closing_client: Option<SamClient>,
     accept_cancelled: Arc<AtomicBool>,
     connect_cancelled: Arc<AtomicBool>,
+    lookup_cancelled: Arc<AtomicBool>,
     accept_tokens: Arc<StdMutex<Vec<Weak<AtomicBool>>>>,
     connect_tokens: Arc<StdMutex<Vec<Weak<AtomicBool>>>>,
+    lookup_tokens: Arc<StdMutex<Vec<Weak<AtomicBool>>>>,
     accept_task_handles: Arc<StdMutex<Vec<Handle>>>,
     connect_task_handles: Arc<StdMutex<Vec<Handle>>>,
+    lookup_task_handles: Arc<StdMutex<Vec<Handle>>>,
     send_task_handles: Arc<StdMutex<Vec<Handle>>>,
     streams: Arc<StdMutex<Vec<LiveConnection>>>,
     closing: bool,
@@ -45,10 +48,13 @@ impl SamRuntime {
             closing_client: None,
             accept_cancelled: Arc::new(AtomicBool::new(false)),
             connect_cancelled: Arc::new(AtomicBool::new(false)),
+            lookup_cancelled: Arc::new(AtomicBool::new(false)),
             accept_tokens: Arc::new(StdMutex::new(Vec::new())),
             connect_tokens: Arc::new(StdMutex::new(Vec::new())),
+            lookup_tokens: Arc::new(StdMutex::new(Vec::new())),
             accept_task_handles: Arc::new(StdMutex::new(Vec::new())),
             connect_task_handles: Arc::new(StdMutex::new(Vec::new())),
+            lookup_task_handles: Arc::new(StdMutex::new(Vec::new())),
             send_task_handles: Arc::new(StdMutex::new(Vec::new())),
             streams: Arc::new(StdMutex::new(Vec::new())),
             closing: false,
@@ -65,6 +71,7 @@ impl SamRuntime {
         self.cancel_sends();
         self.cancel_accept();
         self.cancel_connect();
+        self.cancel_lookup();
     }
 
     pub fn shutdown_parts(&mut self) -> (Vec<LiveConnection>, SamClient) {
@@ -141,6 +148,29 @@ impl SamRuntime {
         }
     }
 
+    pub fn cancel_lookup(&self) {
+        self.lookup_cancelled.store(true, Ordering::SeqCst);
+        let mut cancelled_count = 0usize;
+        if let Ok(mut tokens) = self.lookup_tokens.lock() {
+            tokens.retain(|token| {
+                if let Some(token) = token.upgrade() {
+                    token.store(true, Ordering::SeqCst);
+                    cancelled_count += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        if let Ok(mut handles) = self.lookup_task_handles.lock() {
+            runtime_lifecycle_log(format!(
+                "lookup cancel tokens={cancelled_count} released_handles={}",
+                handles.len()
+            ));
+            handles.clear();
+        }
+    }
+
     pub fn accept_parts(&self) -> Option<(SamClient, Arc<AtomicBool>)> {
         if self.closing {
             return None;
@@ -165,6 +195,18 @@ impl SamRuntime {
         Some((self.client.clone(), token))
     }
 
+    pub fn lookup_parts(&self) -> Option<(SamClient, Arc<AtomicBool>)> {
+        if self.closing {
+            return None;
+        }
+        self.lookup_cancelled.store(false, Ordering::SeqCst);
+        let token = Arc::new(AtomicBool::new(false));
+        if let Ok(mut tokens) = self.lookup_tokens.lock() {
+            tokens.push(Arc::downgrade(&token));
+        }
+        Some((self.client.clone(), token))
+    }
+
     pub fn accept_cancelled(&self) -> bool {
         self.accept_cancelled.load(Ordering::SeqCst)
     }
@@ -180,6 +222,14 @@ impl SamRuntime {
     pub fn track_connect_task<T: 'static>(&self, task: Task<T>) -> Task<T> {
         let (task, handle) = task.abortable();
         if let Ok(mut handles) = self.connect_task_handles.lock() {
+            handles.push(handle);
+        }
+        task
+    }
+
+    pub fn track_lookup_task<T: 'static>(&self, task: Task<T>) -> Task<T> {
+        let (task, handle) = task.abortable();
+        if let Ok(mut handles) = self.lookup_task_handles.lock() {
             handles.push(handle);
         }
         task
@@ -217,10 +267,16 @@ impl SamRuntime {
         if let Ok(mut tokens) = self.connect_tokens.lock() {
             tokens.clear();
         }
+        if let Ok(mut tokens) = self.lookup_tokens.lock() {
+            tokens.clear();
+        }
         if let Ok(mut handles) = self.accept_task_handles.lock() {
             handles.clear();
         }
         if let Ok(mut handles) = self.connect_task_handles.lock() {
+            handles.clear();
+        }
+        if let Ok(mut handles) = self.lookup_task_handles.lock() {
             handles.clear();
         }
         if let Ok(mut handles) = self.send_task_handles.lock() {

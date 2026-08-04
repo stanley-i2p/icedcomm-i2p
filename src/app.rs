@@ -146,7 +146,10 @@ const GROUP_CONTROL_RENAME_REQUEST: &str = "rename_request";
 const SHUTDOWN_NOTIFY_GRACE_MS: u64 = 1_200;
 const GROUP_STREAM_CLOSE_TIMEOUT_MS: u64 = 120;
 const SAM_CONNECT_CANCEL_GRACE_MS: u64 = 4_500;
-const SAM_LIFECYCLE_DEBUG: bool = true;
+const GROUP_PUBLISH_LOOKUP_TIMEOUT_MS: u64 = 5_000;
+const GROUP_PUBLISH_LOOKUP_RETRY_MS: u64 = 2_000;
+const GROUP_HANDSHAKE_TIMEOUT_MS: u64 = 45_000;
+const SAM_LIFECYCLE_DEBUG: bool = false;
 const HEARTBEAT_PING_INTERVAL_MS: u64 = 10_000;
 const HEARTBEAT_TIMEOUT_MS: u64 = 35_000;
 const HEARTBEAT_PING_PREFIX: &str = "__SIGNAL__:PING:";
@@ -234,6 +237,9 @@ pub struct GroupPeerRuntime {
     pub authorized: bool,
     pub connecting: bool,
     pub last_connect_attempt_ms: u64,
+    pub handshake_started_ms: u64,
+    pub handshake_identity_received: bool,
+    pub handshake_key_received: bool,
     pub heartbeat_last_rx_ms: u64,
     pub heartbeat_last_ping_ms: u64,
     pub incoming_image_name: Option<String>,
@@ -248,6 +254,7 @@ pub struct GroupRuntime {
     pub meta: GroupMeta,
     pub peers: Vec<GroupPeerRuntime>,
     pub accept_armed: bool,
+    pub publish_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,6 +823,7 @@ pub enum Message {
     GroupInviteImportFinished(Result<String, String>),
 
     SamInitialized(u64, Result<(SamClient, SamInitResult), String>),
+    GroupPublishReady(u64, Result<(), String>),
     GroupConnectFinished(u64, String, Result<(String, LiveConnection), String>),
     GroupIncomingAccepted(u64, Result<AcceptedIncoming, String>),
     ConnectFinished(u64, Result<(String, LiveConnection), String>),
@@ -1114,6 +1122,7 @@ impl TermchatApp {
             meta: group_meta,
             peers,
             accept_armed: false,
+            publish_ready: false,
         });
 
         tab
@@ -1129,6 +1138,9 @@ impl TermchatApp {
             authorized,
             connecting: false,
             last_connect_attempt_ms: 0,
+            handshake_started_ms: 0,
+            handshake_identity_received: false,
+            handshake_key_received: false,
             heartbeat_last_rx_ms: 0,
             heartbeat_last_ping_ms: 0,
             incoming_image_name: None,
@@ -1301,13 +1313,9 @@ impl TermchatApp {
             tab.session.peer_b32 = None;
             tab.session.accept_armed = false;
             if let Some(group) = tab.group.as_mut() {
+                group.publish_ready = false;
                 for peer in &mut group.peers {
-                    peer.conn = None;
-                    peer.pending_conn = None;
-                    peer.ready = false;
-                    peer.connecting = false;
-                    peer.heartbeat_last_rx_ms = 0;
-                    peer.heartbeat_last_ping_ms = 0;
+                    Self::reset_group_peer_transport_state(peer);
                 }
                 group.accept_armed = false;
             }
@@ -1400,6 +1408,10 @@ impl TermchatApp {
             return Vec::new();
         };
 
+        if !group.publish_ready {
+            return Vec::new();
+        }
+
         let mut tasks = Vec::new();
         let now_ms = Self::now_epoch_millis();
 
@@ -1445,6 +1457,54 @@ impl TermchatApp {
         }
 
         tasks
+    }
+
+    fn group_publish_ready_task(&self, tab_id: u64) -> Task<Message> {
+        let Some(tab) = self.opened_tabs.iter().find(|tab| tab.id == tab_id) else {
+            return Task::none();
+        };
+        let Some(group_b32) = tab
+            .group
+            .as_ref()
+            .and_then(|group| group.meta.my_b32.clone())
+        else {
+            return Task::none();
+        };
+        let Some((sam, cancelled)) = tab.sam_runtime.lookup_parts() else {
+            return Task::none();
+        };
+
+        let task = Task::perform(
+            async move {
+                loop {
+                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err("group publication lookup cancelled".to_string());
+                    }
+
+                    if let Ok(Ok(_)) = timeout(
+                        Duration::from_millis(GROUP_PUBLISH_LOOKUP_TIMEOUT_MS),
+                        sam.naming_lookup_cancelled(&group_b32, cancelled.clone()),
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+
+                    let mut waited_ms = 0u64;
+                    while waited_ms < GROUP_PUBLISH_LOOKUP_RETRY_MS {
+                        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err("group publication lookup cancelled".to_string());
+                        }
+                        let step_ms = 50u64.min(GROUP_PUBLISH_LOOKUP_RETRY_MS - waited_ms);
+                        sleep(Duration::from_millis(step_ms)).await;
+                        waited_ms += step_ms;
+                    }
+                }
+            },
+            move |result| Message::GroupPublishReady(tab_id, result),
+        );
+
+        tab.sam_runtime.track_lookup_task(task)
     }
 
     fn active_tab(&self) -> Option<&OpenedTab> {
@@ -2524,13 +2584,9 @@ impl TermchatApp {
                         tab.e2e = E2E::new(tab.session.pq_enabled);
 
                         if let Some(group) = tab.group.as_mut() {
+                            group.publish_ready = false;
                             for peer in &mut group.peers {
-                                peer.conn = None;
-                                peer.pending_conn = None;
-                                peer.ready = false;
-                                peer.connecting = false;
-                                peer.heartbeat_last_rx_ms = 0;
-                                peer.heartbeat_last_ping_ms = 0;
+                                Self::reset_group_peer_transport_state(peer);
                             }
                             group.accept_armed = false;
                         }
@@ -3894,6 +3950,7 @@ impl TermchatApp {
 
                         if let Some(group) = tab.group.as_mut() {
                             let old_key = storage::group_storage_key(&group.meta);
+                            group.publish_ready = false;
                             group.meta.my_dest_b64 = Some(init.my_dest_b64.clone());
                             group.meta.my_b32 = Some(init.my_b32.clone());
                             if group.meta.owner_b32.is_none() && group.meta.join_token.is_none() {
@@ -3917,6 +3974,9 @@ impl TermchatApp {
                             tab.session
                                 .log_lines
                                 .push(format!("Group address: {}", init.my_b32));
+                            tab.session
+                                .log_lines
+                                .push("Waiting for group tunnels to be published.".into());
                         }
                     } else {
                         return Task::none();
@@ -3974,9 +4034,10 @@ impl TermchatApp {
                         .unwrap_or(false);
 
                     if is_group_tab {
-                        let mut tasks = state.group_connect_tasks(tab_id);
-                        tasks.push(state.group_accept_task(tab_id));
-                        return Task::batch(tasks);
+                        return Task::batch(vec![
+                            state.group_accept_task(tab_id),
+                            state.group_publish_ready_task(tab_id),
+                        ]);
                     }
 
                     return state.accept_task(tab_id);
@@ -3997,6 +4058,49 @@ impl TermchatApp {
                     return Task::none();
                 }
             },
+
+            Message::GroupPublishReady(tab_id, result) => {
+                match result {
+                    Ok(()) => {
+                        let can_start = if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            if tab.sam_runtime.is_closing() {
+                                false
+                            } else if let Some(group) = tab.group.as_mut() {
+                                group.publish_ready = true;
+                                tab.session.network_status = NetworkStatus::Visible;
+                                tab.session.log_lines.push(
+                                    "Group tunnels confirmed. Starting group member connections."
+                                        .into(),
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                            state.load_active_runtime();
+                        }
+
+                        if can_start {
+                            return Task::batch(state.group_connect_tasks(tab_id));
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            if !tab.sam_runtime.is_closing() {
+                                tab.session
+                                    .log_lines
+                                    .push(format!("Group tunnel check stopped: {err}"));
+                            }
+                        }
+                    }
+                }
+
+                return Task::none();
+            }
 
             Message::GroupConnectFinished(tab_id, member_b32, result) => {
                 let is_active = state.active_tab().map(|t| t.id) == Some(tab_id);
@@ -4081,10 +4185,10 @@ impl TermchatApp {
                                 tab.sam_runtime.register_stream(&conn);
                                 let old_conn = peer.conn.replace(conn.clone());
                                 peer.pending_conn = None;
-                                peer.e2e = E2E::new(false);
-                                peer.ready = false;
-                                peer.heartbeat_last_rx_ms = 0;
-                                peer.heartbeat_last_ping_ms = 0;
+                                Self::start_group_peer_handshake(
+                                    peer,
+                                    Self::now_epoch_millis(),
+                                );
 
                                 if let Some(old_conn) = old_conn {
                                     close_task = Some(Task::perform(
@@ -4384,11 +4488,10 @@ impl TermchatApp {
                             tab.sam_runtime.register_stream(&incoming.conn);
                             let old_conn = peer.conn.replace(incoming.conn.clone());
                             peer.pending_conn = None;
-                            peer.e2e = E2E::new(false);
-                            peer.ready = false;
-                            peer.connecting = false;
-                            peer.heartbeat_last_rx_ms = 0;
-                            peer.heartbeat_last_ping_ms = 0;
+                            Self::start_group_peer_handshake(
+                                peer,
+                                Self::now_epoch_millis(),
+                            );
 
                             if let Some(old_conn) = old_conn {
                                 close_tasks.push(Task::perform(
@@ -10287,10 +10390,7 @@ impl TermchatApp {
                         MsgType::S => match String::from_utf8(frame.payload) {
                             Ok(body) => {
                                 if body == "__SIGNAL__:QUIT" {
-                                    peer.conn = None;
-                                    peer.ready = false;
-                                    peer.heartbeat_last_rx_ms = 0;
-                                    peer.heartbeat_last_ping_ms = 0;
+                                    Self::reset_group_peer_transport_state(peer);
                                     tab.session.log_lines.push(format!(
                                         "Group member disconnected: {}",
                                         peer.member.name
@@ -10320,7 +10420,10 @@ impl TermchatApp {
                                 }
 
                                 match SamClient::destination_to_b32(&body) {
-                                    Ok(peer_b32) if peer_b32 == peer.member.b32 => {
+                                    Ok(peer_b32)
+                                        if peer_b32.eq_ignore_ascii_case(&peer.member.b32) =>
+                                    {
+                                        peer.handshake_identity_received = true;
                                         tab.session.log_lines.push(format!(
                                             "Group member identity verified: {}",
                                             peer.member.name
@@ -10331,10 +10434,7 @@ impl TermchatApp {
                                             "Group identity mismatch for {}: {}",
                                             peer.member.name, peer_b32
                                         ));
-                                        peer.conn = None;
-                                        peer.ready = false;
-                                        peer.heartbeat_last_rx_ms = 0;
-                                        peer.heartbeat_last_ping_ms = 0;
+                                        Self::reset_group_peer_transport_state(peer);
                                         let close_conn = conn.clone();
                                         tasks.push(Task::perform(
                                             async move {
@@ -10349,97 +10449,43 @@ impl TermchatApp {
                                             "Invalid group identity from {}: {err}",
                                             peer.member.name
                                         ));
+                                        Self::reset_group_peer_transport_state(peer);
+                                        let close_conn = conn.clone();
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                close_conn.close().await.map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
+                                        continue;
                                     }
                                 }
                             }
                             Err(_) => {
-                                tab.session
-                                    .log_lines
-                                    .push("Invalid UTF-8 group identity payload.".into());
+                                tab.session.log_lines.push(format!(
+                                    "Invalid UTF-8 group identity payload from {}.",
+                                    peer.member.name
+                                ));
+                                Self::reset_group_peer_transport_state(peer);
+                                let close_conn = conn.clone();
+                                tasks.push(Task::perform(
+                                    async move {
+                                        close_conn.close().await.map_err(|e| e.to_string())
+                                    },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                ));
+                                continue;
                             }
                         },
                         MsgType::K => {
                             peer.e2e.receive_peer_key(&frame.payload);
                             if peer.e2e.ready() {
-                                peer.ready = true;
-                                peer.heartbeat_last_rx_ms = now_ms;
-                                peer.heartbeat_last_ping_ms = now_ms;
-                                if is_group_admin {
-                                    roster_sync_needed = true;
-                                }
+                                peer.handshake_key_received = true;
+                            } else {
                                 tab.session.log_lines.push(format!(
-                                    "Group secure session ready: {}",
+                                    "Invalid group key from {}.",
                                     peer.member.name
                                 ));
-
-                                if let (Some(my_b32), Some(owner_b32)) =
-                                    (group.meta.my_b32.clone(), group.meta.owner_b32.clone())
-                                {
-                                    if !peer.member.b32.eq_ignore_ascii_case(&owner_b32) {
-                                        continue;
-                                    }
-
-                                    let control = if let Some(token) = group.meta.join_token.clone()
-                                    {
-                                        GroupControlMessage {
-                                            kind: GROUP_CONTROL_JOIN_PROOF.into(),
-                                            token,
-                                            b32: my_b32,
-                                            name: Self::group_self_display_name(&group.meta),
-                                        }
-                                    } else if !is_group_admin
-                                        && !group.meta.my_name.trim().is_empty()
-                                    {
-                                        GroupControlMessage {
-                                            kind: GROUP_CONTROL_RENAME_REQUEST.into(),
-                                            token: String::new(),
-                                            b32: my_b32,
-                                            name: Self::group_self_display_name(&group.meta),
-                                        }
-                                    } else {
-                                        continue;
-                                    };
-
-                                    match serde_json::to_vec(&control) {
-                                        Ok(payload) => {
-                                            let frame = Frame {
-                                                msg_type: MsgType::L,
-                                                msg_id: Self::generate_msg_id_value(),
-                                                payload: peer.e2e.encrypt(&payload),
-                                            };
-                                            let conn = conn.clone();
-                                            let task = Task::perform(
-                                                async move {
-                                                    conn.send_frame(&frame)
-                                                        .await
-                                                        .map_err(|e| e.to_string())
-                                                },
-                                                move |result| Message::SendFinished(tab_id, result),
-                                            );
-                                            tasks.push(sam_runtime.track_send_task(task));
-                                            if control.kind == GROUP_CONTROL_JOIN_PROOF {
-                                                tab.session.log_lines.push(format!(
-                                                    "Sent group invite proof to {}.",
-                                                    peer.member.name
-                                                ));
-                                            } else {
-                                                tab.session.log_lines.push(format!(
-                                                    "Sent group rename request to {}.",
-                                                    peer.member.name
-                                                ));
-                                            }
-                                        }
-                                        Err(err) => {
-                                            tab.session.log_lines.push(format!(
-                                                "Group invite proof encode failed: {err}"
-                                            ));
-                                        }
-                                    }
-                                }
-                            } else {
-                                tab.session
-                                    .log_lines
-                                    .push(format!("Received group key: {}", peer.member.name));
                             }
                         }
                         MsgType::L => {
@@ -10457,11 +10503,8 @@ impl TermchatApp {
                                             "Rejected group invite proof b32 mismatch from {}.",
                                             peer.member.name
                                         ));
-                                        peer.conn = None;
-                                        peer.ready = false;
                                         peer.authorized = false;
-                                        peer.heartbeat_last_rx_ms = 0;
-                                        peer.heartbeat_last_ping_ms = 0;
+                                        Self::reset_group_peer_transport_state(peer);
                                         let close_conn = conn.clone();
                                         tasks.push(Task::perform(
                                             async move {
@@ -10510,11 +10553,8 @@ impl TermchatApp {
                                                 "Rejected group invite proof from {}: {err}",
                                                 peer.member.name
                                             ));
-                                            peer.conn = None;
-                                            peer.ready = false;
                                             peer.authorized = false;
-                                            peer.heartbeat_last_rx_ms = 0;
-                                            peer.heartbeat_last_ping_ms = 0;
+                                            Self::reset_group_peer_transport_state(peer);
                                             let close_conn = conn.clone();
                                             tasks.push(Task::perform(
                                                 async move {
@@ -10928,15 +10968,93 @@ impl TermchatApp {
                             ));
                         }
                     }
+
+                    if !peer.ready
+                        && peer.handshake_identity_received
+                        && peer.handshake_key_received
+                        && peer.e2e.ready()
+                    {
+                        peer.ready = true;
+                        peer.handshake_started_ms = 0;
+                        peer.heartbeat_last_rx_ms = now_ms;
+                        peer.heartbeat_last_ping_ms = now_ms;
+                        if is_group_admin {
+                            roster_sync_needed = true;
+                        }
+                        tab.session.log_lines.push(format!(
+                            "Group secure session ready: {}",
+                            peer.member.name
+                        ));
+
+                        if let (Some(my_b32), Some(owner_b32)) =
+                            (group.meta.my_b32.clone(), group.meta.owner_b32.clone())
+                        {
+                            if peer.member.b32.eq_ignore_ascii_case(&owner_b32) {
+                                let control = if let Some(token) = group.meta.join_token.clone() {
+                                    Some(GroupControlMessage {
+                                        kind: GROUP_CONTROL_JOIN_PROOF.into(),
+                                        token,
+                                        b32: my_b32,
+                                        name: Self::group_self_display_name(&group.meta),
+                                    })
+                                } else if !is_group_admin
+                                    && !group.meta.my_name.trim().is_empty()
+                                {
+                                    Some(GroupControlMessage {
+                                        kind: GROUP_CONTROL_RENAME_REQUEST.into(),
+                                        token: String::new(),
+                                        b32: my_b32,
+                                        name: Self::group_self_display_name(&group.meta),
+                                    })
+                                } else {
+                                    None
+                                };
+
+                                if let Some(control) = control {
+                                    match serde_json::to_vec(&control) {
+                                        Ok(payload) => {
+                                            let frame = Frame {
+                                                msg_type: MsgType::L,
+                                                msg_id: Self::generate_msg_id_value(),
+                                                payload: peer.e2e.encrypt(&payload),
+                                            };
+                                            let conn = conn.clone();
+                                            let task = Task::perform(
+                                                async move {
+                                                    conn.send_frame(&frame)
+                                                        .await
+                                                        .map_err(|e| e.to_string())
+                                                },
+                                                move |result| Message::SendFinished(tab_id, result),
+                                            );
+                                            tasks.push(sam_runtime.track_send_task(task));
+                                            if control.kind == GROUP_CONTROL_JOIN_PROOF {
+                                                tab.session.log_lines.push(format!(
+                                                    "Sent group invite proof to {}.",
+                                                    peer.member.name
+                                                ));
+                                            } else {
+                                                tab.session.log_lines.push(format!(
+                                                    "Sent group rename request to {}.",
+                                                    peer.member.name
+                                                ));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tab.session.log_lines.push(format!(
+                                                "Group invite proof encode failed: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if conn.is_closed() && !conn.has_pending_frames() {
                     let was_ready = peer.ready;
-                    peer.conn = None;
-                    peer.ready = false;
-                    peer.connecting = false;
-                    peer.heartbeat_last_rx_ms = 0;
-                    peer.heartbeat_last_ping_ms = 0;
+                    Self::reset_group_peer_transport_state(peer);
 
                     if was_ready {
                         tab.session
@@ -10947,17 +11065,36 @@ impl TermchatApp {
                     continue;
                 }
 
+                if !peer.ready
+                    && peer.handshake_started_ms != 0
+                    && now_ms.saturating_sub(peer.handshake_started_ms)
+                        >= GROUP_HANDSHAKE_TIMEOUT_MS
+                {
+                    let identity_received = peer.handshake_identity_received;
+                    let key_received = peer.handshake_key_received;
+                    let stalled_conn = peer.conn.take();
+                    Self::reset_group_peer_transport_state(peer);
+                    tab.session.log_lines.push(format!(
+                        "Group handshake timed out for {} (identity={}, key={}).",
+                        peer.member.name, identity_received, key_received
+                    ));
+
+                    if let Some(stalled_conn) = stalled_conn {
+                        tasks.push(Task::perform(
+                            async move { stalled_conn.close().await.map_err(|e| e.to_string()) },
+                            move |result| Message::CloseFinished(tab_id, result),
+                        ));
+                    }
+                    continue;
+                }
+
                 if peer.ready && peer.authorized {
                     if peer.heartbeat_last_rx_ms == 0 {
                         peer.heartbeat_last_rx_ms = now_ms;
                     }
 
                     if now_ms.saturating_sub(peer.heartbeat_last_rx_ms) >= HEARTBEAT_TIMEOUT_MS {
-                        peer.conn = None;
-                        peer.ready = false;
-                        peer.connecting = false;
-                        peer.heartbeat_last_rx_ms = 0;
-                        peer.heartbeat_last_ping_ms = 0;
+                        Self::reset_group_peer_transport_state(peer);
                         tab.session.log_lines.push(format!(
                             "Group member heartbeat timed out: {}",
                             peer.member.name
@@ -10986,6 +11123,8 @@ impl TermchatApp {
 
             tab.session.live_ready = any_ready;
             tab.session.network_status = if any_ready {
+                NetworkStatus::Visible
+            } else if group.publish_ready {
                 NetworkStatus::Visible
             } else if tab.meta.initialized {
                 NetworkStatus::LocalOk
@@ -11021,9 +11160,10 @@ impl TermchatApp {
             .get(idx)
             .and_then(|tab| tab.group.as_ref())
             .map(|group| {
-                group.peers.iter().any(|peer| {
-                    peer.authorized && !peer.ready && !peer.connecting && peer.conn.is_none()
-                })
+                group.publish_ready
+                    && group.peers.iter().any(|peer| {
+                        peer.authorized && !peer.ready && !peer.connecting && peer.conn.is_none()
+                    })
             })
             .unwrap_or(false);
 
@@ -11132,6 +11272,32 @@ impl TermchatApp {
         peer.incoming_image_received = 0;
         peer.incoming_image_msg_id = 0;
         peer.incoming_image_bytes.clear();
+    }
+
+    fn start_group_peer_handshake(peer: &mut GroupPeerRuntime, now_ms: u64) {
+        peer.e2e = E2E::new(false);
+        peer.ready = false;
+        peer.connecting = false;
+        peer.handshake_started_ms = now_ms;
+        peer.handshake_identity_received = false;
+        peer.handshake_key_received = false;
+        peer.heartbeat_last_rx_ms = 0;
+        peer.heartbeat_last_ping_ms = 0;
+        Self::clear_group_peer_incoming_image_state(peer);
+    }
+
+    fn reset_group_peer_transport_state(peer: &mut GroupPeerRuntime) {
+        peer.conn = None;
+        peer.pending_conn = None;
+        peer.e2e = E2E::new(false);
+        peer.ready = false;
+        peer.connecting = false;
+        peer.handshake_started_ms = 0;
+        peer.handshake_identity_received = false;
+        peer.handshake_key_received = false;
+        peer.heartbeat_last_rx_ms = 0;
+        peer.heartbeat_last_ping_ms = 0;
+        Self::clear_group_peer_incoming_image_state(peer);
     }
 
     async fn send_group_image_sequence(

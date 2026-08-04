@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-const SAM_CLIENT_LIFECYCLE_DEBUG: bool = true;
+const SAM_CLIENT_LIFECYCLE_DEBUG: bool = false;
 const LIVE_CONNECTION_READER_JOIN_TIMEOUT_MS: u64 = 250;
 const CANCELLED_STREAM_CONNECT_RESPONSE_GRACE_MS: u64 = 4_000;
 
@@ -250,6 +250,40 @@ impl SamClient {
             my_pub_dest_b64,
             my_b32,
         })
+    }
+
+    pub async fn naming_lookup_cancelled(
+        &self,
+        name: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, SamError> {
+        let ctrl = self
+            .ctrl
+            .as_ref()
+            .ok_or(SamError::SessionNotInitialized)?
+            .clone();
+        let mut ctrl = ctrl.lock().await;
+
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(SamError::Protocol("naming lookup cancelled".into()));
+        }
+
+        let command = format!("NAMING LOOKUP NAME={name}\n");
+        ctrl.writer
+            .write_all(command.as_bytes())
+            .await
+            .map_err(|e| SamError::Io(e.to_string()))?;
+
+        let response = read_line_cancelled(&mut ctrl.reader, cancelled).await?;
+        let result =
+            extract_field(&response, "RESULT").ok_or(SamError::MissingField("RESULT"))?;
+        if result != "OK" {
+            return Err(SamError::Protocol(format!(
+                "NAMING LOOKUP failed: {response}"
+            )));
+        }
+
+        extract_field(&response, "VALUE").ok_or(SamError::MissingField("VALUE"))
     }
 
     pub async fn stream_connect_cancelled(
