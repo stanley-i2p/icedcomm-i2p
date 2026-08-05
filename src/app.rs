@@ -14,7 +14,7 @@ use iced::widget::Id as ScrollableId;
 use iced::widget::operation;
 use iced::widget::{
     Space, button, column, container, image, progress_bar, row, scrollable, stack, text,
-    text_editor, text_input,
+    text_editor, text_input, tooltip,
 };
 use iced::{
     Alignment, Background, Color, ContentFit, Element, Font, Length, Subscription, Task, exit,
@@ -154,6 +154,22 @@ const HEARTBEAT_PING_INTERVAL_MS: u64 = 10_000;
 const HEARTBEAT_TIMEOUT_MS: u64 = 35_000;
 const HEARTBEAT_PING_PREFIX: &str = "__SIGNAL__:PING:";
 const HEARTBEAT_PONG_PREFIX: &str = "__SIGNAL__:PONG:";
+const MAX_LOG_LINES: usize = 5_000;
+const LOG_TRIM_BATCH: usize = 500;
+
+fn current_utc_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let day = secs % 86_400;
+    let h = day / 3_600;
+    let m = (day % 3_600) / 60;
+    let s = day % 60;
+
+    format!("{:02}:{:02}:{:02} UTC", h, m, s)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupGate {
@@ -341,6 +357,13 @@ pub struct ImageBubbleData {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingImageDraft {
+    pub filename: String,
+    pub mime: String,
+    pub image: ImageBubbleData,
+}
+
+#[derive(Debug, Clone)]
 pub struct FileBubbleData {
     pub filename: String,
     pub saved_path: Option<String>,
@@ -511,6 +534,47 @@ pub enum GuiAction {
 }
 
 #[derive(Debug, Clone)]
+pub struct LogLines {
+    lines: Vec<String>,
+}
+
+impl LogLines {
+    fn from_messages(messages: Vec<String>) -> Self {
+        let mut log_lines = Self { lines: Vec::new() };
+        for message in messages {
+            log_lines.push(message);
+        }
+        log_lines
+    }
+
+    fn push(&mut self, message: String) {
+        if self.lines.len() >= MAX_LOG_LINES {
+            let trim_count = LOG_TRIM_BATCH.min(self.lines.len());
+            self.lines.drain(..trim_count);
+        }
+
+        self.lines
+            .push(format!("[{}] {message}", current_utc_hms()));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.lines.iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn joined(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionState {
     pub profile: String,
     pub profiles: Vec<ProfileEntry>,
@@ -563,6 +627,7 @@ pub struct SessionState {
     pub input: String,
     pub input_editor: text_editor::Content,
     pub reply_to: Option<ReplyDraft>,
+    pub pending_image: Option<PendingImageDraft>,
     pub bubbles: Vec<Bubble>,
     pub status_lines: Vec<String>,
     pub show_logs: bool,
@@ -570,7 +635,7 @@ pub struct SessionState {
     pub show_group_panel: bool,
     pub deaddrop_server_input: String,
     pub deaddrop_delete_confirm: Option<DdServerDeleteConfirm>,
-    pub log_lines: Vec<String>,
+    pub log_lines: LogLines,
     pub messages_scroll_id: ScrollableId,
     pub logs_scroll_id: ScrollableId,
 
@@ -647,6 +712,7 @@ impl Default for SessionState {
             input: String::new(),
             input_editor: text_editor::Content::new(),
             reply_to: None,
+            pending_image: None,
             bubbles: vec![],
             status_lines: vec![
                 format!("{APP_NAME} {APP_VERSION}"),
@@ -658,11 +724,11 @@ impl Default for SessionState {
             show_group_panel: false,
             deaddrop_server_input: String::new(),
             deaddrop_delete_confirm: None,
-            log_lines: vec![
+            log_lines: LogLines::from_messages(vec![
                 format!("{APP_NAME} {APP_VERSION}"),
                 "Application ready.".into(),
                 "Open a profile to start a chat tab.".into(),
-            ],
+            ]),
             messages_scroll_id: ScrollableId::unique(),
             logs_scroll_id: ScrollableId::unique(),
             deaddrop_servers: vec![],
@@ -729,6 +795,8 @@ pub enum BackupOperation {
 #[derive(Debug, Clone)]
 pub enum Message {
     InputChanged(text_editor::Action),
+    PasteFromClipboard,
+    CancelPendingImagePressed,
     SendPressed,
 
     UnlockInputChanged(String),
@@ -791,6 +859,7 @@ pub enum Message {
     CopyBubbleTextPressed(usize),
     ReplyBubblePressed(usize),
     CancelReplyPressed,
+    CopyLogsPressed,
     ToggleLogsPressed,
     ToggleGroupPanelPressed,
     DdServerInputChanged(String),
@@ -1105,10 +1174,10 @@ impl TermchatApp {
         tab.session.offline_mode = false;
         tab.session.deaddrop_servers.clear();
         tab.session.show_deaddrop_panel = false;
-        tab.session.log_lines = vec![
+        tab.session.log_lines = LogLines::from_messages(vec![
             format!("Group opened: {}", group_meta.name),
             "Group chat uses separate identity and live fan-out only.".into(),
-        ];
+        ]);
         tab.session.bubbles.clear();
 
         let peers = group_meta
@@ -1863,6 +1932,20 @@ impl TermchatApp {
         content
     }
 
+    fn message_editor_key_binding(
+        key_press: text_editor::KeyPress,
+    ) -> Option<text_editor::Binding<Message>> {
+        let is_paste = key_press.modifiers.command()
+            && !key_press.modifiers.alt()
+            && key_press.key.to_latin(key_press.physical_key) == Some('v');
+
+        if is_paste {
+            Some(text_editor::Binding::Custom(Message::PasteFromClipboard))
+        } else {
+            text_editor::Binding::from_key_press(key_press)
+        }
+    }
+
     pub fn update(state: &mut Self, message: Message) -> Task<Message> {
         match message {
             Message::InputChanged(action) => {
@@ -1875,6 +1958,75 @@ impl TermchatApp {
                     return operation::snap_to_end(state.session.messages_scroll_id.clone());
                 }
 
+                return Task::none();
+            }
+
+            Message::PasteFromClipboard => {
+                if state.clipboard.is_none() {
+                    state.post_system("Clipboard is not available.");
+                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                }
+
+                let clipboard_image = state
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_image().ok());
+                if let Some(image) = clipboard_image {
+                    if !state.can_send_live_image() {
+                        state.post_system("Image paste requires a live secure chat.");
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+
+                    let draft = match Self::prepare_clipboard_image_draft(image) {
+                        Ok(draft) => draft,
+                        Err(err) => {
+                            state.post_system(err);
+                            return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                        }
+                    };
+
+                    if state.active_tab_is_group()
+                        && draft.image.bytes.len() > GROUP_IMAGE_TRANSFER_MAX_BYTES
+                    {
+                        state.post_system(format!(
+                            "Group image preview too large ({} bytes). Maximum is {} bytes.",
+                            draft.image.bytes.len(),
+                            GROUP_IMAGE_TRANSFER_MAX_BYTES
+                        ));
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+
+                    state.session.pending_image = Some(draft);
+                    state.store_active_runtime();
+                    return Task::none();
+                }
+
+                let clipboard_text = state
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok());
+                if let Some(text) = clipboard_text {
+                    let was_empty = state.session.input.is_empty();
+                    state
+                        .session
+                        .input_editor
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                            std::sync::Arc::new(text),
+                        )));
+                    state.session.input = state.session.input_editor.text();
+                    let should_snap_messages = was_empty && !state.session.input.is_empty();
+                    state.store_active_runtime();
+                    if should_snap_messages {
+                        return operation::snap_to_end(state.session.messages_scroll_id.clone());
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::CancelPendingImagePressed => {
+                state.session.pending_image = None;
+                state.store_active_runtime();
                 return Task::none();
             }
 
@@ -2987,6 +3139,27 @@ impl TermchatApp {
             }
 
             Message::SendPressed => {
+                if state.can_send_live_image() {
+                    if let Some(draft) = state.session.pending_image.clone() {
+                        let send_task = state.send_prepared_image(
+                            draft.filename,
+                            draft.mime,
+                            draft.image.bytes,
+                        );
+                        return match send_task {
+                            Ok(task) => {
+                                state.session.pending_image = None;
+                                state.store_active_runtime();
+                                task
+                            }
+                            Err(err) => {
+                                state.post_system(err);
+                                operation::snap_to_end(state.session.logs_scroll_id.clone())
+                            }
+                        };
+                    }
+                }
+
                 let draft_text = state.session.input.clone();
 
                 if !draft_text.trim().is_empty() {
@@ -3551,6 +3724,26 @@ impl TermchatApp {
                 };
 
                 state.copy_text_to_clipboard(text, "message text");
+                state.store_active_runtime();
+                return operation::snap_to_end(state.session.logs_scroll_id.clone());
+            }
+
+            Message::CopyLogsPressed => {
+                let line_count = state.session.log_lines.len();
+                if line_count == 0 {
+                    return Task::none();
+                }
+
+                let contents = state.session.log_lines.joined();
+                let copy_result = match state.clipboard.as_mut() {
+                    Some(clipboard) => clipboard.set_text(contents).map_err(|err| err.to_string()),
+                    None => Err("Clipboard is not available.".to_string()),
+                };
+
+                match copy_result {
+                    Ok(()) => state.post_system(format!("Copied {line_count} log lines.")),
+                    Err(err) => state.post_system(format!("Clipboard copy failed: {err}")),
+                }
                 state.store_active_runtime();
                 return operation::snap_to_end(state.session.logs_scroll_id.clone());
             }
@@ -4870,119 +5063,13 @@ impl TermchatApp {
                     }
                 };
 
-                if bytes.is_empty() {
-                    state.post_system("Image preview is empty.");
-                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
-                }
-
-                if bytes.len() > MAX_FILE_SIZE {
-                    state.post_system(format!("Image preview too large ({} bytes).", bytes.len()));
-                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
-                }
-
-                let msg_id = state.generate_msg_id();
-
-                if state.active_tab_is_group() {
-                    if bytes.len() > GROUP_IMAGE_TRANSFER_MAX_BYTES {
-                        state.post_system(format!(
-                            "Group image preview too large ({} bytes). Maximum is {} bytes.",
-                            bytes.len(),
-                            GROUP_IMAGE_TRANSFER_MAX_BYTES
-                        ));
-                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                return match state.send_prepared_image(filename, mime, bytes) {
+                    Ok(task) => task,
+                    Err(err) => {
+                        state.post_system(err);
+                        operation::snap_to_end(state.session.logs_scroll_id.clone())
                     }
-
-                    let tab_id = match state.active_tab() {
-                        Some(tab) => tab.id,
-                        None => return Task::none(),
-                    };
-
-                    let mut tasks = Vec::new();
-                    let mut expected_acks = Vec::new();
-
-                    if let Some(tab) = state.active_tab_mut() {
-                        let sam_runtime = tab.sam_runtime.clone();
-                        let Some(group) = tab.group.as_mut() else {
-                            return Task::none();
-                        };
-
-                        for peer in &group.peers {
-                            if !peer.ready || !peer.authorized {
-                                continue;
-                            }
-
-                            let Some(conn) = peer.conn.clone() else {
-                                continue;
-                            };
-
-                            expected_acks.push(peer.member.b32.to_ascii_lowercase());
-                            let e2e = peer.e2e.clone();
-                            let filename = filename.clone();
-                            let mime = mime.clone();
-                            let bytes = bytes.clone();
-                            let task = Task::perform(
-                                async move {
-                                    Self::send_group_image_sequence(
-                                        conn, e2e, filename, mime, bytes, msg_id,
-                                    )
-                                    .await
-                                },
-                                move |result| Message::SendFinished(tab_id, result),
-                            );
-                            tasks.push(sam_runtime.track_send_task(task));
-                        }
-                    }
-
-                    if expected_acks.is_empty() {
-                        state.post_system("No ready group members.");
-                        state.store_active_runtime();
-                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
-                    }
-
-                    state.session.bubbles.push(Bubble {
-                        author: "Me".into(),
-                        content: BubbleContent::Image(Self::image_bubble_data(bytes.clone())),
-                        mine: true,
-                        offline: false,
-                        timestamp_utc: Self::now_utc_hms(),
-                        msg_id: Some(msg_id),
-                        delivered: false,
-                        group_expected_acks: expected_acks,
-                        group_received_acks: Vec::new(),
-                    });
-
-                    state.store_active_runtime();
-                    tasks.push(operation::snap_to_end(
-                        state.session.messages_scroll_id.clone(),
-                    ));
-                    return Task::batch(tasks);
-                }
-
-                state.session.bubbles.push(Bubble {
-                    author: "Me".into(),
-                    content: BubbleContent::Image(Self::image_bubble_data(bytes.clone())),
-                    mine: true,
-                    offline: false,
-                    timestamp_utc: Self::now_utc_hms(),
-                    msg_id: Some(msg_id),
-                    delivered: false,
-                    group_expected_acks: Vec::new(),
-                    group_received_acks: Vec::new(),
-                });
-
-                if let Some(tab) = state.active_tab_mut() {
-                    tab.outgoing_image_name = Some(filename);
-                    tab.outgoing_image_mime = Some(mime);
-                    tab.outgoing_image_total = bytes.len() as u64;
-                    tab.outgoing_image_sent = 0;
-                    tab.outgoing_image_msg_id = msg_id;
-                    tab.outgoing_image_bytes = bytes;
-                    tab.outgoing_image_phase = OutgoingImagePhase::Header;
-                    tab.outgoing_image_send_in_flight = false;
-                }
-
-                state.store_active_runtime();
-                return operation::snap_to_end(state.session.messages_scroll_id.clone());
+                };
             }
 
             Message::OutgoingFileHeaderSent(tab_id, result) => {
@@ -6856,11 +6943,51 @@ impl TermchatApp {
             |col, line| col.push(text(line).size(12).width(Length::Fill)),
         );
 
+        let copy_logs_button = button(
+            text("\u{e14d}")
+                .font(Font {
+                    family: font::Family::Name(APP_ICON_FONT_FAMILY),
+                    ..Font::default()
+                })
+                .size(12),
+        )
+        .width(24)
+        .height(20)
+        .padding(iced::Padding {
+            top: 1.0,
+            right: 4.0,
+            bottom: 3.0,
+            left: 6.0,
+        })
+        .style(copy_bubble_button_style);
+        let copy_logs_button = if state.session.log_lines.is_empty() {
+            copy_logs_button
+        } else {
+            copy_logs_button.on_press(Message::CopyLogsPressed)
+        };
+        let log_toolbar = row![
+            Space::new().width(Length::Fill),
+            tooltip(
+                copy_logs_button,
+                container(text("Copy logs").size(11))
+                    .padding([4, 6])
+                    .style(|_| log_panel_style()),
+                tooltip::Position::Top,
+            ),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
         let log_inner = container(
-            scrollable(log_lines)
-                .id(state.session.logs_scroll_id.clone())
-                .height(Length::Fill)
-                .width(Length::Fill),
+            column![
+                log_toolbar,
+                scrollable(log_lines)
+                    .id(state.session.logs_scroll_id.clone())
+                    .height(Length::Fill)
+                    .width(Length::Fill),
+            ]
+            .spacing(4)
+            .height(Length::Fill),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -7293,7 +7420,8 @@ impl TermchatApp {
             .height(Length::Fixed(82.0))
             .min_height(52.0)
             .max_height(140.0)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .key_binding(Self::message_editor_key_binding);
 
         let message_input = if message_input_enabled {
             message_input.on_action(Message::InputChanged)
@@ -7301,7 +7429,10 @@ impl TermchatApp {
             message_input
         };
 
-        let send_button_enabled = message_input_enabled && !state.session.input.trim().is_empty();
+        let pending_image_sendable =
+            state.session.pending_image.is_some() && state.can_send_live_image();
+        let send_button_enabled = (message_input_enabled && !state.session.input.trim().is_empty())
+            || pending_image_sendable;
         let send_button = button(text("Send").size(13))
             .padding([8, 14])
             .style(app_button_style);
@@ -7343,8 +7474,49 @@ impl TermchatApp {
             Space::new().height(0).into()
         };
 
+        let pending_image_preview: Element<'_, Message> =
+            if let Some(draft) = &state.session.pending_image {
+                let source_width = draft.image.width.max(1) as f32;
+                let source_height = draft.image.height.max(1) as f32;
+                let scale = (96.0 / source_width).min(64.0 / source_height).min(1.0);
+                let preview_width = (source_width * scale).max(1.0);
+                let preview_height = (source_height * scale).max(1.0);
+
+                container(
+                    row![
+                        image(draft.image.handle.clone())
+                            .width(preview_width)
+                            .height(preview_height)
+                            .content_fit(ContentFit::Contain),
+                        column![
+                            text("Pasted image")
+                                .size(12)
+                                .color(Color::from_rgb8(210, 210, 216)),
+                            text(format!("{} x {}", draft.image.width, draft.image.height))
+                                .size(11)
+                                .color(Color::from_rgb8(155, 155, 164)),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(text("x").size(11))
+                            .padding([2, 6])
+                            .style(copy_bubble_button_style)
+                            .on_press(Message::CancelPendingImagePressed),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([6, 8])
+                .style(|_| reply_preview_style())
+                .into()
+            } else {
+                Space::new().height(0).into()
+            };
+
         let message_input_panel = container(
             column![
+                pending_image_preview,
                 reply_preview,
                 row![container(message_input).width(Length::Fill), send_button,]
                     .spacing(8)
@@ -7519,17 +7691,7 @@ impl TermchatApp {
     }
 
     fn now_utc_hms() -> String {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let day = secs % 86_400;
-        let h = day / 3_600;
-        let m = (day % 3_600) / 60;
-        let s = day % 60;
-
-        format!("{:02}:{:02}:{:02} UTC", h, m, s)
+        current_utc_hms()
     }
 
     fn sam_lifecycle_log(line: impl AsRef<str>) {
@@ -9172,6 +9334,14 @@ impl TermchatApp {
 
         (self.session.live_ready && self.active_live_conn().is_some())
             || self.can_send_offline_now()
+    }
+
+    fn can_send_live_image(&self) -> bool {
+        if self.active_tab_is_group() {
+            return self.active_group_ready_count() > 0;
+        }
+
+        self.session.live_ready && self.active_live_conn().is_some()
     }
 
     fn tick_one_tab(&mut self, idx: usize) -> Vec<Task<Message>> {
@@ -11300,6 +11470,133 @@ impl TermchatApp {
         Self::clear_group_peer_incoming_image_state(peer);
     }
 
+    fn send_prepared_image(
+        &mut self,
+        filename: String,
+        mime: String,
+        bytes: Vec<u8>,
+    ) -> Result<Task<Message>, String> {
+        let Some(tab) = self.active_tab() else {
+            return Err("Open a chat tab before sending an image.".into());
+        };
+        if tab.outgoing_phase != OutgoingFilePhase::Idle
+            || tab.outgoing_image_phase != OutgoingImagePhase::Idle
+        {
+            return Err("Another transfer is already in progress.".into());
+        }
+        if tab.meta.kind != TabKind::Group && (tab.live_conn.is_none() || !tab.session.live_ready) {
+            return Err("Image send requires a live secure chat.".into());
+        }
+        if bytes.is_empty() {
+            return Err("Image preview is empty.".into());
+        }
+        if bytes.len() > MAX_FILE_SIZE {
+            return Err(format!("Image preview too large ({} bytes).", bytes.len()));
+        }
+
+        let msg_id = self.generate_msg_id();
+
+        if self.active_tab_is_group() {
+            if bytes.len() > GROUP_IMAGE_TRANSFER_MAX_BYTES {
+                return Err(format!(
+                    "Group image preview too large ({} bytes). Maximum is {} bytes.",
+                    bytes.len(),
+                    GROUP_IMAGE_TRANSFER_MAX_BYTES
+                ));
+            }
+
+            let tab_id = self
+                .active_tab()
+                .map(|tab| tab.id)
+                .ok_or_else(|| "Open a chat tab before sending an image.".to_string())?;
+            let mut tasks = Vec::new();
+            let mut expected_acks = Vec::new();
+
+            if let Some(tab) = self.active_tab_mut() {
+                let sam_runtime = tab.sam_runtime.clone();
+                let Some(group) = tab.group.as_mut() else {
+                    return Err("Group runtime is not available.".into());
+                };
+
+                for peer in &group.peers {
+                    if !peer.ready || !peer.authorized {
+                        continue;
+                    }
+
+                    let Some(conn) = peer.conn.clone() else {
+                        continue;
+                    };
+
+                    expected_acks.push(peer.member.b32.to_ascii_lowercase());
+                    let e2e = peer.e2e.clone();
+                    let filename = filename.clone();
+                    let mime = mime.clone();
+                    let bytes = bytes.clone();
+                    let task = Task::perform(
+                        async move {
+                            Self::send_group_image_sequence(
+                                conn, e2e, filename, mime, bytes, msg_id,
+                            )
+                            .await
+                        },
+                        move |result| Message::SendFinished(tab_id, result),
+                    );
+                    tasks.push(sam_runtime.track_send_task(task));
+                }
+            }
+
+            if expected_acks.is_empty() {
+                return Err("No ready group members.".into());
+            }
+
+            self.session.bubbles.push(Bubble {
+                author: "Me".into(),
+                content: BubbleContent::Image(Self::image_bubble_data(bytes)),
+                mine: true,
+                offline: false,
+                timestamp_utc: Self::now_utc_hms(),
+                msg_id: Some(msg_id),
+                delivered: false,
+                group_expected_acks: expected_acks,
+                group_received_acks: Vec::new(),
+            });
+
+            self.store_active_runtime();
+            tasks.push(operation::snap_to_end(
+                self.session.messages_scroll_id.clone(),
+            ));
+            return Ok(Task::batch(tasks));
+        }
+
+        self.session.bubbles.push(Bubble {
+            author: "Me".into(),
+            content: BubbleContent::Image(Self::image_bubble_data(bytes.clone())),
+            mine: true,
+            offline: false,
+            timestamp_utc: Self::now_utc_hms(),
+            msg_id: Some(msg_id),
+            delivered: false,
+            group_expected_acks: Vec::new(),
+            group_received_acks: Vec::new(),
+        });
+
+        if let Some(tab) = self.active_tab_mut() {
+            tab.outgoing_image_name = Some(filename);
+            tab.outgoing_image_mime = Some(mime);
+            tab.outgoing_image_total = bytes.len() as u64;
+            tab.outgoing_image_sent = 0;
+            tab.outgoing_image_msg_id = msg_id;
+            tab.outgoing_image_bytes = bytes;
+            tab.outgoing_image_phase = OutgoingImagePhase::Header;
+            tab.outgoing_image_send_in_flight = false;
+        }
+
+        self.store_active_runtime();
+        Ok(operation::snap_to_end(
+            self.session.messages_scroll_id.clone(),
+        ))
+    }
+
     async fn send_group_image_sequence(
         conn: LiveConnection,
         e2e: E2E,
@@ -11375,6 +11672,54 @@ impl TermchatApp {
         let decoded =
             ::image::load_from_memory(&source).map_err(|e| format!("Image decode failed: {e}"))?;
         let keep_alpha = decoded.has_alpha();
+        Self::encode_image_preview(decoded, keep_alpha)
+    }
+
+    fn prepare_clipboard_image_draft(
+        image: arboard::ImageData<'static>,
+    ) -> Result<PendingImageDraft, String> {
+        if image.width == 0 || image.height == 0 {
+            return Err("Clipboard image has invalid dimensions.".into());
+        }
+
+        let expected_bytes = image
+            .width
+            .checked_mul(image.height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "Clipboard image dimensions are too large.".to_string())?;
+        if expected_bytes != image.bytes.len() {
+            return Err("Clipboard image pixel data is invalid.".into());
+        }
+        if expected_bytes > MAX_FILE_SIZE {
+            return Err(format!(
+                "Clipboard image is too large ({expected_bytes} decoded bytes)."
+            ));
+        }
+
+        let width = u32::try_from(image.width)
+            .map_err(|_| "Clipboard image width is too large.".to_string())?;
+        let height = u32::try_from(image.height)
+            .map_err(|_| "Clipboard image height is too large.".to_string())?;
+        let raw = image.bytes.into_owned();
+        let keep_alpha = raw.chunks_exact(4).any(|pixel| pixel[3] != 255);
+        let rgba = ::image::RgbaImage::from_raw(width, height, raw)
+            .ok_or_else(|| "Clipboard image pixel data is invalid.".to_string())?;
+        let decoded = ::image::DynamicImage::ImageRgba8(rgba);
+        let (bytes, mime) = Self::encode_image_preview(decoded, keep_alpha)?;
+        let extension = if mime == "image/png" { "png" } else { "jpg" };
+        let filename = format!("pasted-image-{}.{}", Self::now_epoch_millis(), extension);
+
+        Ok(PendingImageDraft {
+            filename,
+            mime,
+            image: Self::image_bubble_data(bytes),
+        })
+    }
+
+    fn encode_image_preview(
+        decoded: ::image::DynamicImage,
+        keep_alpha: bool,
+    ) -> Result<(Vec<u8>, String), String> {
         let preview = if decoded.width() > IMAGE_TRANSFER_MAX_DIMENSION
             || decoded.height() > IMAGE_TRANSFER_MAX_DIMENSION
         {
