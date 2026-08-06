@@ -134,13 +134,13 @@ const FILE_BUBBLE_WIDTH: f32 = 340.0;
 const IMAGE_BUBBLE_MAX_WIDTH: f32 = 420.0;
 const IMAGE_BUBBLE_MAX_HEIGHT: f32 = 360.0;
 const SYSTEM_BUBBLE_MAX_WIDTH: f32 = 700.0;
-const REPLY_BEGIN_MARKER: &str = "[ICEDCOMM-REPLY-v1]";
-const REPLY_QUOTE_MARKER: &str = "[ICEDCOMM-QUOTE]";
-const REPLY_END_MARKER: &str = "[/ICEDCOMM-REPLY]";
+const REPLY_BEGIN_MARKER: &str = "[COMMTOOLS-I2P-REPLY-v1]";
+const REPLY_QUOTE_MARKER: &str = "[COMMTOOLS-I2P-QUOTE]";
+const REPLY_END_MARKER: &str = "[/COMMTOOLS-I2P-REPLY]";
 const IMAGE_TRANSFER_MAX_DIMENSION: u32 = 1280;
 const IMAGE_TRANSFER_JPEG_QUALITY: u8 = 82;
 const GROUP_IMAGE_TRANSFER_MAX_BYTES: usize = 2 * 1024 * 1024;
-const GROUP_INVITE_STRING_PREFIX: &str = "ICEDCOMM-GROUP-INVITE-v1:";
+const GROUP_INVITE_STRING_PREFIX: &str = "COMMTOOLS-I2P-GROUP-INVITE-v1:";
 const GROUP_CONTROL_JOIN_PROOF: &str = "join_proof";
 const GROUP_CONTROL_RENAME_REQUEST: &str = "rename_request";
 const SHUTDOWN_NOTIFY_GRACE_MS: u64 = 1_200;
@@ -411,7 +411,7 @@ impl Bubble {
             content: BubbleContent::Text(text.into()),
             mine: true,
             offline: false,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
             group_expected_acks: Vec::new(),
@@ -425,7 +425,7 @@ impl Bubble {
             content: BubbleContent::Text(text.into()),
             mine: true,
             offline: false,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: Some(msg_id),
             delivered: false,
             group_expected_acks: Vec::new(),
@@ -439,7 +439,7 @@ impl Bubble {
             content: BubbleContent::Text(text.into()),
             mine: true,
             offline: false,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: Some(msg_id),
             delivered: expected_acks.is_empty(),
             group_expected_acks: expected_acks,
@@ -453,7 +453,7 @@ impl Bubble {
             content: BubbleContent::Text(text.into()),
             mine: false,
             offline: false,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
             group_expected_acks: Vec::new(),
@@ -471,7 +471,7 @@ impl Bubble {
             content: BubbleContent::Text(text.into()),
             mine: true,
             offline: true,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: if msg_id == 0 { None } else { Some(msg_id) },
             delivered: false,
             group_expected_acks: Vec::new(),
@@ -485,7 +485,7 @@ impl Bubble {
             content: BubbleContent::Text(text.into()),
             mine: false,
             offline: true,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
             group_expected_acks: Vec::new(),
@@ -499,7 +499,7 @@ impl Bubble {
             content: BubbleContent::System(text.into()),
             mine: false,
             offline: false,
-            timestamp_utc: TermchatApp::now_utc_hms(),
+            timestamp_utc: IcedCommApp::now_utc_hms(),
             msg_id: None,
             delivered: false,
             group_expected_acks: Vec::new(),
@@ -745,7 +745,7 @@ impl Default for SessionState {
     }
 }
 
-pub struct TermchatApp {
+pub struct IcedCommApp {
     pub session: SessionState,
     pub opened_tabs: Vec<OpenedTab>,
     pub app_lock: Option<AppLock>,
@@ -937,7 +937,7 @@ pub enum ShutdownTarget {
     Runtime,
 }
 
-impl Default for TermchatApp {
+impl Default for IcedCommApp {
     fn default() -> Self {
         Self {
             session: SessionState::default(),
@@ -975,7 +975,7 @@ impl Default for TermchatApp {
     }
 }
 
-impl Drop for TermchatApp {
+impl Drop for IcedCommApp {
     fn drop(&mut self) {
         if let Err(err) = self.encrypt_for_shutdown() {
             eprintln!("Vault encryption failed during app drop: {err}");
@@ -983,7 +983,7 @@ impl Drop for TermchatApp {
     }
 }
 
-impl TermchatApp {
+impl IcedCommApp {
     pub fn boot() -> (Self, Task<Message>) {
         let mut app = Self::default();
 
@@ -7535,7 +7535,7 @@ impl TermchatApp {
                 row!().spacing(8).align_y(Alignment::Center),
                 |row_acc, action| {
                     let btn = button(
-                        text(TermchatApp::action_label_for_session(
+                        text(IcedCommApp::action_label_for_session(
                             &state.session,
                             action,
                         ))
@@ -7544,7 +7544,7 @@ impl TermchatApp {
                     .padding([6, 10])
                     .style(app_button_style);
 
-                    if TermchatApp::action_enabled(action) {
+                    if IcedCommApp::action_enabled(action) {
                         row_acc.push(btn.on_press(Message::ActionPressed(action)))
                     } else {
                         row_acc.push(btn)
@@ -7584,18 +7584,18 @@ impl TermchatApp {
         };
 
         let actions_row = actions_row.push(
-            button(text(TermchatApp::action_label(GuiAction::Help)).size(13))
+            button(text(IcedCommApp::action_label(GuiAction::Help)).size(13))
                 .padding([6, 10])
                 .style(app_button_style),
         );
 
         let command_panel_content = if let Some(action) = state.session.pending_action {
-            if TermchatApp::action_needs_param(action) {
+            if IcedCommApp::action_needs_param(action) {
                 column![
                     actions_row,
                     row![
                         text_input(
-                            TermchatApp::action_placeholder(action),
+                            IcedCommApp::action_placeholder(action),
                             &state.session.action_param
                         )
                         .on_input(Message::ActionParamChanged)
@@ -7616,11 +7616,11 @@ impl TermchatApp {
                     .align_y(Alignment::Center)
                 ]
                 .spacing(8)
-            } else if TermchatApp::action_needs_confirm(action) {
+            } else if IcedCommApp::action_needs_confirm(action) {
                 column![
                     actions_row,
                     row![
-                        text(TermchatApp::action_confirm_prompt(action))
+                        text(IcedCommApp::action_confirm_prompt(action))
                             .size(13)
                             .width(Length::Fill),
                         button(text("OK").size(12))
@@ -7951,7 +7951,7 @@ impl TermchatApp {
         };
 
         Ok(GroupInvite {
-            format: "icedcomm-i2p-group-invite".into(),
+            format: "commtools-i2p-group-invite".into(),
             version: 1,
             group_name: group.name.clone(),
             inviter_name: Self::group_self_display_name(group),
@@ -8055,7 +8055,7 @@ impl TermchatApp {
         };
 
         let payload = GroupRosterSignaturePayload {
-            format: "icedcomm-i2p-group-roster-signature".into(),
+            format: "commtools-i2p-group-roster-signature".into(),
             version: 1,
             group_name: group.name.clone(),
             owner_b32,
@@ -8138,7 +8138,7 @@ impl TermchatApp {
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         let payload = GroupRosterSignaturePayload {
-            format: "icedcomm-i2p-group-roster-signature".into(),
+            format: "commtools-i2p-group-roster-signature".into(),
             version: 1,
             group_name: group_name.to_string(),
             owner_b32: owner_b32.to_string(),
@@ -8164,7 +8164,7 @@ impl TermchatApp {
         };
 
         Ok(GroupRosterSync {
-            format: "icedcomm-i2p-group-roster".into(),
+            format: "commtools-i2p-group-roster".into(),
             version: 1,
             group_name: group.name.clone(),
             owner_b32,
@@ -8182,7 +8182,7 @@ impl TermchatApp {
     }
 
     fn merge_group_invite(invite: GroupInvite) -> Result<String, String> {
-        if invite.format != "icedcomm-i2p-group-invite" || invite.version != 1 {
+        if invite.format != "commtools-i2p-group-invite" || invite.version != 1 {
             return Err("unsupported group invite".into());
         }
 
@@ -8306,7 +8306,7 @@ impl TermchatApp {
     }
 
     fn merge_group_roster_sync(roster: GroupRosterSync) -> Result<String, String> {
-        if roster.format != "icedcomm-i2p-group-roster" || roster.version != 1 {
+        if roster.format != "commtools-i2p-group-roster" || roster.version != 1 {
             return Err("unsupported group roster sync".into());
         }
 
@@ -9952,7 +9952,27 @@ impl TermchatApp {
                                 continue;
                             }
 
-                            if frame.payload.len() != 32 {
+                            if !tab.session.live_ready || !tab.e2e.ready() {
+                                push_log(
+                                    tab,
+                                    "Received offline secret before secure session was ready."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+
+                            let payload = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("Offline secret authentication failed: {err}"),
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            if payload.len() != 32 {
                                 push_log(tab, "Invalid offline secret length.".to_string());
                                 continue;
                             }
@@ -9973,7 +9993,7 @@ impl TermchatApp {
                             }
 
                             let mut secret = [0u8; 32];
-                            secret.copy_from_slice(&frame.payload);
+                            secret.copy_from_slice(&payload);
                             tab.session.offline_shared_secret = Some(secret);
 
                             if let Some(peer_b32) = tab.session.stored_peer.clone() {
@@ -10009,74 +10029,110 @@ impl TermchatApp {
                             }
                         }
 
-                        MsgType::L => match String::from_utf8(frame.payload) {
-                            Ok(body) => {
-                                let servers: Vec<String> = body
-                                    .lines()
-                                    .map(|line| line.trim().to_string())
-                                    .filter(|line| !line.is_empty())
-                                    .collect();
-
-                                if servers.is_empty() {
-                                    continue;
-                                }
-
-                                let changed = Self::merge_deaddrop_servers_into_session(
-                                    &mut tab.session,
-                                    &servers,
+                        MsgType::L => {
+                            if !(tab.session.profile != "default"
+                                && tab.session.stored_peer.is_some()
+                                && tab.session.stored_peer_dest_b64.is_some())
+                            {
+                                push_log(
+                                    tab,
+                                    "Received deaddrop server list outside persistent locked-peer mode."
+                                        .to_string(),
                                 );
-                                Self::sync_tab_deaddrop_servers(tab);
+                                continue;
+                            }
 
-                                if changed {
-                                    match storage::load_contact_meta(&tab.session.profile) {
-                                        Ok(mut meta) => {
-                                            meta.deaddrop_servers =
-                                                tab.session.deaddrop_servers.clone();
+                            if !tab.session.live_ready || !tab.e2e.ready() {
+                                push_log(
+                                    tab,
+                                    "Received deaddrop server list before secure session was ready."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
 
-                                            match storage::save_contact_meta(&meta) {
-                                                Ok(()) => {
-                                                    push_log(
-                                                        tab,
-                                                        format!(
-                                                            "Merged deaddrop server list from peer. Total: {}",
-                                                            tab.session.deaddrop_servers.len()
-                                                        ),
-                                                    );
-                                                }
-                                                Err(err) => {
-                                                    push_log(
-                                                        tab,
-                                                        format!(
-                                                            "Failed to save merged deaddrop servers: {err}"
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(err) => {
-                                            push_log(
-                                                tab,
-                                                format!(
-                                                    "Failed to load contact metadata for deaddrop merge: {err}"
-                                                ),
-                                            );
-                                        }
-                                    }
-                                } else {
+                            let payload = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(payload) => payload,
+                                Err(err) => {
                                     push_log(
                                         tab,
-                                        "Received deaddrop server list from peer (no new entries)."
-                                            .to_string(),
+                                        format!(
+                                            "Deaddrop server list authentication failed: {err}"
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            match String::from_utf8(payload) {
+                                Ok(body) => {
+                                    let servers: Vec<String> = body
+                                        .lines()
+                                        .map(|line| line.trim().to_string())
+                                        .filter(|line| !line.is_empty())
+                                        .collect();
+
+                                    if servers.is_empty() {
+                                        continue;
+                                    }
+
+                                    let changed = Self::merge_deaddrop_servers_into_session(
+                                        &mut tab.session,
+                                        &servers,
+                                    );
+                                    Self::sync_tab_deaddrop_servers(tab);
+
+                                    if changed {
+                                        match storage::load_contact_meta(&tab.session.profile) {
+                                            Ok(mut meta) => {
+                                                meta.deaddrop_servers =
+                                                    tab.session.deaddrop_servers.clone();
+
+                                                match storage::save_contact_meta(&meta) {
+                                                    Ok(()) => {
+                                                        push_log(
+                                                            tab,
+                                                            format!(
+                                                                "Merged deaddrop server list from peer. Total: {}",
+                                                                tab.session.deaddrop_servers.len()
+                                                            ),
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        push_log(
+                                                            tab,
+                                                            format!(
+                                                                "Failed to save merged deaddrop servers: {err}"
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                push_log(
+                                                    tab,
+                                                    format!(
+                                                        "Failed to load contact metadata for deaddrop merge: {err}"
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        push_log(
+                                            tab,
+                                            "Received deaddrop server list from peer (no new entries)."
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                                Err(_) => {
+                                    push_log(
+                                        tab,
+                                        "Received invalid UTF-8 deaddrop server list.".to_string(),
                                     );
                                 }
                             }
-                            Err(_) => {
-                                push_log(
-                                    tab,
-                                    "Received invalid UTF-8 deaddrop server list.".to_string(),
-                                );
-                            }
-                        },
+                        }
 
                         other => {
                             push_log(tab, format!("Received unsupported frame type: {:?}", other));
@@ -12177,7 +12233,7 @@ impl TermchatApp {
             return Task::none();
         };
 
-        if !self.opened_tabs[idx].session.live_ready {
+        if !self.opened_tabs[idx].session.live_ready || !self.opened_tabs[idx].e2e.ready() {
             return Task::none();
         }
 
@@ -12197,10 +12253,6 @@ impl TermchatApp {
             let Some(secret) = self.opened_tabs[idx].session.offline_shared_secret else {
                 return Task::none();
             };
-            self.opened_tabs[idx]
-                .session
-                .log_lines
-                .push("Offline secret sync sent.".into());
             secret
         } else {
             let secret: [u8; 32] = random();
@@ -12238,10 +12290,26 @@ impl TermchatApp {
             secret
         };
 
+        let payload = match self.opened_tabs[idx].e2e.encrypt_strict(&secret) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.opened_tabs[idx]
+                    .session
+                    .log_lines
+                    .push(format!("Offline secret encryption failed: {err}"));
+                return Task::none();
+            }
+        };
+
+        self.opened_tabs[idx]
+            .session
+            .log_lines
+            .push("Offline secret sync sent.".into());
+
         let frame = Frame {
             msg_type: MsgType::X,
             msg_id: self.generate_msg_id(),
-            payload: secret.to_vec(),
+            payload,
         };
 
         Task::perform(
@@ -12540,11 +12608,24 @@ impl TermchatApp {
             return Task::none();
         };
 
+        if !tab.session.live_ready
+            || !tab.e2e.ready()
+            || tab.session.profile == "default"
+            || tab.session.stored_peer.is_none()
+            || tab.session.stored_peer_dest_b64.is_none()
+            || tab.session.deaddrop_servers.is_empty()
+        {
+            return Task::none();
+        }
+
         let Some(conn) = tab.live_conn.clone() else {
             return Task::none();
         };
 
-        let payload = tab.session.deaddrop_servers.join("\n").into_bytes();
+        let plaintext = tab.session.deaddrop_servers.join("\n").into_bytes();
+        let Ok(payload) = tab.e2e.encrypt_strict(&plaintext) else {
+            return Task::none();
+        };
 
         let frame = Frame {
             msg_type: MsgType::L,
@@ -13372,7 +13453,7 @@ fn visible_dd_status(session: &SessionState) -> &str {
         return "idle";
     }
 
-    let age_ms = TermchatApp::now_epoch_millis().saturating_sub(session.dd_status_at_ms);
+    let age_ms = IcedCommApp::now_epoch_millis().saturating_sub(session.dd_status_at_ms);
 
     if age_ms > 8_000 {
         "idle"
@@ -13653,7 +13734,7 @@ fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool, closing: bool) -> Ele
             .into()
     } else if tab.initializing {
         let frame = APP_TAB_SPINNER_FRAMES
-            [((TermchatApp::now_epoch_millis() / 120) as usize) % APP_TAB_SPINNER_FRAMES.len()];
+            [((IcedCommApp::now_epoch_millis() / 120) as usize) % APP_TAB_SPINNER_FRAMES.len()];
 
         text(frame)
             .size(13)

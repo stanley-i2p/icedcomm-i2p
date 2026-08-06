@@ -6,7 +6,7 @@ Current version: **1.0.0-beta.2**
 
 
 ### GUI Implementation Notice
-This project is a graphical user interface (GUI) implementation built entirely on top of the original protocol, architecture, and core security features of [termchat-i2p](https://github.com/stanley-i2p/termchat-i2p). While the interface has been modernized using the Rust-based Iced framework, the underlying application logic strictly honors the native end-to-end encryption, compartmentalized per-profile model, TOFU peer pinning, and metadata-poor offline deaddrop system engineered by the original author.
+This project is the Rust/Iced desktop implementation of the CommTools-I2P protocol and architecture, originally implemented by [termchat-i2p](https://github.com/stanley-i2p/termchat-i2p). While the interface has been modernized using the Rust-based Iced framework, the underlying application logic strictly honors the native end-to-end encryption, compartmentalized per-profile model, TOFU peer pinning, and metadata-poor offline deaddrop system engineered by the original author.
 
 ![IcedComm-I2P](Screenshot_1.png)
 ![IcedComm-I2P](Screenshot_2.png)
@@ -175,7 +175,7 @@ cargo check
 
 ## Compatibility
 
-The Rust GUI follows the Termchat-I2P protocol family. Some newer Rust features, such as binary image preview transfer, may need corresponding implementation in the Python reference before full Rust/Python feature parity is available.
+The Rust GUI implements the CommTools-I2P protocol family shared with Termchat-I2P. Some newer Rust features, such as binary image preview transfer, may need corresponding implementation in the Python reference before full Rust/Python feature parity is available.
 
 Backup format naming intentionally keeps Termchat-I2P compatibility identifiers where needed.
 

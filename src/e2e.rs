@@ -57,7 +57,7 @@ impl E2E {
             };
 
             let mut material = Vec::new();
-            material.extend_from_slice(b"TERMCHAT_HYBRID_V1");
+            material.extend_from_slice(b"COMMTOOLS-I2P-HYBRID-V1");
             material.push(b'|');
             material.extend_from_slice(&classical_shared);
             material.push(b'|');
@@ -69,7 +69,7 @@ impl E2E {
             self.session_key = Some(key);
         } else {
             let mut material = Vec::new();
-            material.extend_from_slice(b"TERMCHAT_CLASSICAL_V1");
+            material.extend_from_slice(b"COMMTOOLS-I2P-CLASSICAL-V1");
             material.push(b'|');
             material.extend_from_slice(&classical_shared);
 
@@ -108,6 +108,47 @@ impl E2E {
 
     pub fn ready(&self) -> bool {
         self.session_key.is_some()
+    }
+
+    pub fn encrypt_strict(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let session_key = self
+            .session_key
+            .ok_or_else(|| "secure session key is not ready".to_string())?;
+
+        let cipher = XSalsa20Poly1305::new(Key::from_slice(&session_key));
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, payload)
+            .map_err(|_| "payload encryption failed".to_string())?;
+
+        let mut out = Vec::with_capacity(24 + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    // Later on, during future cleanup stage, encrypt/decrypt_strict are to be merged into encrypt/decrypt.
+    // Currently this is an update for X and L frames mostly. Still, old encrypt/decrypt does not compromise practical security model at all:)
+    
+    pub fn decrypt_strict(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let session_key = self
+            .session_key
+            .ok_or_else(|| "secure session key is not ready".to_string())?;
+
+        // XSalsa20-Poly1305 carries a 24-byte nonce and a 16-byte authenticator.!!!
+        if payload.len() < 40 {
+            return Err("encrypted payload is too short".to_string());
+        }
+
+        let cipher = XSalsa20Poly1305::new(Key::from_slice(&session_key));
+        let (nonce_bytes, ciphertext) = payload.split_at(24);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| "payload authentication failed".to_string())
     }
 
     pub fn encrypt(&self, payload: &[u8]) -> Vec<u8> {

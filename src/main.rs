@@ -11,7 +11,7 @@ mod vault;
 
 mod app_home;
 
-use app::TermchatApp;
+use app::IcedCommApp;
 use constants::APP_FONT_FAMILY;
 use iced::{Font, Theme, application, window};
 
@@ -19,19 +19,19 @@ const INTER_FONT_BYTES: &[u8] = include_bytes!("../fonts/Inter-VariableFont_opsz
 const MATERIAL_SYMBOLS_ROUNDED_BYTES: &[u8] =
     include_bytes!("../fonts/MaterialSymbolsRounded[FILL,GRAD,opsz,wght].ttf");
 
-fn app_title(_: &TermchatApp) -> String {
+fn app_title(_: &IcedCommApp) -> String {
     String::from("IcedComm-I2P")
 }
 
-fn app_theme(_: &TermchatApp) -> Theme {
+fn app_theme(_: &IcedCommApp) -> Theme {
     Theme::Dark
 }
 
 fn main() -> iced::Result {
-    application(TermchatApp::boot, TermchatApp::update, TermchatApp::view)
+    application(IcedCommApp::boot, IcedCommApp::update, IcedCommApp::view)
         .title(app_title)
         .theme(app_theme)
-        .subscription(TermchatApp::subscription)
+        .subscription(IcedCommApp::subscription)
         .exit_on_close_request(false)
         .window(window::Settings {
             min_size: Some(iced::Size::new(1280.0, 700.0)),
