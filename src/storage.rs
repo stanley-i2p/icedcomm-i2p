@@ -165,12 +165,32 @@ fn default_sam_port() -> u16 {
 }
 
 #[derive(Debug, Clone)]
+pub struct OfflineMissingIndexState {
+    pub index: u64,
+    pub confirmed_miss_rounds: u32,
+    pub first_miss_ms: u64,
+    pub last_miss_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfflineSkippedIndexState {
+    pub index: u64,
+    pub skipped_at_ms: u64,
+    pub last_recovery_probe_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct OfflineState {
     pub offline_shared_secret: [u8; 32],
     pub drop_send_index: u64,
     pub drop_recv_base: u64,
     pub drop_window: u32,
     pub consumed_drop_recv: Vec<u64>,
+    pub known_remote_next_send: u64,
+    pub highest_authenticated_recv_index: Option<u64>,
+    pub missing_drop_recv: Vec<OfflineMissingIndexState>,
+    pub skipped_drop_recv: Vec<OfflineSkippedIndexState>,
+    pub forward_probe_index: u64,
 }
 
 pub fn default_offline_state() -> OfflineState {
@@ -180,6 +200,11 @@ pub fn default_offline_state() -> OfflineState {
         drop_recv_base: 0,
         drop_window: 8,
         consumed_drop_recv: vec![],
+        known_remote_next_send: 0,
+        highest_authenticated_recv_index: None,
+        missing_drop_recv: vec![],
+        skipped_drop_recv: vec![],
+        forward_probe_index: 0,
     }
 }
 
@@ -823,6 +848,46 @@ pub fn load_offline_state(name: &str, peer_b32: &str) -> Result<OfflineState, St
                         .collect();
                 }
             }
+            "known_remote_next_send" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    state.known_remote_next_send = n;
+                }
+            }
+            "highest_authenticated_recv_index" => {
+                state.highest_authenticated_recv_index = val.parse::<u64>().ok();
+            }
+            "missing_drop_recv" => {
+                state.missing_drop_recv = val
+                    .split(',')
+                    .filter_map(|entry| {
+                        let mut parts = entry.split(':');
+                        Some(OfflineMissingIndexState {
+                            index: parts.next()?.parse().ok()?,
+                            confirmed_miss_rounds: parts.next()?.parse().ok()?,
+                            first_miss_ms: parts.next()?.parse().ok()?,
+                            last_miss_ms: parts.next()?.parse().ok()?,
+                        })
+                    })
+                    .collect();
+            }
+            "skipped_drop_recv" => {
+                state.skipped_drop_recv = val
+                    .split(',')
+                    .filter_map(|entry| {
+                        let mut parts = entry.split(':');
+                        Some(OfflineSkippedIndexState {
+                            index: parts.next()?.parse().ok()?,
+                            skipped_at_ms: parts.next()?.parse().ok()?,
+                            last_recovery_probe_ms: parts.next()?.parse().ok()?,
+                        })
+                    })
+                    .collect();
+            }
+            "forward_probe_index" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    state.forward_probe_index = n;
+                }
+            }
             _ => {}
         }
     }
@@ -860,6 +925,49 @@ pub fn save_offline_state(
             .join(","),
     );
     text.push('\n');
+    text.push_str(&format!(
+        "known_remote_next_send={}\n",
+        state.known_remote_next_send
+    ));
+    text.push_str("highest_authenticated_recv_index=");
+    if let Some(index) = state.highest_authenticated_recv_index {
+        text.push_str(&index.to_string());
+    }
+    text.push('\n');
+    text.push_str("missing_drop_recv=");
+    text.push_str(
+        &state
+            .missing_drop_recv
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}:{}:{}:{}",
+                    entry.index,
+                    entry.confirmed_miss_rounds,
+                    entry.first_miss_ms,
+                    entry.last_miss_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    text.push('\n');
+    text.push_str("skipped_drop_recv=");
+    text.push_str(
+        &state
+            .skipped_drop_recv
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}:{}:{}",
+                    entry.index, entry.skipped_at_ms, entry.last_recovery_probe_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    text.push('\n');
+    text.push_str(&format!("forward_probe_index={}\n", state.forward_probe_index));
 
     atomic_write_text(&path, &text)
 }

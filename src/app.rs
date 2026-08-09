@@ -29,7 +29,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::storage::{
     self, AppLock, ContactMeta, GroupInvite, GroupIssuedInvite, GroupMember, GroupMeta,
-    OfflineState,
+    OfflineMissingIndexState, OfflineSkippedIndexState, OfflineState,
 };
 
 use base64::{Engine as _, engine::general_purpose};
@@ -45,6 +45,13 @@ use rand::random;
 use sha2::Digest;
 use tokio::sync::Mutex as TokioMutex;
 const DEADDROP_POLL_INTERVAL_MS: u64 = 5_000;
+const OFFLINE_INDEX_SYNC_VERSION: u8 = 1;
+const OFFLINE_INDEX_SYNC_PAYLOAD_LEN: usize = 17;
+const OFFLINE_GAP_MISS_ROUNDS: u32 = 3;
+const OFFLINE_FORWARD_PROBE_STALL_ROUNDS: u32 = 3;
+const OFFLINE_RECOVERY_STATE_LIMIT: usize = 512;
+const OFFLINE_SKIPPED_RETENTION_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
+const OFFLINE_RECOVERY_PROBE_INTERVAL_MS: u64 = 60_000;
 
 const PY_GREEN: Color = Color::from_rgb8(105, 200, 0); // Vibrant Lime
 const PY_GREEN50: Color = Color::from_rgb8(52, 100, 0);
@@ -207,11 +214,16 @@ pub struct OpenedTab {
     pub deaddrop_started: bool,
     pub deaddrop_poller_started: bool,
     pub deaddrop_poll_in_flight: bool,
-    pub deaddrop_poll_queue: Vec<(u64, String)>,
+    pub deaddrop_poll_queue: Vec<OfflinePollTarget>,
+    pub deaddrop_poll_round_misses: Vec<u64>,
+    pub deaddrop_poll_round_authenticated: Vec<u64>,
+    pub deaddrop_stalled_sweeps: u32,
+    pub deaddrop_last_recovery_probe_ms: u64,
     pub deaddrop_put_in_flight: bool,
     pub deaddrop_last_poll_ms: u64,
     pub live_conn: Option<LiveConnection>,
     pub pending_conn: Option<LiveConnection>,
+    pub offline_index_sync_sent: bool,
 
     pub incoming_file: Option<StdFile>,
     pub incoming_filename: Option<String>,
@@ -242,6 +254,20 @@ pub struct OpenedTab {
     pub outgoing_image_phase: OutgoingImagePhase,
     pub outgoing_image_send_in_flight: bool,
     pub group: Option<GroupRuntime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflinePollKind {
+    Window,
+    ForwardProbe,
+    RecoveryProbe,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfflinePollTarget {
+    pub index: u64,
+    pub key: String,
+    pub kind: OfflinePollKind,
 }
 
 pub struct GroupPeerRuntime {
@@ -648,6 +674,11 @@ pub struct SessionState {
     pub drop_recv_base: u64,
     pub drop_window: u32,
     pub consumed_drop_recv: Vec<u64>,
+    pub known_remote_next_send: u64,
+    pub highest_authenticated_recv_index: Option<u64>,
+    pub missing_drop_recv: Vec<OfflineMissingIndexState>,
+    pub skipped_drop_recv: Vec<OfflineSkippedIndexState>,
+    pub forward_probe_index: u64,
     pub seen_drop_msgs: Vec<String>,
 }
 
@@ -740,6 +771,11 @@ impl Default for SessionState {
             drop_recv_base: 0,
             drop_window: 8,
             consumed_drop_recv: vec![],
+            known_remote_next_send: 0,
+            highest_authenticated_recv_index: None,
+            missing_drop_recv: vec![],
+            skipped_drop_recv: vec![],
+            forward_probe_index: 0,
             seen_drop_msgs: vec![],
         }
     }
@@ -911,6 +947,7 @@ pub enum Message {
     OfflinePollKeyFinished(
         u64,
         u64,
+        OfflinePollKind,
         String,
         Vec<(String, Vec<u8>)>,
         Vec<DeaddropOpStat>,
@@ -1092,12 +1129,17 @@ impl IcedCommApp {
             deaddrop_poller_started: false,
             deaddrop_poll_in_flight: false,
             deaddrop_poll_queue: vec![],
+            deaddrop_poll_round_misses: vec![],
+            deaddrop_poll_round_authenticated: vec![],
+            deaddrop_stalled_sweeps: 0,
+            deaddrop_last_recovery_probe_ms: 0,
             deaddrop_put_in_flight: false,
             deaddrop_last_poll_ms: 0,
             sam_runtime: SamRuntime::new(sam_host.clone(), sam_port),
             e2e: E2E::new(false),
             live_conn: None,
             pending_conn: None,
+            offline_index_sync_sent: false,
 
             incoming_file: None,
             incoming_filename: None,
@@ -3850,6 +3892,11 @@ impl IcedCommApp {
                             state.session.drop_recv_base = 0;
                             state.session.drop_window = 8;
                             state.session.consumed_drop_recv.clear();
+                            state.session.known_remote_next_send = 0;
+                            state.session.highest_authenticated_recv_index = None;
+                            state.session.missing_drop_recv.clear();
+                            state.session.skipped_drop_recv.clear();
+                            state.session.forward_probe_index = 0;
                             state.session.tofu_verified = true;
                             state.session.tofu_mismatch = false;
 
@@ -4928,8 +4975,61 @@ impl IcedCommApp {
                     let my_b32 = tab.session.my_b32.clone().unwrap();
                     let peer_b32 = tab.session.stored_peer.clone().unwrap();
 
-                    let recv_window =
+                    let mut recv_window =
                         Self::get_deaddrop_recv_window(&tab.session, &my_b32, &peer_b32);
+
+                    if tab.deaddrop_stalled_sweeps >= OFFLINE_FORWARD_PROBE_STALL_ROUNDS {
+                        let window_end = tab
+                            .session
+                            .drop_recv_base
+                            .saturating_add(tab.session.drop_window as u64);
+                        let probe_index = tab.session.forward_probe_index.max(window_end);
+                        let probe_key = Self::offline_directional_key(
+                            &tab.session.offline_shared_secret.unwrap_or([0u8; 32]),
+                            &my_b32,
+                            &peer_b32,
+                            "recv",
+                            probe_index,
+                        );
+                        recv_window.push(OfflinePollTarget {
+                            index: probe_index,
+                            key: probe_key,
+                            kind: OfflinePollKind::ForwardProbe,
+                        });
+                        tab.session.forward_probe_index = probe_index.saturating_add(1);
+                    }
+
+                    if now_ms.saturating_sub(tab.deaddrop_last_recovery_probe_ms)
+                        >= OFFLINE_RECOVERY_PROBE_INTERVAL_MS
+                    {
+                        let recovery_index = tab
+                            .session
+                            .skipped_drop_recv
+                            .iter_mut()
+                            .find(|entry| {
+                                now_ms.saturating_sub(entry.last_recovery_probe_ms)
+                                    >= OFFLINE_RECOVERY_PROBE_INTERVAL_MS
+                            })
+                            .map(|skipped| {
+                                skipped.last_recovery_probe_ms = now_ms;
+                                skipped.index
+                            });
+                        if let Some(recovery_index) = recovery_index {
+                            tab.deaddrop_last_recovery_probe_ms = now_ms;
+                            recv_window.push(OfflinePollTarget {
+                                index: recovery_index,
+                                key: Self::offline_directional_key(
+                                    &tab.session.offline_shared_secret.unwrap_or([0u8; 32]),
+                                    &my_b32,
+                                    &peer_b32,
+                                    "recv",
+                                    recovery_index,
+                                ),
+                                kind: OfflinePollKind::RecoveryProbe,
+                            });
+                        }
+                    }
+
                     if recv_window.is_empty() {
                         continue;
                     }
@@ -4943,6 +5043,8 @@ impl IcedCommApp {
 
                     tab.deaddrop_poll_in_flight = true;
                     tab.deaddrop_poll_queue = recv_window;
+                    tab.deaddrop_poll_round_misses.clear();
+                    tab.deaddrop_poll_round_authenticated.clear();
                     Self::set_dd_status(&mut tab.session, "poll");
                     poll_tab_ids.push(tab.id);
                 }
@@ -6146,19 +6248,8 @@ impl IcedCommApp {
                                     }
 
                                     if let Some(peer_b32) = tab.session.stored_peer.clone() {
-                                        let offline = OfflineState {
-                                            offline_shared_secret: tab
-                                                .session
-                                                .offline_shared_secret
-                                                .unwrap_or([0u8; 32]),
-                                            drop_send_index: tab.session.drop_send_index,
-                                            drop_recv_base: tab.session.drop_recv_base,
-                                            drop_window: tab.session.drop_window,
-                                            consumed_drop_recv: tab
-                                                .session
-                                                .consumed_drop_recv
-                                                .clone(),
-                                        };
+                                        let offline =
+                                            Self::offline_state_from_session(&tab.session);
 
                                         match storage::save_offline_state(
                                             &tab.session.profile,
@@ -6227,6 +6318,8 @@ impl IcedCommApp {
                             tab.deaddrop_poller_started = true;
                             tab.deaddrop_poll_in_flight = false;
                             tab.deaddrop_poll_queue.clear();
+                            tab.deaddrop_poll_round_misses.clear();
+                            tab.deaddrop_poll_round_authenticated.clear();
                             tab.deaddrop_last_poll_ms = 0;
                             tab.session
                                 .log_lines
@@ -6254,11 +6347,24 @@ impl IcedCommApp {
                 return Task::none();
             }
 
-            Message::OfflinePollKeyFinished(tab_id, recv_index, _dd_key, blobs, stats) => {
+            Message::OfflinePollKeyFinished(
+                tab_id,
+                recv_index,
+                poll_kind,
+                _dd_key,
+                blobs,
+                stats,
+            ) => {
                 if let Some(tab) = state.tab_by_id_mut(tab_id) {
                     Self::record_deaddrop_stats_for_tab(tab, &stats);
                     Self::flush_deaddrop_stats_for_tab(tab, false);
-                    Self::handle_offline_poll_key_result(tab, recv_index, blobs);
+                    Self::handle_offline_poll_key_result(
+                        tab,
+                        recv_index,
+                        poll_kind,
+                        blobs,
+                        &stats,
+                    );
                 }
 
                 let next_poll_task = state.start_next_deaddrop_poll_key_task(tab_id);
@@ -8877,6 +8983,11 @@ impl IcedCommApp {
         tab.session.drop_recv_base = 0;
         tab.session.drop_window = 8;
         tab.session.consumed_drop_recv.clear();
+        tab.session.known_remote_next_send = 0;
+        tab.session.highest_authenticated_recv_index = None;
+        tab.session.missing_drop_recv.clear();
+        tab.session.skipped_drop_recv.clear();
+        tab.session.forward_probe_index = 0;
 
         if let Some(peer_b32) = meta.locked_peer.as_deref() {
             if let Ok(offline) = storage::load_offline_state(&meta.name, peer_b32) {
@@ -9109,6 +9220,11 @@ impl IcedCommApp {
         self.session.drop_recv_base = 0;
         self.session.drop_window = 8;
         self.session.consumed_drop_recv.clear();
+        self.session.known_remote_next_send = 0;
+        self.session.highest_authenticated_recv_index = None;
+        self.session.missing_drop_recv.clear();
+        self.session.skipped_drop_recv.clear();
+        self.session.forward_probe_index = 0;
 
         if profile_name != "default" {
             if let Some(peer_b32) = old_peer.as_deref() {
@@ -9811,10 +9927,14 @@ impl IcedCommApp {
                         }
 
                         MsgType::K => {
+                            let was_live_ready = tab.session.live_ready;
                             tab.e2e.receive_peer_key(&frame.payload);
 
                             if tab.e2e.ready() {
                                 tab.session.live_ready = true;
+                                if !was_live_ready {
+                                    tab.offline_index_sync_sent = false;
+                                }
                                 tab.session.heartbeat_last_rx_ms = now_ms;
                                 tab.session.heartbeat_last_ping_ms = now_ms;
                                 push_log(tab, "Secure session established.".to_string());
@@ -9997,13 +10117,7 @@ impl IcedCommApp {
                             tab.session.offline_shared_secret = Some(secret);
 
                             if let Some(peer_b32) = tab.session.stored_peer.clone() {
-                                let offline = OfflineState {
-                                    offline_shared_secret: secret,
-                                    drop_send_index: tab.session.drop_send_index,
-                                    drop_recv_base: tab.session.drop_recv_base,
-                                    drop_window: tab.session.drop_window,
-                                    consumed_drop_recv: tab.session.consumed_drop_recv.clone(),
-                                };
+                                let offline = Self::offline_state_from_session(&tab.session);
 
                                 match storage::save_offline_state(
                                     &tab.session.profile,
@@ -10131,6 +10245,67 @@ impl IcedCommApp {
                                         "Received invalid UTF-8 deaddrop server list.".to_string(),
                                     );
                                 }
+                            }
+                        }
+
+                        MsgType::I => {
+                            if !(tab.session.profile != "default"
+                                && tab.session.stored_peer.is_some()
+                                && tab.session.stored_peer_dest_b64.is_some()
+                                && tab.session.tofu_verified
+                                && tab.session.live_ready
+                                && tab.e2e.ready())
+                            {
+                                push_log(
+                                    tab,
+                                    "Received offline index sync outside a verified persistent secure session."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+
+                            let payload = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("Offline index sync authentication failed: {err}"),
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let Some((remote_next_send, remote_receive_base)) =
+                                Self::decode_offline_index_sync_payload(&payload)
+                            else {
+                                push_log(tab, "Invalid offline index sync payload.".to_string());
+                                continue;
+                            };
+
+                            let old_send = tab.session.drop_send_index;
+                            let old_known_remote = tab.session.known_remote_next_send;
+                            tab.session.drop_send_index =
+                                tab.session.drop_send_index.max(remote_receive_base);
+                            tab.session.known_remote_next_send = tab
+                                .session
+                                .known_remote_next_send
+                                .max(remote_next_send);
+                            Self::save_offline_state_for_tab(
+                                tab,
+                                "Failed to save offline index synchronization",
+                            );
+
+                            if old_send != tab.session.drop_send_index
+                                || old_known_remote != tab.session.known_remote_next_send
+                            {
+                                push_log(
+                                    tab,
+                                    format!(
+                                        "Offline indexes synchronized: send={}, remote_next={}.",
+                                        tab.session.drop_send_index,
+                                        tab.session.known_remote_next_send
+                                    ),
+                                );
                             }
                         }
 
@@ -10578,6 +10753,17 @@ impl IcedCommApp {
 
         if let Some(tab_id) = offline_secret_request_tab_id {
             tasks.push(self.send_offline_secret_if_needed_task(tab_id));
+        }
+
+        let index_sync_tab_id = self.opened_tabs.get(idx).and_then(|tab| {
+            if Self::can_send_offline_index_sync(tab) && !tab.offline_index_sync_sent {
+                Some(tab.id)
+            } else {
+                None
+            }
+        });
+        if let Some(tab_id) = index_sync_tab_id {
+            tasks.push(self.send_offline_index_sync_task(tab_id));
         }
 
         tasks
@@ -12119,6 +12305,25 @@ impl IcedCommApp {
         session.drop_recv_base = offline.drop_recv_base;
         session.drop_window = offline.drop_window;
         session.consumed_drop_recv = offline.consumed_drop_recv.clone();
+        session.known_remote_next_send = offline
+            .known_remote_next_send
+            .max(offline.drop_recv_base);
+        session.highest_authenticated_recv_index = offline.highest_authenticated_recv_index;
+        session.missing_drop_recv = offline.missing_drop_recv.clone();
+        session.skipped_drop_recv = offline.skipped_drop_recv.clone();
+        session.forward_probe_index = offline.forward_probe_index;
+        session
+            .missing_drop_recv
+            .sort_unstable_by_key(|entry| entry.index);
+        session
+            .skipped_drop_recv
+            .sort_unstable_by_key(|entry| entry.index);
+        session
+            .missing_drop_recv
+            .truncate(OFFLINE_RECOVERY_STATE_LIMIT);
+        session
+            .skipped_drop_recv
+            .truncate(OFFLINE_RECOVERY_STATE_LIMIT);
     }
 
     fn offline_state_from_session(session: &SessionState) -> OfflineState {
@@ -12128,6 +12333,23 @@ impl IcedCommApp {
             drop_recv_base: session.drop_recv_base,
             drop_window: session.drop_window,
             consumed_drop_recv: session.consumed_drop_recv.clone(),
+            known_remote_next_send: session.known_remote_next_send,
+            highest_authenticated_recv_index: session.highest_authenticated_recv_index,
+            missing_drop_recv: session.missing_drop_recv.clone(),
+            skipped_drop_recv: session.skipped_drop_recv.clone(),
+            forward_probe_index: session.forward_probe_index,
+        }
+    }
+
+    fn save_offline_state_for_tab(tab: &mut OpenedTab, context: &str) {
+        let Some(peer_b32) = tab.session.stored_peer.clone() else {
+            return;
+        };
+        let offline = Self::offline_state_from_session(&tab.session);
+        if let Err(err) =
+            storage::save_offline_state(&tab.session.profile, &peer_b32, &offline)
+        {
+            tab.session.log_lines.push(format!("{context}: {err}"));
         }
     }
 
@@ -12639,6 +12861,82 @@ impl IcedCommApp {
         )
     }
 
+    fn can_send_offline_index_sync(tab: &OpenedTab) -> bool {
+        let session = &tab.session;
+        session.profile != "default"
+            && session.live_ready
+            && session.tofu_verified
+            && tab.e2e.ready()
+            && Self::session_has_real_offline_secret(session)
+            && session.stored_peer.as_deref() == session.current_peer_addr.as_deref()
+            && session.stored_peer_dest_b64.as_deref()
+                == session.current_peer_dest_b64.as_deref()
+            && tab.live_conn.is_some()
+    }
+
+    fn encode_offline_index_sync_payload(session: &SessionState) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(OFFLINE_INDEX_SYNC_PAYLOAD_LEN);
+        payload.push(OFFLINE_INDEX_SYNC_VERSION);
+        payload.extend_from_slice(&session.drop_send_index.to_be_bytes());
+        payload.extend_from_slice(&session.drop_recv_base.to_be_bytes());
+        payload
+    }
+
+    fn decode_offline_index_sync_payload(payload: &[u8]) -> Option<(u64, u64)> {
+        if payload.len() != OFFLINE_INDEX_SYNC_PAYLOAD_LEN
+            || payload[0] != OFFLINE_INDEX_SYNC_VERSION
+        {
+            return None;
+        }
+
+        let mut next_send_bytes = [0u8; 8];
+        next_send_bytes.copy_from_slice(&payload[1..9]);
+        let mut receive_base_bytes = [0u8; 8];
+        receive_base_bytes.copy_from_slice(&payload[9..17]);
+        Some((
+            u64::from_be_bytes(next_send_bytes),
+            u64::from_be_bytes(receive_base_bytes),
+        ))
+    }
+
+    fn send_offline_index_sync_task(&mut self, tab_id: u64) -> Task<Message> {
+        let Some(idx) = self.find_tab_index_by_id(tab_id) else {
+            return Task::none();
+        };
+        if !Self::can_send_offline_index_sync(&self.opened_tabs[idx])
+            || self.opened_tabs[idx].offline_index_sync_sent
+        {
+            return Task::none();
+        }
+
+        let Some(conn) = self.opened_tabs[idx].live_conn.clone() else {
+            return Task::none();
+        };
+        let plaintext = Self::encode_offline_index_sync_payload(&self.opened_tabs[idx].session);
+        let payload = match self.opened_tabs[idx].e2e.encrypt_strict(&plaintext) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.opened_tabs[idx]
+                    .session
+                    .log_lines
+                    .push(format!("Offline index sync encryption failed: {err}"));
+                return Task::none();
+            }
+        };
+
+        self.opened_tabs[idx].offline_index_sync_sent = true;
+        let frame = Frame {
+            msg_type: MsgType::I,
+            msg_id: self.generate_msg_id(),
+            payload,
+        };
+
+        Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
+            move |result| Message::SendFinished(tab_id, result),
+        )
+    }
+
     fn offline_directional_key(
         shared_secret: &[u8; 32],
         my_b32: &str,
@@ -12752,11 +13050,12 @@ impl IcedCommApp {
         session: &SessionState,
         my_b32: &str,
         peer_b32: &str,
-    ) -> Vec<(u64, String)> {
+    ) -> Vec<OfflinePollTarget> {
         let mut out = Vec::new();
 
         let window = session.drop_window as u64;
-        for recv_index in session.drop_recv_base..(session.drop_recv_base + window) {
+        let window_end = session.drop_recv_base.saturating_add(window);
+        for recv_index in session.drop_recv_base..window_end {
             if session.consumed_drop_recv.iter().any(|n| *n == recv_index) {
                 continue;
             }
@@ -12769,7 +13068,11 @@ impl IcedCommApp {
                 recv_index,
             );
 
-            out.push((recv_index, dd_key));
+            out.push(OfflinePollTarget {
+                index: recv_index,
+                key: dd_key,
+                kind: OfflinePollKind::Window,
+            });
         }
 
         out
@@ -12781,8 +13084,12 @@ impl IcedCommApp {
                 .consumed_drop_recv
                 .iter()
                 .any(|n| *n == session.drop_recv_base)
+                || session
+                    .skipped_drop_recv
+                    .iter()
+                    .any(|entry| entry.index == session.drop_recv_base)
             {
-                session.drop_recv_base += 1;
+                session.drop_recv_base = session.drop_recv_base.saturating_add(1);
             } else {
                 break;
             }
@@ -12807,12 +13114,16 @@ impl IcedCommApp {
         {
             self.opened_tabs[idx].deaddrop_poll_in_flight = false;
             self.opened_tabs[idx].deaddrop_poll_queue.clear();
+            self.opened_tabs[idx].deaddrop_poll_round_misses.clear();
+            self.opened_tabs[idx]
+                .deaddrop_poll_round_authenticated
+                .clear();
             self.opened_tabs[idx].deaddrop_last_poll_ms = Self::now_epoch_millis();
             return Task::none();
         }
 
-        let Some((recv_index, dd_key)) = self.opened_tabs[idx].deaddrop_poll_queue.first().cloned()
-        else {
+        let Some(target) = self.opened_tabs[idx].deaddrop_poll_queue.first().cloned() else {
+            Self::finalize_offline_poll_round(&mut self.opened_tabs[idx]);
             self.opened_tabs[idx].deaddrop_poll_in_flight = false;
             self.opened_tabs[idx].deaddrop_last_poll_ms = Self::now_epoch_millis();
             return Task::none();
@@ -12821,7 +13132,10 @@ impl IcedCommApp {
         self.opened_tabs[idx].deaddrop_poll_queue.remove(0);
 
         let dd = std::sync::Arc::clone(&self.opened_tabs[idx].deaddrop);
-        let dd_key_for_task = dd_key.clone();
+        let dd_key_for_task = target.key.clone();
+        let recv_index = target.index;
+        let poll_kind = target.kind;
+        let dd_key = target.key;
 
         Task::perform(
             async move {
@@ -12829,7 +13143,14 @@ impl IcedCommApp {
                 dd.get_with_stats(&dd_key_for_task).await
             },
             move |(blobs, stats)| {
-                Message::OfflinePollKeyFinished(tab_id, recv_index, dd_key, blobs, stats)
+                Message::OfflinePollKeyFinished(
+                    tab_id,
+                    recv_index,
+                    poll_kind,
+                    dd_key,
+                    blobs,
+                    stats,
+                )
             },
         )
     }
@@ -12837,10 +13158,23 @@ impl IcedCommApp {
     fn handle_offline_poll_key_result(
         tab: &mut OpenedTab,
         recv_index: u64,
+        poll_kind: OfflinePollKind,
         blobs: Vec<(String, Vec<u8>)>,
+        stats: &[DeaddropOpStat],
     ) {
         if blobs.is_empty() {
             Self::set_dd_status(&mut tab.session, "get_miss");
+            let confirmed_miss = stats
+                .iter()
+                .any(|stat| stat.ok && stat.detail.eq_ignore_ascii_case("MISS"));
+            if confirmed_miss && poll_kind != OfflinePollKind::RecoveryProbe {
+                tab.deaddrop_poll_round_misses.push(recv_index);
+            } else if !confirmed_miss {
+                tab.session.log_lines.push(format!(
+                    "Offline poll at index {} was indeterminate; no server confirmed MISS.",
+                    recv_index
+                ));
+            }
             return;
         }
 
@@ -12872,18 +13206,26 @@ impl IcedCommApp {
                 continue;
             }
 
-            let frame_bytes = tab.e2e.decrypt_offline_blob(&blob, &blob_key);
+            let frame_bytes = match tab.e2e.decrypt_offline_blob_strict(&blob, &blob_key) {
+                Ok(frame_bytes) => frame_bytes,
+                Err(err) => {
+                    tab.session.log_lines.push(format!(
+                        "Rejected unauthenticated offline blob at recv index {}: {}",
+                        recv_index, err
+                    ));
+                    continue;
+                }
+            };
 
             match Frame::decode(&frame_bytes) {
                 Ok(frame) => {
-                    tab.session.seen_drop_msgs.push(blob_hash);
-                    got_valid_blob = true;
-
                     match frame.msg_type {
                         MsgType::U => {
                             let plain = tab.e2e.decrypt(&frame.payload);
                             match String::from_utf8(plain) {
                                 Ok(text) => {
+                                    tab.session.seen_drop_msgs.push(blob_hash);
+                                    got_valid_blob = true;
                                     tab.session.bubbles.push(Bubble::peer_offline(text));
                                     tab.meta.has_unread = false;
                                     Self::set_dd_status(&mut tab.session, "get_hit");
@@ -12917,37 +13259,143 @@ impl IcedCommApp {
         }
 
         if got_valid_blob {
-            if !tab
+            tab.deaddrop_poll_round_authenticated.push(recv_index);
+            tab.session.known_remote_next_send = tab
                 .session
-                .consumed_drop_recv
-                .iter()
-                .any(|n| *n == recv_index)
+                .known_remote_next_send
+                .max(recv_index.saturating_add(1));
+            tab.session.highest_authenticated_recv_index = Some(
+                tab.session
+                    .highest_authenticated_recv_index
+                    .map(|current| current.max(recv_index))
+                    .unwrap_or(recv_index),
+            );
+            tab.session
+                .missing_drop_recv
+                .retain(|entry| entry.index != recv_index);
+            tab.session
+                .skipped_drop_recv
+                .retain(|entry| entry.index != recv_index);
+
+            if recv_index >= tab.session.drop_recv_base
+                && !tab
+                    .session
+                    .consumed_drop_recv
+                    .iter()
+                    .any(|n| *n == recv_index)
             {
                 tab.session.consumed_drop_recv.push(recv_index);
             }
 
             Self::advance_drop_recv_base(&mut tab.session);
-
-            if let Some(peer_b32) = tab.session.stored_peer.clone() {
-                let offline = OfflineState {
-                    offline_shared_secret: tab.session.offline_shared_secret.unwrap_or([0u8; 32]),
-                    drop_send_index: tab.session.drop_send_index,
-                    drop_recv_base: tab.session.drop_recv_base,
-                    drop_window: tab.session.drop_window,
-                    consumed_drop_recv: tab.session.consumed_drop_recv.clone(),
-                };
-
-                if let Err(err) =
-                    storage::save_offline_state(&tab.session.profile, &peer_b32, &offline)
-                {
-                    tab.session
-                        .log_lines
-                        .push(format!("Failed to save offline receive state: {err}"));
-                }
-            }
         } else {
             Self::set_dd_status(&mut tab.session, "get_miss");
+            tab.session.log_lines.push(format!(
+                "Offline blobs at recv index {} contained no authenticated message.",
+                recv_index
+            ));
         }
+    }
+
+    fn finalize_offline_poll_round(tab: &mut OpenedTab) {
+        let now_ms = Self::now_epoch_millis();
+        tab.deaddrop_poll_round_misses.sort_unstable();
+        tab.deaddrop_poll_round_misses.dedup();
+        tab.deaddrop_poll_round_authenticated.sort_unstable();
+        tab.deaddrop_poll_round_authenticated.dedup();
+
+        for index in &tab.deaddrop_poll_round_misses {
+            if let Some(entry) = tab
+                .session
+                .missing_drop_recv
+                .iter_mut()
+                .find(|entry| entry.index == *index)
+            {
+                entry.confirmed_miss_rounds = entry.confirmed_miss_rounds.saturating_add(1);
+                entry.last_miss_ms = now_ms;
+            } else {
+                tab.session.missing_drop_recv.push(OfflineMissingIndexState {
+                    index: *index,
+                    confirmed_miss_rounds: 1,
+                    first_miss_ms: now_ms,
+                    last_miss_ms: now_ms,
+                });
+            }
+        }
+
+        let skip_indexes = tab
+            .session
+            .missing_drop_recv
+            .iter()
+            .filter(|entry| {
+                entry.confirmed_miss_rounds >= OFFLINE_GAP_MISS_ROUNDS
+                    && entry.index < tab.session.known_remote_next_send
+                    && entry.index >= tab.session.drop_recv_base
+            })
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+
+        for index in skip_indexes {
+            if !tab
+                .session
+                .skipped_drop_recv
+                .iter()
+                .any(|entry| entry.index == index)
+            {
+                tab.session.skipped_drop_recv.push(OfflineSkippedIndexState {
+                    index,
+                    skipped_at_ms: now_ms,
+                    last_recovery_probe_ms: 0,
+                });
+                tab.session.log_lines.push(format!(
+                    "Skipped confirmed offline gap at recv index {}; late recovery remains active.",
+                    index
+                ));
+            }
+        }
+
+        let skipped_indexes = tab
+            .session
+            .skipped_drop_recv
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+        tab.session
+            .missing_drop_recv
+            .retain(|entry| !skipped_indexes.contains(&entry.index));
+        tab.session.skipped_drop_recv.retain(|entry| {
+            now_ms.saturating_sub(entry.skipped_at_ms) <= OFFLINE_SKIPPED_RETENTION_MS
+        });
+        tab.session
+            .missing_drop_recv
+            .sort_unstable_by_key(|entry| entry.index);
+        tab.session
+            .skipped_drop_recv
+            .sort_unstable_by_key(|entry| entry.index);
+        tab.session
+            .missing_drop_recv
+            .truncate(OFFLINE_RECOVERY_STATE_LIMIT);
+        tab.session
+            .skipped_drop_recv
+            .truncate(OFFLINE_RECOVERY_STATE_LIMIT);
+
+        let previous_base = tab.session.drop_recv_base;
+        Self::advance_drop_recv_base(&mut tab.session);
+        if previous_base != tab.session.drop_recv_base
+            || !tab.deaddrop_poll_round_authenticated.is_empty()
+        {
+            tab.deaddrop_stalled_sweeps = 0;
+            tab.session.forward_probe_index = tab
+                .session
+                .drop_recv_base
+                .saturating_add(tab.session.drop_window as u64);
+        } else {
+            tab.deaddrop_stalled_sweeps = tab.deaddrop_stalled_sweeps.saturating_add(1);
+        }
+
+        tab.deaddrop_poll_round_misses.clear();
+        tab.deaddrop_poll_round_authenticated.clear();
+        Self::save_offline_state_for_tab(tab, "Failed to save offline recovery state");
     }
 }
 

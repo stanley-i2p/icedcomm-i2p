@@ -262,4 +262,25 @@ impl E2E {
             Err(_) => blob.to_vec(),
         }
     }
+
+    pub fn decrypt_offline_blob_strict(
+        &self,
+        blob: &[u8],
+        blob_key: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if blob_key.len() != 32 {
+            return Err("invalid offline blob key length".into());
+        }
+
+        // XSalsa20-Poly1305 needs a 24-byte nonce and a 16-byte authentication tag.
+        if blob.len() < 40 {
+            return Err("offline blob is too short".into());
+        }
+
+        let cipher = XSalsa20Poly1305::new(Key::from_slice(blob_key));
+        let (nonce_bytes, ciphertext) = blob.split_at(24);
+        cipher
+            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .map_err(|_| "offline blob authentication failed".into())
+    }
 }
