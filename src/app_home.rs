@@ -9,6 +9,7 @@ pub fn app_home_view<'a>(
     sam_port_input: &'a str,
     sam_status: &'a str,
     sam_test_in_flight: bool,
+    sam_config_locked: bool,
     backup_export_passphrase: &'a str,
     backup_export_status: &'a str,
     backup_export_include_files: bool,
@@ -27,29 +28,26 @@ pub fn app_home_view<'a>(
     pending_profile_import_name: Option<&'a str>,
     backup_operation: BackupOperation,
 ) -> Element<'a, Message> {
+    let sam_edit_enabled = !sam_test_in_flight && !sam_config_locked;
     let sam_block = sam_operation_block(
         column![
             row![
                 text("SAM").size(16).width(70),
                 text_input("Host", sam_host_input)
-                    .on_input_maybe((!sam_test_in_flight).then_some(Message::SamHostInputChanged))
+                    .on_input_maybe(sam_edit_enabled.then_some(Message::SamHostInputChanged))
                     .padding(10)
                     .size(13)
                     .width(220),
                 text_input("Port", sam_port_input)
-                    .on_input_maybe((!sam_test_in_flight).then_some(Message::SamPortInputChanged))
-                    .on_submit_maybe(
-                        (!sam_test_in_flight).then_some(Message::SaveSamSettingsPressed)
-                    )
+                    .on_input_maybe(sam_edit_enabled.then_some(Message::SamPortInputChanged))
+                    .on_submit_maybe(sam_edit_enabled.then_some(Message::SaveSamSettingsPressed))
                     .padding(10)
                     .size(13)
                     .width(90),
                 button(text("Save").size(13))
                     .padding([6, 10])
                     .style(crate::app::app_button_style)
-                    .on_press_maybe(
-                        (!sam_test_in_flight).then_some(Message::SaveSamSettingsPressed)
-                    ),
+                    .on_press_maybe(sam_edit_enabled.then_some(Message::SaveSamSettingsPressed)),
                 button(text("Test").size(13))
                     .padding([6, 10])
                     .style(crate::app::app_button_style)

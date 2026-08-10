@@ -18,6 +18,7 @@ use iced::{Font, Theme, application, window};
 const INTER_FONT_BYTES: &[u8] = include_bytes!("../fonts/Inter-VariableFont_opsz,wght.ttf");
 const MATERIAL_SYMBOLS_ROUNDED_BYTES: &[u8] =
     include_bytes!("../fonts/MaterialSymbolsRounded[FILL,GRAD,opsz,wght].ttf");
+const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/commtools-i2p.png");
 
 fn app_title(_: &IcedCommApp) -> String {
     String::from("IcedComm-I2P")
@@ -28,6 +29,9 @@ fn app_theme(_: &IcedCommApp) -> Theme {
 }
 
 fn main() -> iced::Result {
+    let app_icon = window::icon::from_file_data(APP_ICON_BYTES, None)
+        .expect("embedded application icon must be a valid image");
+
     application(IcedCommApp::boot, IcedCommApp::update, IcedCommApp::view)
         .title(app_title)
         .theme(app_theme)
@@ -35,6 +39,7 @@ fn main() -> iced::Result {
         .exit_on_close_request(false)
         .window(window::Settings {
             min_size: Some(iced::Size::new(1280.0, 700.0)),
+            icon: Some(app_icon),
             ..Default::default()
         })
         .font(INTER_FONT_BYTES)

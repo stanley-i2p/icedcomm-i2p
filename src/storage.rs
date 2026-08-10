@@ -421,6 +421,10 @@ pub fn load_contacts() -> Result<Vec<ContactMeta>, StorageError> {
         }
 
         let dat_path = contact_dat_path(name);
+        if is_group_contact_namespace(name) && !dat_path.exists() {
+            continue;
+        }
+
         if dat_path.exists() {
             out.push(load_contact_meta(name)?);
         } else {
@@ -435,7 +439,7 @@ pub fn load_contacts() -> Result<Vec<ContactMeta>, StorageError> {
 }
 
 pub fn create_contact(name: &str) -> Result<ContactMeta, StorageError> {
-    validate_contact_name(name)?;
+    validate_persistent_contact_name(name)?;
 
     ensure_base_layout()?;
 
@@ -611,7 +615,7 @@ pub fn load_contact_meta(name: &str) -> Result<ContactMeta, StorageError> {
 }
 
 pub fn save_contact_meta(meta: &ContactMeta) -> Result<(), StorageError> {
-    validate_contact_name(&meta.name)?;
+    validate_persistent_contact_name(&meta.name)?;
 
     let dir = contact_dir(&meta.name);
     create_dir_secure_all(&dir)?;
@@ -645,7 +649,7 @@ pub fn save_deaddrop_stats(
     name: &str,
     stats: &HashMap<String, DeaddropServerStat>,
 ) -> Result<(), StorageError> {
-    validate_contact_name(name)?;
+    validate_persistent_contact_name(name)?;
 
     let dir = contact_dir(name);
     create_dir_secure_all(&dir)?;
@@ -683,6 +687,23 @@ fn validate_contact_name(name: &str) -> Result<(), StorageError> {
         ));
     }
 
+    Ok(())
+}
+
+fn is_group_contact_namespace(name: &str) -> bool {
+    name
+        .get(.."group:".len())
+        .map(|prefix| prefix.eq_ignore_ascii_case("group:"))
+        .unwrap_or(false)
+}
+
+fn validate_persistent_contact_name(name: &str) -> Result<(), StorageError> {
+    validate_contact_name(name)?;
+    if is_group_contact_namespace(name) {
+        return Err(StorageError::InvalidName(
+            "reserved profile name prefix".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -900,7 +921,7 @@ pub fn save_offline_state(
     peer_b32: &str,
     state: &OfflineState,
 ) -> Result<(), StorageError> {
-    validate_contact_name(name)?;
+    validate_persistent_contact_name(name)?;
 
     let dir = contact_dir(name);
     create_dir_secure_all(&dir)?;

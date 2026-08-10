@@ -13,7 +13,7 @@ use iced::border;
 use iced::widget::Id as ScrollableId;
 use iced::widget::operation;
 use iced::widget::{
-    Space, button, column, container, image, progress_bar, row, scrollable, stack, text,
+    Space, button, column, container, image, opaque, progress_bar, row, scrollable, stack, text,
     text_editor, text_input, tooltip,
 };
 use iced::{
@@ -161,6 +161,10 @@ const HEARTBEAT_PING_INTERVAL_MS: u64 = 10_000;
 const HEARTBEAT_TIMEOUT_MS: u64 = 35_000;
 const HEARTBEAT_PING_PREFIX: &str = "__SIGNAL__:PING:";
 const HEARTBEAT_PONG_PREFIX: &str = "__SIGNAL__:PONG:";
+const SAM_MONITOR_INTERVAL_MS: u64 = 5_000;
+const SAM_MONITOR_PROBE_TIMEOUT_MS: u64 = 4_000;
+const SAM_MONITOR_FAILURE_LIMIT: u8 = 3;
+const SAM_SHUTDOWN_COUNTDOWN_MS: u64 = 10_000;
 const MAX_LOG_LINES: usize = 5_000;
 const LOG_TRIM_BATCH: usize = 500;
 
@@ -798,6 +802,14 @@ pub struct IcedCommApp {
     pub sam_port_input: String,
     pub sam_status: String,
     pub sam_test_in_flight: bool,
+    pub sam_monitor_host: Option<String>,
+    pub sam_monitor_port: Option<u16>,
+    pub sam_monitor_generation: u64,
+    pub sam_monitor_last_probe_ms: u64,
+    pub sam_monitor_probe_in_flight: bool,
+    pub sam_monitor_failures: u8,
+    pub sam_shutdown_deadline_ms: Option<u64>,
+    pub sam_shutdown_started: bool,
     pub backup_export_passphrase: String,
     pub backup_export_status: String,
     pub backup_export_include_files: bool,
@@ -850,6 +862,8 @@ pub enum Message {
     SaveSamSettingsPressed,
     TestSamPressed,
     SamTestFinished(Result<String, String>),
+    SamMonitorProbeFinished(u64, Result<(), String>),
+    SamShutdownNowPressed,
     WipeAllPassphraseChanged(String),
     ProfileExportPassphraseChanged(String),
     ProfileImportPassphraseChanged(String),
@@ -998,6 +1012,14 @@ impl Default for IcedCommApp {
             sam_port_input: DEFAULT_SAM_PORT.to_string(),
             sam_status: "SAM settings apply to newly opened chat tabs.".into(),
             sam_test_in_flight: false,
+            sam_monitor_host: None,
+            sam_monitor_port: None,
+            sam_monitor_generation: 0,
+            sam_monitor_last_probe_ms: 0,
+            sam_monitor_probe_in_flight: false,
+            sam_monitor_failures: 0,
+            sam_shutdown_deadline_ms: None,
+            sam_shutdown_started: false,
             backup_export_passphrase: String::new(),
             backup_export_status: "Export creates a v2 encrypted backup file.".into(),
             backup_export_include_files: true,
@@ -1692,6 +1714,80 @@ impl IcedCommApp {
         ))
     }
 
+    fn refresh_sam_monitor_state(&mut self) {
+        if self.sam_shutdown_deadline_ms.is_some() || self.sam_shutdown_started {
+            return;
+        }
+
+        let endpoint = self
+            .opened_tabs
+            .iter()
+            .find(|tab| {
+                tab.meta.initialized
+                    && tab.session.sam_session_id.is_some()
+                    && !tab.sam_runtime.is_closing()
+            })
+            .map(|tab| {
+                (
+                    tab.sam_runtime.client.sam_host.clone(),
+                    tab.sam_runtime.client.sam_port,
+                )
+            });
+
+        let current = self
+            .sam_monitor_host
+            .as_ref()
+            .zip(self.sam_monitor_port)
+            .map(|(host, port)| (host.as_str(), port));
+        let next = endpoint.as_ref().map(|(host, port)| (host.as_str(), *port));
+
+        if current == next {
+            return;
+        }
+
+        self.sam_monitor_generation = self.sam_monitor_generation.wrapping_add(1);
+        self.sam_monitor_probe_in_flight = false;
+        self.sam_monitor_failures = 0;
+        self.sam_monitor_last_probe_ms = Self::now_epoch_millis();
+
+        if let Some((host, port)) = endpoint {
+            self.sam_monitor_host = Some(host);
+            self.sam_monitor_port = Some(port);
+        } else {
+            self.sam_monitor_host = None;
+            self.sam_monitor_port = None;
+            self.sam_monitor_last_probe_ms = 0;
+        }
+    }
+
+    fn start_sam_monitor_probe(&mut self) -> Option<Task<Message>> {
+        if self.sam_monitor_probe_in_flight || self.sam_shutdown_deadline_ms.is_some() {
+            return None;
+        }
+
+        let host = self.sam_monitor_host.clone()?;
+        let port = self.sam_monitor_port?;
+        let generation = self.sam_monitor_generation;
+        self.sam_monitor_probe_in_flight = true;
+        self.sam_monitor_last_probe_ms = Self::now_epoch_millis();
+
+        Some(Task::perform(
+            async move {
+                match timeout(
+                    Duration::from_millis(SAM_MONITOR_PROBE_TIMEOUT_MS),
+                    SamClient::test_endpoint(host, port),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(_) => Err("SAM monitor probe timed out".to_string()),
+                }
+            },
+            move |result| Message::SamMonitorProbeFinished(generation, result),
+        ))
+    }
+
     fn store_active_runtime(&mut self) {
         let sidebar_profiles = self.session.profiles.clone();
         let sidebar_selected = self.session.selected_profile_idx;
@@ -2030,6 +2126,25 @@ impl IcedCommApp {
     }
 
     pub fn update(state: &mut Self, message: Message) -> Task<Message> {
+        if state.sam_shutdown_deadline_ms.is_some()
+            && !matches!(
+                &message,
+                Message::Tick
+                    | Message::SamShutdownNowPressed
+                    | Message::WindowCloseRequested(_)
+                    | Message::WindowOpened(_)
+                    | Message::WindowFocusChanged(_, _)
+                    | Message::ProcessShutdownRequested
+                    | Message::ExitAfterNotify(_)
+                    | Message::CloseFinished(_, _)
+                    | Message::SamCloseFinished(_, _)
+                    | Message::QuitSignalSent(_, _)
+                    | Message::DeaddropClosed(_)
+            )
+        {
+            return Task::none();
+        }
+
         match message {
             Message::InputChanged(action) => {
                 let was_empty = state.session.input.is_empty();
@@ -4168,6 +4283,7 @@ impl IcedCommApp {
             }
 
             Message::WindowCloseRequested(window_id) => {
+                state.sam_shutdown_started = true;
                 return state.begin_shutdown(ShutdownTarget::Window(window_id));
             }
 
@@ -4191,6 +4307,7 @@ impl IcedCommApp {
             }
 
             Message::ProcessShutdownRequested => {
+                state.sam_shutdown_started = true;
                 return state.begin_shutdown(ShutdownTarget::Runtime);
             }
 
@@ -5008,14 +5125,36 @@ impl IcedCommApp {
             }
 
             Message::Tick => {
+                let now_ms = Self::now_epoch_millis();
+                state.refresh_sam_monitor_state();
+
+                if let Some(deadline) = state.sam_shutdown_deadline_ms {
+                    if now_ms >= deadline && !state.sam_shutdown_started {
+                        state.sam_shutdown_started = true;
+                        return state.begin_shutdown(ShutdownTarget::Runtime);
+                    }
+                    return Task::none();
+                }
+
                 let mut tasks: Vec<Task<Message>> = Vec::new();
+
+                if !state.sam_shutdown_started
+                    && state.sam_shutdown_deadline_ms.is_none()
+                    && !state.sam_monitor_probe_in_flight
+                    && state.sam_monitor_host.is_some()
+                    && now_ms.saturating_sub(state.sam_monitor_last_probe_ms)
+                        >= SAM_MONITOR_INTERVAL_MS
+                {
+                    if let Some(task) = state.start_sam_monitor_probe() {
+                        tasks.push(task);
+                    }
+                }
 
                 for idx in 0..state.opened_tabs.len() {
                     let mut tab_tasks = state.tick_one_tab(idx);
                     tasks.append(&mut tab_tasks);
                 }
 
-                let now_ms = Self::now_epoch_millis();
                 let mut poll_tab_ids: Vec<u64> = Vec::new();
 
                 for tab in &mut state.opened_tabs {
@@ -5541,20 +5680,26 @@ impl IcedCommApp {
             }
 
             Message::SamHostInputChanged(value) => {
-                if !state.sam_test_in_flight {
+                if state.opened_tabs.is_empty() && !state.sam_test_in_flight {
                     state.sam_host_input = value;
                 }
                 return Task::none();
             }
 
             Message::SamPortInputChanged(value) => {
-                if !state.sam_test_in_flight {
+                if state.opened_tabs.is_empty() && !state.sam_test_in_flight {
                     state.sam_port_input = value;
                 }
                 return Task::none();
             }
 
             Message::SaveSamSettingsPressed => {
+                if !state.opened_tabs.is_empty() {
+                    state.sam_status =
+                        "Close all chat and group tabs before changing SAM settings.".into();
+                    return Task::none();
+                }
+
                 let host = state.sam_host_input.trim().to_string();
                 if host.is_empty() {
                     state.sam_status = "SAM host cannot be empty.".into();
@@ -5629,6 +5774,50 @@ impl IcedCommApp {
                     Err(err) => err,
                 };
                 return Task::none();
+            }
+
+            Message::SamMonitorProbeFinished(generation, result) => {
+                state.refresh_sam_monitor_state();
+                if state.sam_shutdown_started
+                    || generation != state.sam_monitor_generation
+                    || state.sam_monitor_host.is_none()
+                    || state.sam_shutdown_deadline_ms.is_some()
+                {
+                    return Task::none();
+                }
+
+                state.sam_monitor_probe_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        state.sam_monitor_failures = 0;
+                    }
+                    Err(_) => {
+                        state.sam_monitor_failures = state.sam_monitor_failures.saturating_add(1);
+
+                        if state.sam_monitor_failures >= SAM_MONITOR_FAILURE_LIMIT {
+                            state.sam_shutdown_deadline_ms = Some(
+                                Self::now_epoch_millis().saturating_add(SAM_SHUTDOWN_COUNTDOWN_MS),
+                            );
+
+                            if let Some(window_id) = state.window_id {
+                                return window::request_user_attention(
+                                    window_id,
+                                    Some(window::UserAttention::Informational),
+                                );
+                            }
+                        }
+                    }
+                }
+                return Task::none();
+            }
+
+            Message::SamShutdownNowPressed => {
+                if state.sam_shutdown_started {
+                    return Task::none();
+                }
+
+                state.sam_shutdown_started = true;
+                return state.begin_shutdown(ShutdownTarget::Runtime);
             }
 
             Message::WipeAllPassphraseChanged(value) => {
@@ -7540,6 +7729,7 @@ impl IcedCommApp {
                 &state.sam_port_input,
                 &state.sam_status,
                 state.sam_test_in_flight,
+                !state.opened_tabs.is_empty(),
                 &state.backup_export_passphrase,
                 &state.backup_export_status,
                 state.backup_export_include_files,
@@ -7840,7 +8030,7 @@ impl IcedCommApp {
             .height(Length::Fill)
         };
 
-        container(
+        let app_content: Element<'_, Message> = container(
             row![
                 profile_sidebar,
                 container(main_column)
@@ -7854,7 +8044,68 @@ impl IcedCommApp {
         .padding(10)
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+
+        let Some(deadline_ms) = state.sam_shutdown_deadline_ms else {
+            return app_content;
+        };
+
+        let remaining_ms = deadline_ms.saturating_sub(Self::now_epoch_millis());
+        let remaining_seconds = remaining_ms.saturating_add(999) / 1_000;
+        let shutdown_action: Element<'_, Message> = if state.sam_shutdown_started {
+            button(text("Shutting down...").size(13))
+                .padding([8, 14])
+                .style(app_button_style)
+                .into()
+        } else {
+            button(text("Shut Down Now").size(13))
+                .padding([8, 14])
+                .style(app_button_style)
+                .on_press(Message::SamShutdownNowPressed)
+                .into()
+        };
+
+        let shutdown_card = container(
+            column![
+                text("I2P Router Unavailable").size(20).color(PY_RED),
+                text(
+                    "The configured SAM endpoint is not responding. IcedComm will shut down securely."
+                )
+                .size(13),
+                text(format!("Automatic shutdown in {remaining_seconds} seconds.")).size(14),
+                shutdown_action,
+            ]
+            .spacing(14)
+            .align_x(Alignment::Center),
+        )
+        .padding(24)
+        .max_width(560)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgb8(28, 28, 34))),
+            border: border::Border {
+                color: PY_RED,
+                width: 1.5,
+                radius: border::Radius::from(6.0),
+            },
+            ..Default::default()
+        });
+
+        let shutdown_overlay = opaque(
+            container(shutdown_card)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::from_rgba8(0, 0, 0, 0.78))),
+                    ..Default::default()
+                }),
+        );
+
+        stack![app_content, shutdown_overlay]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn now_epoch_millis() -> u64 {
@@ -8950,20 +9201,24 @@ impl IcedCommApp {
         name == "default"
     }
 
-    fn active_contact_meta(&self) -> Option<ContactMeta> {
-        let profile_name = self.active_tab()?.session.profile.clone();
+    fn is_persistent_contact_tab(tab: &OpenedTab) -> bool {
+        tab.meta.kind == TabKind::Chat
+            && !Self::is_transient_profile_name(&tab.session.profile)
+    }
 
-        if Self::is_transient_profile_name(&profile_name) {
+    fn active_contact_meta(&self) -> Option<ContactMeta> {
+        let tab = self.active_tab()?;
+        if !Self::is_persistent_contact_tab(tab) {
             return None;
         }
 
         Some(ContactMeta {
-            name: profile_name,
-            my_dest_b64: self.active_tab()?.session.my_dest_b64.clone(),
-            locked_peer: self.active_tab()?.session.stored_peer.clone(),
-            locked_peer_dest_b64: self.active_tab()?.session.stored_peer_dest_b64.clone(),
-            pq_enabled: self.active_tab()?.session.pq_enabled,
-            deaddrop_servers: self.active_tab()?.session.deaddrop_servers.clone(),
+            name: tab.session.profile.clone(),
+            my_dest_b64: tab.session.my_dest_b64.clone(),
+            locked_peer: tab.session.stored_peer.clone(),
+            locked_peer_dest_b64: tab.session.stored_peer_dest_b64.clone(),
+            pq_enabled: tab.session.pq_enabled,
+            deaddrop_servers: tab.session.deaddrop_servers.clone(),
         })
     }
 
@@ -8976,14 +9231,12 @@ impl IcedCommApp {
     }
 
     fn save_active_contact_meta_for_name(&mut self, profile_name: &str) {
-        if profile_name == "default" {
-            return;
-        }
-
         let maybe_meta = self
             .opened_tabs
             .iter()
-            .find(|t| t.session.profile == profile_name)
+            .find(|tab| {
+                tab.session.profile == profile_name && Self::is_persistent_contact_tab(tab)
+            })
             .map(|tab| ContactMeta {
                 name: profile_name.to_string(),
                 my_dest_b64: tab.session.my_dest_b64.clone(),
@@ -9003,7 +9256,9 @@ impl IcedCommApp {
             if let Some(tab) = self
                 .opened_tabs
                 .iter()
-                .find(|t| t.session.profile == profile_name)
+                .find(|tab| {
+                    tab.session.profile == profile_name && Self::is_persistent_contact_tab(tab)
+                })
             {
                 if let Err(err) =
                     storage::save_deaddrop_stats(profile_name, &tab.session.deaddrop_stats)
@@ -12755,7 +13010,7 @@ impl IcedCommApp {
     }
 
     fn record_deaddrop_stats_for_tab(tab: &mut OpenedTab, op_stats: &[DeaddropOpStat]) {
-        if tab.session.profile == "default" {
+        if !Self::is_persistent_contact_tab(tab) {
             return;
         }
 
@@ -12820,7 +13075,7 @@ impl IcedCommApp {
     }
 
     fn flush_deaddrop_stats_for_tab(tab: &mut OpenedTab, force: bool) {
-        if tab.session.profile == "default" {
+        if !Self::is_persistent_contact_tab(tab) {
             return;
         }
 
