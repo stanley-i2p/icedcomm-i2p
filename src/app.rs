@@ -786,6 +786,9 @@ pub struct IcedCommApp {
     pub opened_tabs: Vec<OpenedTab>,
     pub app_lock: Option<AppLock>,
     pub clipboard: Option<Clipboard>,
+    pub window_id: Option<window::Id>,
+    pub window_focused: bool,
+    pub unread_attention_active: bool,
 
     pub startup_gate: StartupGate,
     pub unlock_input: String,
@@ -963,6 +966,8 @@ pub enum Message {
     OutgoingImageEndSent(u64, Result<(), String>),
 
     WindowCloseRequested(window::Id),
+    WindowOpened(window::Id),
+    WindowFocusChanged(window::Id, bool),
     ProcessShutdownRequested,
     ExitAfterNotify(ShutdownTarget),
     Tick,
@@ -981,6 +986,9 @@ impl Default for IcedCommApp {
             opened_tabs: vec![],
             app_lock: None,
             clipboard: Clipboard::new().ok(),
+            window_id: None,
+            window_focused: true,
+            unread_attention_active: false,
 
             startup_gate: StartupGate::Locked,
             unlock_input: String::new(),
@@ -1278,6 +1286,18 @@ impl IcedCommApp {
         Subscription::batch(vec![
             time::every(Duration::from_millis(150)).map(|_| Message::Tick),
             window::close_requests().map(Message::WindowCloseRequested),
+            iced::event::listen_with(|event, _status, window_id| match event {
+                iced::Event::Window(window::Event::Opened { .. }) => {
+                    Some(Message::WindowOpened(window_id))
+                }
+                iced::Event::Window(window::Event::Focused) => {
+                    Some(Message::WindowFocusChanged(window_id, true))
+                }
+                iced::Event::Window(window::Event::Unfocused) => {
+                    Some(Message::WindowFocusChanged(window_id, false))
+                }
+                _ => None,
+            }),
             Subscription::run(Self::process_signal_stream),
         ])
     }
@@ -1653,6 +1673,25 @@ impl IcedCommApp {
             .and_then(|idx| self.opened_tabs.get_mut(idx))
     }
 
+    fn sync_unread_attention(&mut self) -> Option<Task<Message>> {
+        let should_request =
+            !self.window_focused && self.opened_tabs.iter().any(|tab| tab.meta.has_unread);
+
+        if should_request == self.unread_attention_active {
+            return None;
+        }
+
+        let Some(window_id) = self.window_id else {
+            return None;
+        };
+        self.unread_attention_active = should_request;
+
+        Some(window::request_user_attention(
+            window_id,
+            should_request.then_some(window::UserAttention::Informational),
+        ))
+    }
+
     fn store_active_runtime(&mut self) {
         let sidebar_profiles = self.session.profiles.clone();
         let sidebar_selected = self.session.selected_profile_idx;
@@ -1844,8 +1883,10 @@ impl IcedCommApp {
                         self.session.tabs = tabs;
                         self.session.active_tab_idx = Some(visible_idx);
 
-                        if let Some(tab) = self.opened_tabs.get_mut(real_idx) {
-                            tab.meta.has_unread = false;
+                        if self.window_focused {
+                            if let Some(tab) = self.opened_tabs.get_mut(real_idx) {
+                                tab.meta.has_unread = false;
+                            }
                         }
                     } else {
                         self.session.profiles = sidebar_profiles.clone();
@@ -2690,8 +2731,10 @@ impl IcedCommApp {
 
                     state.session.active_tab_idx = Some(idx);
 
-                    if let Some(tab) = state.opened_tabs.get_mut(real_idx) {
-                        tab.meta.has_unread = false;
+                    if state.window_focused {
+                        if let Some(tab) = state.opened_tabs.get_mut(real_idx) {
+                            tab.meta.has_unread = false;
+                        }
                     }
 
                     state.session.profile = state.opened_tabs[real_idx].meta.profile_name.clone();
@@ -4128,6 +4171,25 @@ impl IcedCommApp {
                 return state.begin_shutdown(ShutdownTarget::Window(window_id));
             }
 
+            Message::WindowOpened(window_id) => {
+                state.window_id = Some(window_id);
+                return state.sync_unread_attention().unwrap_or_else(Task::none);
+            }
+
+            Message::WindowFocusChanged(window_id, focused) => {
+                state.window_id = Some(window_id);
+                state.window_focused = focused;
+
+                if focused {
+                    if let Some(tab) = state.active_tab_mut() {
+                        tab.meta.has_unread = false;
+                    }
+                    state.refresh_visible_from_active_tab();
+                }
+
+                return state.sync_unread_attention().unwrap_or_else(Task::none);
+            }
+
             Message::ProcessShutdownRequested => {
                 return state.begin_shutdown(ShutdownTarget::Runtime);
             }
@@ -5054,6 +5116,9 @@ impl IcedCommApp {
                 }
 
                 state.refresh_visible_from_active_tab();
+                if let Some(task) = state.sync_unread_attention() {
+                    tasks.push(task);
+                }
 
                 if tasks.is_empty() {
                     return Task::none();
@@ -6355,6 +6420,8 @@ impl IcedCommApp {
                 blobs,
                 stats,
             ) => {
+                let mark_unread = !state.window_focused
+                    || state.active_tab().map(|tab| tab.id) != Some(tab_id);
                 if let Some(tab) = state.tab_by_id_mut(tab_id) {
                     Self::record_deaddrop_stats_for_tab(tab, &stats);
                     Self::flush_deaddrop_stats_for_tab(tab, false);
@@ -6364,6 +6431,7 @@ impl IcedCommApp {
                         poll_kind,
                         blobs,
                         &stats,
+                        mark_unread,
                     );
                 }
 
@@ -9482,6 +9550,7 @@ impl IcedCommApp {
         let mut tasks = Vec::new();
         //let is_active = self.session.active_tab_idx == Some(idx);
         let is_active = self.session.active_tab_idx == Some(Self::real_to_visible_tab_index(idx));
+        let window_focused = self.window_focused;
 
         let mut secure_session_just_established = false;
         let mut secure_session_tab_id: Option<u64> = None;
@@ -9832,7 +9901,7 @@ impl IcedCommApp {
 
                             Self::clear_incoming_image_state(tab);
 
-                            if !is_active {
+                            if !is_active || !window_focused {
                                 tab.meta.has_unread = true;
                             }
 
@@ -9901,7 +9970,7 @@ impl IcedCommApp {
                                         move |result| Message::SendFinished(tab_id, result),
                                     ));
 
-                                    if !is_active {
+                                    if !is_active || !window_focused {
                                         tab.meta.has_unread = true;
                                     }
                                 }
@@ -10772,6 +10841,7 @@ impl IcedCommApp {
     fn tick_group_tab(&mut self, idx: usize) -> Vec<Task<Message>> {
         let mut tasks = Vec::new();
         let is_active = self.session.active_tab_idx == Some(Self::real_to_visible_tab_index(idx));
+        let window_focused = self.window_focused;
         let tab_id;
         let mut roster_sync_needed = false;
         let mut received_roster_groups: Vec<String> = Vec::new();
@@ -11280,6 +11350,10 @@ impl IcedCommApp {
                                 group_received_acks: Vec::new(),
                             });
 
+                            if !is_active || !window_focused {
+                                tab.meta.has_unread = true;
+                            }
+
                             tab.session.log_lines.push(format!(
                                 "Group image received from {}: {image_name} ({} bytes)",
                                 peer.member.name, peer.incoming_image_received
@@ -11327,6 +11401,9 @@ impl IcedCommApp {
                                         group_expected_acks: Vec::new(),
                                         group_received_acks: Vec::new(),
                                     });
+                                    if !is_active || !window_focused {
+                                        tab.meta.has_unread = true;
+                                    }
                                     let ack = Frame {
                                         msg_type: MsgType::D,
                                         msg_id: Self::generate_msg_id_value(),
@@ -13161,6 +13238,7 @@ impl IcedCommApp {
         poll_kind: OfflinePollKind,
         blobs: Vec<(String, Vec<u8>)>,
         stats: &[DeaddropOpStat],
+        mark_unread: bool,
     ) {
         if blobs.is_empty() {
             Self::set_dd_status(&mut tab.session, "get_miss");
@@ -13227,7 +13305,9 @@ impl IcedCommApp {
                                     tab.session.seen_drop_msgs.push(blob_hash);
                                     got_valid_blob = true;
                                     tab.session.bubbles.push(Bubble::peer_offline(text));
-                                    tab.meta.has_unread = false;
+                                    if mark_unread {
+                                        tab.meta.has_unread = true;
+                                    }
                                     Self::set_dd_status(&mut tab.session, "get_hit");
                                     tab.session.log_lines.push(format!(
                                         "Offline message received from deaddrop {} at recv index {}.",
@@ -14175,7 +14255,11 @@ fn status_address_container_style() -> container::Style {
 }
 
 fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool, closing: bool) -> Element<'a, Message> {
-    if closing {
+    if tab.kind == TabKind::AppHome {
+        return Space::new().width(Length::Shrink).into();
+    }
+
+    let connection_marker: Element<'a, Message> = if closing {
         text("...")
             .size(13)
             .color(APP_TAB_DISABLED_TEXT)
@@ -14202,13 +14286,26 @@ fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool, closing: bool) -> Ele
         }
     } else if tab.connected {
         text("●").size(13).color(Color::from_rgb8(0, 200, 0)).into()
-    } else if tab.has_unread {
-        text("+")
-            .size(13)
-            .color(Color::from_rgb8(220, 220, 220))
-            .into()
     } else {
         Space::new().width(Length::Shrink).into()
+    };
+
+    if tab.has_unread && !closing {
+        row![
+            connection_marker,
+            text("\u{e145}")
+                .font(Font {
+                    family: font::Family::Name(APP_ICON_FONT_FAMILY),
+                    ..Font::default()
+                })
+                .size(13)
+                .color(Color::from_rgb8(220, 220, 220)),
+        ]
+        .spacing(3)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        connection_marker
     }
 }
 
