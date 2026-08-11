@@ -195,6 +195,12 @@ pub enum TabKind {
     Group,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionDirection {
+    Inbound,
+    Outbound,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatTab {
     pub kind: TabKind,
@@ -227,6 +233,10 @@ pub struct OpenedTab {
     pub deaddrop_last_poll_ms: u64,
     pub live_conn: Option<LiveConnection>,
     pub pending_conn: Option<LiveConnection>,
+    pub connect_in_flight: bool,
+    pub connect_generation: u64,
+    pub connect_peer: Option<String>,
+    pub connection_direction: Option<ConnectionDirection>,
     pub offline_index_sync_sent: bool,
 
     pub incoming_file: Option<StdFile>,
@@ -948,7 +958,7 @@ pub enum Message {
     GroupPublishReady(u64, Result<(), String>),
     GroupConnectFinished(u64, String, Result<(String, LiveConnection), String>),
     GroupIncomingAccepted(u64, Result<AcceptedIncoming, String>),
-    ConnectFinished(u64, Result<(String, LiveConnection), String>),
+    ConnectFinished(u64, u64, Result<(String, LiveConnection), String>),
     IncomingAccepted(u64, Result<AcceptedIncoming, String>),
     SendFinished(u64, Result<(), String>),
     CloseFinished(u64, Result<(), String>),
@@ -1169,6 +1179,10 @@ impl IcedCommApp {
             e2e: E2E::new(false),
             live_conn: None,
             pending_conn: None,
+            connect_in_flight: false,
+            connect_generation: 0,
+            connect_peer: None,
+            connection_direction: None,
             offline_index_sync_sent: false,
 
             incoming_file: None,
@@ -1293,7 +1307,7 @@ impl IcedCommApp {
         }
     }
 
-    fn group_local_prefers_outbound(my_b32: Option<&str>, peer_b32: &str) -> bool {
+    fn local_prefers_outbound(my_b32: Option<&str>, peer_b32: &str) -> bool {
         let Some(my_b32) = my_b32 else {
             return false;
         };
@@ -1302,6 +1316,49 @@ impl IcedCommApp {
             .to_ascii_lowercase()
             .cmp(&peer_b32.to_ascii_lowercase())
             .is_lt()
+    }
+
+    fn invalidate_one_to_one_connect(tab: &mut OpenedTab, cancel: bool) {
+        if cancel && tab.connect_in_flight {
+            tab.sam_runtime.cancel_connect();
+        }
+        tab.connect_in_flight = false;
+        tab.connect_peer = None;
+        tab.connect_generation = tab.connect_generation.wrapping_add(1);
+    }
+
+    fn start_one_to_one_connect(&mut self, peer: String) -> Option<Task<Message>> {
+        let tab = self.active_tab_mut()?;
+        if tab.meta.kind != TabKind::Chat
+            || tab.sam_runtime.is_closing()
+            || tab.session.offline_mode
+            || tab.connect_in_flight
+            || tab.live_conn.is_some()
+            || tab.pending_conn.is_some()
+        {
+            return None;
+        }
+
+        let (sam, connect_cancelled) = tab.sam_runtime.connect_parts()?;
+        tab.connect_generation = tab.connect_generation.wrapping_add(1);
+        let generation = tab.connect_generation;
+        let tab_id = tab.id;
+        tab.connect_in_flight = true;
+        tab.connect_peer = Some(peer.clone());
+        tab.connection_direction = None;
+        tab.session.network_status = NetworkStatus::Visible;
+
+        let task = Task::perform(
+            async move {
+                sam.stream_connect_cancelled(&peer, connect_cancelled)
+                    .await
+                    .map(|conn| (peer, conn))
+                    .map_err(|e| e.to_string())
+            },
+            move |result| Message::ConnectFinished(tab_id, generation, result),
+        );
+
+        Some(tab.sam_runtime.track_connect_task(task))
     }
 
     pub fn subscription(_state: &Self) -> Subscription<Message> {
@@ -1458,6 +1515,9 @@ impl IcedCommApp {
 
             tab.live_conn = None;
             tab.pending_conn = None;
+            tab.connect_in_flight = false;
+            tab.connect_peer = None;
+            tab.connection_direction = None;
             tab.session.sam_session_id = None;
             tab.session.live_ready = false;
             tab.session.pending_peer_addr = None;
@@ -2916,6 +2976,9 @@ impl IcedCommApp {
                     if let Some(tab) = state.opened_tabs.get_mut(idx) {
                         tab.live_conn = None;
                         tab.pending_conn = None;
+                        tab.connect_in_flight = false;
+                        tab.connect_peer = None;
+                        tab.connection_direction = None;
                         tab.session.live_ready = false;
                         tab.session.pending_peer_addr = None;
                         tab.session.pending_peer_dest_b64 = None;
@@ -3619,30 +3682,19 @@ impl IcedCommApp {
                 GuiAction::Connect => {
                     if state.session.profile != "default" {
                         if let Some(peer) = state.session.stored_peer.clone() {
-                            let (tab_id, sam, connect_cancelled) = match state.active_tab() {
-                                Some(tab) => match tab.sam_runtime.connect_parts() {
-                                    Some((sam, connect_cancelled)) => {
-                                        (tab.id, sam, connect_cancelled)
-                                    }
-                                    None => return Task::none(),
-                                },
-                                None => return Task::none(),
+                            let Some(connect_task) =
+                                state.start_one_to_one_connect(peer.clone())
+                            else {
+                                return Task::none();
                             };
 
                             state.session.pending_action = None;
                             state.session.action_param.clear();
+                            state.session.network_status = NetworkStatus::Visible;
                             state.post_system(format!("Connecting to locked peer {peer}..."));
                             state.store_active_runtime();
 
-                            return Task::perform(
-                                async move {
-                                    sam.stream_connect_cancelled(&peer, connect_cancelled)
-                                        .await
-                                        .map(|conn| (peer, conn))
-                                        .map_err(|e| e.to_string())
-                                },
-                                move |result| Message::ConnectFinished(tab_id, result),
-                            );
+                            return connect_task;
                         }
                     }
 
@@ -3985,30 +4037,19 @@ impl IcedCommApp {
                         GuiAction::Connect => {
                             if !value.is_empty() {
                                 let peer = value.clone();
-                                let (tab_id, sam, connect_cancelled) = match state.active_tab() {
-                                    Some(tab) => match tab.sam_runtime.connect_parts() {
-                                        Some((sam, connect_cancelled)) => {
-                                            (tab.id, sam, connect_cancelled)
-                                        }
-                                        None => return Task::none(),
-                                    },
-                                    None => return Task::none(),
+                                let Some(connect_task) =
+                                    state.start_one_to_one_connect(peer.clone())
+                                else {
+                                    return Task::none();
                                 };
 
                                 state.session.pending_action = None;
                                 state.session.action_param.clear();
+                                state.session.network_status = NetworkStatus::Visible;
                                 state.post_system(format!("Connecting to {peer}..."));
                                 state.store_active_runtime();
 
-                                return Task::perform(
-                                    async move {
-                                        sam.stream_connect_cancelled(&peer, connect_cancelled)
-                                            .await
-                                            .map(|conn| (peer, conn))
-                                            .map_err(|e| e.to_string())
-                                    },
-                                    move |result| Message::ConnectFinished(tab_id, result),
-                                );
+                                return connect_task;
                             }
                         }
 
@@ -4560,7 +4601,7 @@ impl IcedCommApp {
 
                             let my_b32 = group.meta.my_b32.as_deref();
                             let prefer_outbound =
-                                Self::group_local_prefers_outbound(my_b32, &member_b32);
+                                Self::local_prefers_outbound(my_b32, &member_b32);
 
                             let Some(peer) = group
                                 .peers
@@ -4704,85 +4745,200 @@ impl IcedCommApp {
                 return Task::none();
             }
 
-            Message::ConnectFinished(tab_id, result) => {
+            Message::ConnectFinished(tab_id, generation, result) => {
+                let msg_id_s = state.generate_msg_id();
+                let msg_id_k = state.generate_msg_id();
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                let mut rearm_accept = false;
+
                 match result {
                     Ok((peer, conn)) => {
-                        let msg_id_s = state.generate_msg_id();
-                        let msg_id_k = state.generate_msg_id();
+                        let mut handshake: Option<(String, Frame, Frame)> = None;
+                        let mut keep_outbound = false;
 
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
-                            if tab.sam_runtime.is_closing() {
-                                return Task::perform(
-                                    async move { conn.close().await.map_err(|e| e.to_string()) },
-                                    move |result| Message::CloseFinished(tab_id, result),
-                                );
-                            }
+                            let current_attempt = !tab.sam_runtime.is_closing()
+                                && tab.connect_in_flight
+                                && tab.connect_generation == generation
+                                && tab.connect_peer.as_deref() == Some(peer.as_str());
 
-                            tab.pending_conn = None;
-                            tab.session.pending_peer_addr = None;
-                            tab.session.pending_peer_dest_b64 = None;
-                            tab.session.accept_armed = false;
-                            tab.session.call_blink_on = true;
-                            tab.session.call_blink_ticks = 0;
-                            tab.e2e = E2E::new(tab.session.pq_enabled);
-                            tab.sam_runtime.register_stream(&conn);
-                            tab.live_conn = Some(conn.clone());
-
-                            tab.session.current_peer_addr = Some(peer.clone());
-                            tab.session.current_peer_dest_b64 = None;
-                            tab.session.peer_b32 = Some(peer.clone());
-                            tab.session.network_status = NetworkStatus::Visible;
-                            tab.session.live_ready = false;
-                            tab.session.offline_mode = false;
-                            tab.session.log_lines.push(format!(
-                                "Handshake sent to {peer}. Establishing secure session..."
-                            ));
-
-                            if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
-                                let line = format!("{my_dest_b64}\n");
-                                let frame_s = Frame {
-                                    msg_type: MsgType::S,
-                                    msg_id: msg_id_s,
-                                    payload: my_dest_b64.clone().into_bytes(),
-                                };
-
-                                let frame_k = Frame {
-                                    msg_type: MsgType::K,
-                                    msg_id: msg_id_k,
-                                    payload: tab.e2e.public_bytes(),
-                                };
-
-                                if let Some(idx) = state.find_tab_index_by_id(tab_id) {
-                                    state.sync_tab_meta(idx);
-                                }
-
-                                if state.active_tab().map(|t| t.id) == Some(tab_id) {
-                                    state.load_active_runtime();
-                                }
-
-                                return Task::batch(vec![Task::perform(
+                            if !current_attempt {
+                                let conn_to_close = conn.clone();
+                                tasks.push(Task::perform(
                                     async move {
-                                        conn.send_raw_line(&line)
-                                            .await
-                                            .map_err(|e| e.to_string())?;
-                                        conn.send_frame(&frame_s)
-                                            .await
-                                            .map_err(|e| e.to_string())?;
-                                        conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
+                                        conn_to_close.close().await.map_err(|e| e.to_string())
                                     },
-                                    move |result| Message::SendFinished(tab_id, result),
-                                )]);
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                ));
+                            } else {
+                                tab.connect_in_flight = false;
+                                tab.connect_peer = None;
+
+                                if tab.session.live_ready && tab.live_conn.is_some() {
+                                    tab.session.log_lines.push(format!(
+                                        "Connection collision: kept established session with {peer}."
+                                    ));
+                                    let conn_to_close = conn.clone();
+                                    tasks.push(Task::perform(
+                                        async move {
+                                            conn_to_close.close().await.map_err(|e| e.to_string())
+                                        },
+                                        move |result| Message::CloseFinished(tab_id, result),
+                                    ));
+                                } else if let Some(pending) = tab.pending_conn.clone() {
+                                    let same_peer = tab
+                                        .session
+                                        .pending_peer_addr
+                                        .as_deref()
+                                        .map(|pending_peer| pending_peer.eq_ignore_ascii_case(&peer))
+                                        .unwrap_or(false);
+                                    let prefer_outbound = same_peer
+                                        && Self::local_prefers_outbound(
+                                            tab.session.my_b32.as_deref(),
+                                            &peer,
+                                        );
+
+                                    if prefer_outbound {
+                                        tab.session.log_lines.push(format!(
+                                            "Connection collision: kept outbound session with {peer}."
+                                        ));
+                                        tab.pending_conn = None;
+                                        tab.session.pending_peer_addr = None;
+                                        tab.session.pending_peer_dest_b64 = None;
+                                        tab.session.call_blink_on = true;
+                                        tab.session.call_blink_ticks = 0;
+                                        rearm_accept = true;
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                pending.close().await.map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
+                                        keep_outbound = true;
+                                    } else {
+                                        let collision_message = if same_peer {
+                                            format!(
+                                                "Connection collision: kept inbound session with {peer}."
+                                            )
+                                        } else {
+                                            format!(
+                                                "Connect result ignored while another incoming call is pending from {}.",
+                                                tab.session
+                                                    .pending_peer_addr
+                                                    .as_deref()
+                                                    .unwrap_or("unknown peer")
+                                            )
+                                        };
+                                        tab.session.log_lines.push(collision_message);
+                                        let conn_to_close = conn.clone();
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                conn_to_close.close().await.map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
+                                    }
+                                } else if tab.live_conn.is_some() {
+                                    tab.session.log_lines.push(format!(
+                                        "Connection collision: kept existing session with {peer}."
+                                    ));
+                                    let conn_to_close = conn.clone();
+                                    tasks.push(Task::perform(
+                                        async move {
+                                            conn_to_close.close().await.map_err(|e| e.to_string())
+                                        },
+                                        move |result| Message::CloseFinished(tab_id, result),
+                                    ));
+                                } else {
+                                    keep_outbound = true;
+                                }
+
+                                if keep_outbound {
+                                    tab.e2e = E2E::new(tab.session.pq_enabled);
+                                    tab.sam_runtime.register_stream(&conn);
+                                    tab.live_conn = Some(conn.clone());
+                                    tab.connection_direction =
+                                        Some(ConnectionDirection::Outbound);
+                                    tab.session.current_peer_addr = Some(peer.clone());
+                                    tab.session.current_peer_dest_b64 = None;
+                                    tab.session.peer_b32 = Some(peer.clone());
+                                    tab.session.network_status = NetworkStatus::Visible;
+                                    tab.session.live_ready = false;
+                                    tab.session.offline_mode = false;
+                                    tab.session.log_lines.push(format!(
+                                        "Handshake sent to {peer}. Establishing secure session..."
+                                    ));
+
+                                    if let Some(my_dest_b64) =
+                                        tab.session.my_pub_dest_b64.clone()
+                                    {
+                                        let line = format!("{my_dest_b64}\n");
+                                        let frame_s = Frame {
+                                            msg_type: MsgType::S,
+                                            msg_id: msg_id_s,
+                                            payload: my_dest_b64.into_bytes(),
+                                        };
+                                        let frame_k = Frame {
+                                            msg_type: MsgType::K,
+                                            msg_id: msg_id_k,
+                                            payload: tab.e2e.public_bytes(),
+                                        };
+                                        handshake = Some((line, frame_s, frame_k));
+                                    }
+                                } else if tab.pending_conn.is_none()
+                                    && tab.live_conn.is_none()
+                                {
+                                    tab.connection_direction = None;
+                                    tab.session.network_status = NetworkStatus::LocalOk;
+                                }
                             }
                         } else {
-                            return Task::perform(
-                                async move { conn.close().await.map_err(|e| e.to_string()) },
+                            let conn_to_close = conn.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    conn_to_close.close().await.map_err(|e| e.to_string())
+                                },
                                 move |result| Message::CloseFinished(tab_id, result),
-                            );
+                            ));
+                        }
+
+                        if let Some((line, frame_s, frame_k)) = handshake {
+                            tasks.push(Task::perform(
+                                async move {
+                                    conn.send_raw_line(&line)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_frame(&frame_s)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
+                                },
+                                move |result| Message::SendFinished(tab_id, result),
+                            ));
                         }
                     }
                     Err(err) => {
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
-                            tab.session.log_lines.push(format!("Connect failed: {err}"));
+                            if tab.connect_in_flight && tab.connect_generation == generation {
+                                tab.connect_in_flight = false;
+                                tab.connect_peer = None;
+                                if tab.live_conn.is_none() && tab.pending_conn.is_none() {
+                                    tab.connection_direction = None;
+                                    tab.session.network_status = NetworkStatus::LocalOk;
+                                }
+                                tab.session.log_lines.push(format!("Connect failed: {err}"));
+                            }
+                        }
+                    }
+                }
+
+                if rearm_accept {
+                    if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                        tab.session.accept_armed = true;
+                        if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                            tasks.push(Self::incoming_accept_task_from_parts(
+                                tab_id, sam, cancelled,
+                            ));
                         }
                     }
                 }
@@ -4795,7 +4951,7 @@ impl IcedCommApp {
                     state.load_active_runtime();
                 }
 
-                return Task::none();
+                return Task::batch(tasks);
             }
 
             Message::GroupIncomingAccepted(tab_id, result) => match result {
@@ -4841,7 +4997,7 @@ impl IcedCommApp {
                         };
                         let my_b32 = group.meta.my_b32.as_deref();
                         let prefer_outbound =
-                            Self::group_local_prefers_outbound(my_b32, &incoming.peer_b32);
+                            Self::local_prefers_outbound(my_b32, &incoming.peer_b32);
 
                         let peer_idx = if let Some(peer_idx) = group
                             .peers
@@ -4993,6 +5149,8 @@ impl IcedCommApp {
             },
 
             Message::IncomingAccepted(tab_id, result) => {
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                let mut rearm_accept = false;
                 match result {
                     Ok(incoming) => {
                         if state
@@ -5010,45 +5168,135 @@ impl IcedCommApp {
                         }
 
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
-                            tab.e2e = E2E::new(tab.session.pq_enabled);
-                            tab.sam_runtime.register_stream(&incoming.conn);
-                            tab.pending_conn = Some(incoming.conn);
-                            tab.session.pending_peer_addr = Some(incoming.peer_b32.clone());
-                            tab.session.pending_peer_dest_b64 =
-                                Some(incoming.peer_dest_b64.clone());
+                            let outbound_peer = tab
+                                .connect_peer
+                                .as_deref()
+                                .or(tab.session.current_peer_addr.as_deref());
+                            let same_outbound_peer = outbound_peer
+                                .map(|peer| peer.eq_ignore_ascii_case(&incoming.peer_b32))
+                                .unwrap_or(false);
+                            let has_outbound_candidate = tab.connect_in_flight
+                                || (tab.live_conn.is_some()
+                                    && tab.connection_direction
+                                        == Some(ConnectionDirection::Outbound));
+                            let keep_established = tab.session.live_ready
+                                && tab.live_conn.is_some();
+                            let keep_existing_pending = tab.pending_conn.is_some();
+                            let prefer_outbound = same_outbound_peer
+                                && Self::local_prefers_outbound(
+                                    tab.session.my_b32.as_deref(),
+                                    &incoming.peer_b32,
+                                );
 
-                            let tofu_ok = match &tab.session.stored_peer_dest_b64 {
-                                Some(stored) => stored == &incoming.peer_dest_b64,
-                                None => true,
-                            };
+                            if keep_established
+                                || keep_existing_pending
+                                || (has_outbound_candidate
+                                    && (!same_outbound_peer || prefer_outbound))
+                            {
+                                let reason = if keep_established {
+                                    format!(
+                                        "Connection collision: kept established session with {}.",
+                                        incoming.peer_b32
+                                    )
+                                } else if keep_existing_pending {
+                                    format!(
+                                        "Connection collision: kept existing incoming call from {}.",
+                                        tab.session
+                                            .pending_peer_addr
+                                            .as_deref()
+                                            .unwrap_or("unknown peer")
+                                    )
+                                } else if same_outbound_peer {
+                                    format!(
+                                        "Connection collision: kept outbound session with {}.",
+                                        incoming.peer_b32
+                                    )
+                                } else {
+                                    format!(
+                                        "Incoming call from {} rejected while connecting to another peer.",
+                                        incoming.peer_b32
+                                    )
+                                };
+                                tab.session.log_lines.push(reason);
+                                let conn_to_close = incoming.conn.clone();
+                                tasks.push(Task::perform(
+                                    async move {
+                                        conn_to_close.close().await.map_err(|e| e.to_string())
+                                    },
+                                    move |result| Message::CloseFinished(tab_id, result),
+                                ));
+                                rearm_accept = !keep_existing_pending;
+                            } else {
+                                if has_outbound_candidate {
+                                    tab.session.log_lines.push(format!(
+                                        "Connection collision: kept inbound session with {}.",
+                                        incoming.peer_b32
+                                    ));
+                                    Self::invalidate_one_to_one_connect(tab, true);
+                                }
 
-                            if tofu_ok {
-                                if tab.session.stored_peer_dest_b64.is_some() {
-                                    tab.session.tofu_verified = true;
-                                    tab.session.tofu_mismatch = false;
+                                if let Some(old_conn) = tab.live_conn.take() {
+                                    tasks.push(Task::perform(
+                                        async move {
+                                            old_conn.close().await.map_err(|e| e.to_string())
+                                        },
+                                        move |result| Message::CloseFinished(tab_id, result),
+                                    ));
+                                }
+
+                                tab.session.current_peer_addr = None;
+                                tab.session.current_peer_dest_b64 = None;
+                                tab.session.peer_b32 = None;
+                                tab.session.live_ready = false;
+                                tab.session.heartbeat_last_rx_ms = 0;
+                                tab.session.heartbeat_last_ping_ms = 0;
+                                tab.e2e = E2E::new(tab.session.pq_enabled);
+                                tab.sam_runtime.register_stream(&incoming.conn);
+                                tab.pending_conn = Some(incoming.conn);
+                                tab.connection_direction = Some(ConnectionDirection::Inbound);
+                                tab.session.pending_peer_addr = Some(incoming.peer_b32.clone());
+                                tab.session.pending_peer_dest_b64 =
+                                    Some(incoming.peer_dest_b64.clone());
+
+                                let tofu_ok = match &tab.session.stored_peer_dest_b64 {
+                                    Some(stored) => stored == &incoming.peer_dest_b64,
+                                    None => true,
+                                };
+
+                                if tofu_ok {
+                                    if tab.session.stored_peer_dest_b64.is_some() {
+                                        tab.session.tofu_verified = true;
+                                        tab.session.tofu_mismatch = false;
+                                    } else {
+                                        tab.session.tofu_verified = false;
+                                        tab.session.tofu_mismatch = false;
+                                    }
                                 } else {
                                     tab.session.tofu_verified = false;
-                                    tab.session.tofu_mismatch = false;
+                                    tab.session.tofu_mismatch = true;
+                                    tab.session.log_lines.push(format!(
+                                        "TOFU mismatch for incoming peer: {}",
+                                        incoming.peer_b32
+                                    ));
                                 }
-                            } else {
-                                tab.session.tofu_verified = false;
-                                tab.session.tofu_mismatch = true;
+
+                                tab.session.accept_armed = false;
+                                tab.session.call_blink_on = true;
+                                tab.session.call_blink_ticks = 0;
                                 tab.session.log_lines.push(format!(
-                                    "TOFU mismatch for incoming peer: {}",
+                                    "Incoming call from {}. Awaiting Accept / Decline.",
                                     incoming.peer_b32
                                 ));
+                                tab.meta.has_incoming = true;
                             }
-
-                            tab.session.accept_armed = false;
-                            tab.session.call_blink_on = true;
-                            tab.session.call_blink_ticks = 0;
-                            tab.session.log_lines.push(format!(
-                                "Incoming call from {}. Awaiting Accept / Decline.",
-                                incoming.peer_b32
-                            ));
-                            tab.meta.has_incoming = true;
                         } else {
-                            return Task::none();
+                            let conn_to_close = incoming.conn.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    conn_to_close.close().await.map_err(|e| e.to_string())
+                                },
+                                move |result| Message::CloseFinished(tab_id, result),
+                            ));
                         }
                     }
                     Err(err) => {
@@ -5061,6 +5309,17 @@ impl IcedCommApp {
                     }
                 }
 
+                if rearm_accept {
+                    if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                        tab.session.accept_armed = true;
+                        if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
+                            tasks.push(Self::incoming_accept_task_from_parts(
+                                tab_id, sam, cancelled,
+                            ));
+                        }
+                    }
+                }
+
                 if let Some(idx) = state.find_tab_index_by_id(tab_id) {
                     state.sync_tab_meta(idx);
                 }
@@ -5069,7 +5328,7 @@ impl IcedCommApp {
                     state.load_active_runtime();
                 }
 
-                return Task::none();
+                return Task::batch(tasks);
             }
 
             Message::SendFinished(tab_id, result) => {
@@ -8196,6 +8455,10 @@ impl IcedCommApp {
     }
 
     fn reset_connection_state(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            Self::invalidate_one_to_one_connect(tab, true);
+            tab.connection_direction = None;
+        }
         self.set_active_live_conn(None);
         self.set_active_pending_conn(None);
         self.session.current_peer_addr = None;
@@ -9409,6 +9672,10 @@ impl IcedCommApp {
     }
 
     fn mock_disconnect(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            Self::invalidate_one_to_one_connect(tab, true);
+            tab.connection_direction = None;
+        }
         self.session.current_peer_addr = None;
         self.session.current_peer_dest_b64 = None;
         self.session.peer_b32 = None;
@@ -9465,6 +9732,9 @@ impl IcedCommApp {
 
     fn decline_pending(&mut self) {
         self.set_active_pending_conn(None);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.connection_direction = None;
+        }
         self.session.pending_peer_addr = None;
         self.session.pending_peer_dest_b64 = None;
 
@@ -9484,6 +9754,8 @@ impl IcedCommApp {
     }
 
     fn clear_pending_dead_call(tab: &mut OpenedTab, message: &str) {
+        Self::invalidate_one_to_one_connect(tab, true);
+        tab.connection_direction = None;
         tab.pending_conn = None;
         tab.session.pending_peer_addr = None;
         tab.session.pending_peer_dest_b64 = None;
@@ -9571,6 +9843,8 @@ impl IcedCommApp {
         }
 
         if let Some(tab) = self.active_tab_mut() {
+            Self::invalidate_one_to_one_connect(tab, true);
+            tab.connection_direction = None;
             tab.live_conn = None;
             tab.pending_conn = None;
             tab.session.live_ready = false;
@@ -9615,6 +9889,8 @@ impl IcedCommApp {
         self.session.call_blink_ticks = 0;
 
         if let Some(tab) = self.active_tab_mut() {
+            Self::invalidate_one_to_one_connect(tab, true);
+            tab.connection_direction = None;
             tab.live_conn = None;
             tab.pending_conn = None;
             tab.session.offline_mode = false;
@@ -10274,6 +10550,7 @@ impl IcedCommApp {
                             Ok(body) => {
                                 if body == "__SIGNAL__:QUIT" {
                                     tab.live_conn = None;
+                                    tab.connection_direction = None;
                                     tab.session.current_peer_addr = None;
                                     tab.session.current_peer_dest_b64 = None;
                                     tab.session.peer_b32 = None;
@@ -10354,6 +10631,7 @@ impl IcedCommApp {
                                             );
 
                                             tab.live_conn = None;
+                                            tab.connection_direction = None;
                                             tab.session.current_peer_addr = None;
                                             tab.session.current_peer_dest_b64 = None;
                                             tab.session.peer_b32 = None;
@@ -10648,6 +10926,7 @@ impl IcedCommApp {
                         >= HEARTBEAT_TIMEOUT_MS
                     {
                         tab.live_conn = None;
+                        tab.connection_direction = None;
                         tab.session.current_peer_addr = None;
                         tab.session.current_peer_dest_b64 = None;
                         tab.session.peer_b32 = None;
@@ -10688,6 +10967,7 @@ impl IcedCommApp {
 
                 if conn.is_closed() && !conn.has_pending_frames() {
                     tab.live_conn = None;
+                    tab.connection_direction = None;
                     tab.session.current_peer_addr = None;
                     tab.session.current_peer_dest_b64 = None;
                     tab.session.peer_b32 = None;
@@ -10747,6 +11027,7 @@ impl IcedCommApp {
                             Ok(body) => {
                                 if body == "__SIGNAL__:QUIT" {
                                     tab.pending_conn = None;
+                                    tab.connection_direction = None;
                                     tab.session.pending_peer_addr = None;
                                     tab.session.pending_peer_dest_b64 = None;
 
@@ -10805,6 +11086,7 @@ impl IcedCommApp {
                     let had_visible_call = tab.session.pending_peer_addr.is_some();
 
                     tab.pending_conn = None;
+                    tab.connection_direction = None;
                     tab.session.pending_peer_addr = None;
                     tab.session.pending_peer_dest_b64 = None;
 
@@ -12521,7 +12803,11 @@ impl IcedCommApp {
     }
 
     fn has_active_connection_attempt(&self) -> bool {
-        self.active_live_conn().is_some() || self.active_pending_conn().is_some()
+        self.active_tab()
+            .map(|tab| {
+                tab.connect_in_flight || tab.live_conn.is_some() || tab.pending_conn.is_some()
+            })
+            .unwrap_or(false)
     }
 
     fn new_app_home_tab() -> ChatTab {
