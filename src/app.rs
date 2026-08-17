@@ -4,7 +4,12 @@ use crate::constants::{
 };
 use crate::deaddrop::{DeadDropClient, DeaddropOpStat};
 use crate::e2e::E2E;
+use crate::group_invite::{self, PrivateJoinCredential, PrivateJoinProof};
 use crate::protocol::{Frame, MsgType};
+use crate::rendezvous::{
+    self, IssuedAccess as RendezvousIssuedAccess, IssuedState as RendezvousIssuedState,
+    OutgoingAccess as RendezvousOutgoingAccess, PendingRequest as RendezvousPendingRequest,
+};
 use crate::sam::{AcceptedIncoming, LiveConnection, SamClient, SamInitResult};
 use crate::sam_runtime::SamRuntime;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -165,8 +170,8 @@ const SAM_MONITOR_INTERVAL_MS: u64 = 5_000;
 const SAM_MONITOR_PROBE_TIMEOUT_MS: u64 = 4_000;
 const SAM_MONITOR_FAILURE_LIMIT: u8 = 3;
 const SAM_SHUTDOWN_COUNTDOWN_MS: u64 = 10_000;
-const MAX_LOG_LINES: usize = 5_000;
-const LOG_TRIM_BATCH: usize = 500;
+const MAX_LOG_LINES: usize = 500;
+const LOG_TRIM_BATCH: usize = 50;
 
 fn current_utc_hms() -> String {
     let secs = SystemTime::now()
@@ -319,6 +324,12 @@ struct GroupControlMessage {
     token: String,
     b32: String,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_proof_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_proof_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -629,6 +640,9 @@ pub struct SessionState {
     pub group_member_b32_input: String,
     pub group_invite_string_input: String,
     pub group_generated_invite_string: String,
+    pub group_private_request_string: String,
+    pub group_private_request_input: String,
+    pub group_generated_private_invite_string: String,
     pub group_status: String,
     pub tabs: Vec<ChatTab>,
     pub active_tab_idx: Option<usize>,
@@ -663,6 +677,15 @@ pub struct SessionState {
 
     pub pending_action: Option<GuiAction>,
     pub action_param: String,
+
+    pub show_rendezvous_panel: bool,
+    pub rendezvous_input: String,
+    pub rendezvous_output: String,
+    pub rendezvous_status: String,
+    pub rendezvous_request: Option<RendezvousPendingRequest>,
+    pub rendezvous_issued: Option<RendezvousIssuedAccess>,
+    pub rendezvous_outgoing: Option<RendezvousOutgoingAccess>,
+    pub pending_rendezvous_request_id: Option<[u8; 16]>,
 
     pub input: String,
     pub input_editor: text_editor::Content,
@@ -724,6 +747,9 @@ impl Default for SessionState {
             group_member_b32_input: String::new(),
             group_invite_string_input: String::new(),
             group_generated_invite_string: String::new(),
+            group_private_request_string: String::new(),
+            group_private_request_input: String::new(),
+            group_generated_private_invite_string: String::new(),
             group_status: "Groups use separate I2P identities and live fan-out only.".into(),
             tabs: vec![],
             active_tab_idx: None,
@@ -754,6 +780,14 @@ impl Default for SessionState {
             call_blink_on: true,
             call_blink_ticks: 0,
             action_param: String::new(),
+            show_rendezvous_panel: false,
+            rendezvous_input: String::new(),
+            rendezvous_output: String::new(),
+            rendezvous_status: "Optional one-time bootstrap for a transient call.".into(),
+            rendezvous_request: None,
+            rendezvous_issued: None,
+            rendezvous_outgoing: None,
+            pending_rendezvous_request_id: None,
             input: String::new(),
             input_editor: text_editor::Content::new(),
             reply_to: None,
@@ -925,6 +959,14 @@ pub enum Message {
     CopyLogsPressed,
     ToggleLogsPressed,
     ToggleGroupPanelPressed,
+    ToggleRendezvousPanelPressed,
+    RendezvousInputChanged(String),
+    GenerateRendezvousRequestPressed,
+    AnswerRendezvousRequestPressed,
+    ConnectRendezvousResponsePressed,
+    CopyRendezvousOutputPressed,
+    ClearRendezvousPressed,
+    RevokeRendezvousPressed,
     DdServerInputChanged(String),
     DdServerAddPressed,
     DdServerDeletePressed(usize),
@@ -947,6 +989,12 @@ pub enum Message {
     GroupInviteStringInputChanged(String),
     GenerateGroupInvitePressed,
     CopyGeneratedGroupInvitePressed,
+    GeneratePrivateGroupRequestPressed,
+    CopyPrivateGroupRequestPressed,
+    PrivateGroupRequestInputChanged(String),
+    GeneratePrivateGroupInvitePressed,
+    CopyGeneratedPrivateGroupInvitePressed,
+    RevokePrivateGroupInvitePressed(String),
     CopyGroupInviteStringPressed,
     ImportGroupInviteStringPressed,
     GroupInviteExportPathChosen(Option<PathBuf>),
@@ -1861,6 +1909,12 @@ impl IcedCommApp {
         let group_member_b32_input = self.session.group_member_b32_input.clone();
         let group_invite_string_input = self.session.group_invite_string_input.clone();
         let group_generated_invite_string = self.session.group_generated_invite_string.clone();
+        let group_private_request_string = self.session.group_private_request_string.clone();
+        let group_private_request_input = self.session.group_private_request_input.clone();
+        let group_generated_private_invite_string = self
+            .session
+            .group_generated_private_invite_string
+            .clone();
         let group_status = self.session.group_status.clone();
         let tabs = self.session.tabs.clone();
         let active_idx = self.session.active_tab_idx;
@@ -1878,6 +1932,9 @@ impl IcedCommApp {
         snapshot.group_member_b32_input.clear();
         snapshot.group_invite_string_input.clear();
         snapshot.group_generated_invite_string.clear();
+        snapshot.group_private_request_string.clear();
+        snapshot.group_private_request_input.clear();
+        snapshot.group_generated_private_invite_string.clear();
         snapshot.group_status.clear();
 
         if let Some(tab) = self.active_tab_mut() {
@@ -1899,6 +1956,10 @@ impl IcedCommApp {
         self.session.group_member_b32_input = group_member_b32_input;
         self.session.group_invite_string_input = group_invite_string_input;
         self.session.group_generated_invite_string = group_generated_invite_string;
+        self.session.group_private_request_string = group_private_request_string;
+        self.session.group_private_request_input = group_private_request_input;
+        self.session.group_generated_private_invite_string =
+            group_generated_private_invite_string;
         self.session.group_status = group_status;
         self.session.tabs = tabs;
         self.session.active_tab_idx = active_idx;
@@ -1917,6 +1978,12 @@ impl IcedCommApp {
         let group_member_b32_input = self.session.group_member_b32_input.clone();
         let group_invite_string_input = self.session.group_invite_string_input.clone();
         let group_generated_invite_string = self.session.group_generated_invite_string.clone();
+        let group_private_request_string = self.session.group_private_request_string.clone();
+        let group_private_request_input = self.session.group_private_request_input.clone();
+        let group_generated_private_invite_string = self
+            .session
+            .group_generated_private_invite_string
+            .clone();
         let group_status = self.session.group_status.clone();
         let tabs = self.session.tabs.clone();
         let active_idx = self.session.active_tab_idx;
@@ -1949,6 +2016,10 @@ impl IcedCommApp {
             self.session.group_member_b32_input = group_member_b32_input;
             self.session.group_invite_string_input = group_invite_string_input;
             self.session.group_generated_invite_string = group_generated_invite_string;
+            self.session.group_private_request_string = group_private_request_string;
+            self.session.group_private_request_input = group_private_request_input;
+            self.session.group_generated_private_invite_string =
+                group_generated_private_invite_string;
             self.session.group_status = group_status;
             self.session.tabs = tabs;
             self.session.active_tab_idx = active_idx;
@@ -1976,6 +2047,12 @@ impl IcedCommApp {
         let group_member_b32_input = self.session.group_member_b32_input.clone();
         let group_invite_string_input = self.session.group_invite_string_input.clone();
         let group_generated_invite_string = self.session.group_generated_invite_string.clone();
+        let group_private_request_string = self.session.group_private_request_string.clone();
+        let group_private_request_input = self.session.group_private_request_input.clone();
+        let group_generated_private_invite_string = self
+            .session
+            .group_generated_private_invite_string
+            .clone();
         let group_status = self.session.group_status.clone();
 
         self.session.tabs = std::iter::once(Self::new_app_home_tab())
@@ -1996,6 +2073,10 @@ impl IcedCommApp {
                 self.session.group_member_b32_input = group_member_b32_input.clone();
                 self.session.group_invite_string_input = group_invite_string_input.clone();
                 self.session.group_generated_invite_string = group_generated_invite_string.clone();
+                self.session.group_private_request_string = group_private_request_string.clone();
+                self.session.group_private_request_input = group_private_request_input.clone();
+                self.session.group_generated_private_invite_string =
+                    group_generated_private_invite_string.clone();
                 self.session.group_status = group_status.clone();
                 self.session.active_tab_idx = Some(0);
                 self.session.profile = "__app__".into();
@@ -2035,6 +2116,12 @@ impl IcedCommApp {
                         self.session.group_invite_string_input = group_invite_string_input.clone();
                         self.session.group_generated_invite_string =
                             group_generated_invite_string.clone();
+                        self.session.group_private_request_string =
+                            group_private_request_string.clone();
+                        self.session.group_private_request_input =
+                            group_private_request_input.clone();
+                        self.session.group_generated_private_invite_string =
+                            group_generated_private_invite_string.clone();
                         self.session.group_status = group_status.clone();
                         self.session.tabs = tabs;
                         self.session.active_tab_idx = Some(visible_idx);
@@ -2058,6 +2145,12 @@ impl IcedCommApp {
                         self.session.group_invite_string_input = group_invite_string_input.clone();
                         self.session.group_generated_invite_string =
                             group_generated_invite_string.clone();
+                        self.session.group_private_request_string =
+                            group_private_request_string.clone();
+                        self.session.group_private_request_input =
+                            group_private_request_input.clone();
+                        self.session.group_generated_private_invite_string =
+                            group_generated_private_invite_string.clone();
                         self.session.group_status = group_status.clone();
                         self.session.active_tab_idx = Some(0);
                         self.session.profile = "__app__".into();
@@ -2174,7 +2267,8 @@ impl IcedCommApp {
     fn message_editor_key_binding(
         key_press: text_editor::KeyPress,
     ) -> Option<text_editor::Binding<Message>> {
-        let is_paste = key_press.modifiers.command()
+        let is_paste = matches!(key_press.status, text_editor::Status::Focused { .. })
+            && key_press.modifiers.command()
             && !key_press.modifiers.alt()
             && key_press.key.to_latin(key_press.physical_key) == Some('v');
 
@@ -2339,6 +2433,8 @@ impl IcedCommApp {
                     state.session.group_display_name_input =
                         state.session.groups[idx].my_name.clone();
                     state.session.group_generated_invite_string.clear();
+                    state.session.group_private_request_input.clear();
+                    state.session.group_generated_private_invite_string.clear();
                     state.session.group_status.clear();
                 }
                 return Task::none();
@@ -2422,6 +2518,62 @@ impl IcedCommApp {
                 return Task::none();
             }
 
+            Message::GeneratePrivateGroupRequestPressed => {
+                let now_ms = Self::now_epoch_millis();
+                match group_invite::generate_request(now_ms) {
+                    Ok((pending_request, request_string)) => {
+                        let mut pending = match storage::load_pending_private_group_invites() {
+                            Ok(pending) => pending,
+                            Err(err) => {
+                                state.session.group_status = format!(
+                                    "Load pending private group requests failed: {err}"
+                                );
+                                return Task::none();
+                            }
+                        };
+                        pending.retain(|request| request.expires_ms > now_ms);
+                        pending.retain(|request| request.request_id != pending_request.request_id);
+                        pending.push(pending_request);
+                        match storage::save_pending_private_group_invites(&pending) {
+                            Ok(()) => {
+                                state.session.group_private_request_string = request_string;
+                                state.session.group_status =
+                                    "Generated a private group invite request.".into();
+                            }
+                            Err(err) => {
+                                state.session.group_status = format!(
+                                    "Save pending private group request failed: {err}"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        state.session.group_status =
+                            format!("Private group request generation failed: {err}");
+                    }
+                }
+                return Task::none();
+            }
+
+            Message::CopyPrivateGroupRequestPressed => {
+                if state.session.group_private_request_string.trim().is_empty() {
+                    state.session.group_status =
+                        "Generate a private group request first.".into();
+                    return Task::none();
+                }
+                state.copy_text_to_clipboard(
+                    state.session.group_private_request_string.clone(),
+                    "private group invite request",
+                );
+                state.session.group_status = "Copied private group invite request.".into();
+                return Task::none();
+            }
+
+            Message::PrivateGroupRequestInputChanged(value) => {
+                state.session.group_private_request_input = value;
+                return Task::none();
+            }
+
             Message::CreateGroupPressed => {
                 let name = state.session.group_name_input.trim().to_string();
 
@@ -2466,6 +2618,8 @@ impl IcedCommApp {
                             .unwrap_or_default();
                         state.session.group_name_input.clear();
                         state.session.group_generated_invite_string.clear();
+                        state.session.group_private_request_input.clear();
+                        state.session.group_generated_private_invite_string.clear();
                         state.session.group_status = format!("Created group: {name}");
                     }
                     Err(err) => {
@@ -2705,6 +2859,118 @@ impl IcedCommApp {
                 return Task::none();
             }
 
+            Message::GeneratePrivateGroupInvitePressed => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+                let Some(group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+                if !Self::group_is_admin(&group) {
+                    state.session.group_status =
+                        "Only the group admin can generate private invites.".into();
+                    return Task::none();
+                }
+
+                let request = state.session.group_private_request_input.trim().to_string();
+                if request.is_empty() {
+                    state.session.group_status =
+                        "Paste a private group request first.".into();
+                    return Task::none();
+                }
+
+                match Self::encode_private_group_invite_string(&group, &request) {
+                    Ok((updated_group, invite_string)) => {
+                        if let Some(idx) = state.session.groups.iter().position(|existing| {
+                            storage::group_storage_key(existing)
+                                == storage::group_storage_key(&updated_group)
+                        }) {
+                            state.session.groups[idx] = updated_group.clone();
+                        }
+                        state.update_open_group_roster(&updated_group);
+                        state.session.group_generated_private_invite_string = invite_string;
+                        state.session.group_status =
+                            "Generated a recipient-bound private group invite.".into();
+                    }
+                    Err(err) => {
+                        state.session.group_status =
+                            format!("Private group invite generation failed: {err}");
+                    }
+                }
+                return Task::none();
+            }
+
+            Message::CopyGeneratedPrivateGroupInvitePressed => {
+                if state
+                    .session
+                    .group_generated_private_invite_string
+                    .trim()
+                    .is_empty()
+                {
+                    state.session.group_status =
+                        "Generate a private group invite first.".into();
+                    return Task::none();
+                }
+                state.copy_text_to_clipboard(
+                    state.session.group_generated_private_invite_string.clone(),
+                    "private group invite",
+                );
+                state.session.group_status = "Copied private group invite.".into();
+                return Task::none();
+            }
+
+            Message::RevokePrivateGroupInvitePressed(request_id) => {
+                let Some(group_idx) = state.session.selected_group_idx else {
+                    state.session.group_status = "Select a group first.".into();
+                    return Task::none();
+                };
+                let Some(mut group) = state.session.groups.get(group_idx).cloned() else {
+                    state.session.group_status = "Selected group is missing.".into();
+                    return Task::none();
+                };
+                if !Self::group_is_admin(&group) {
+                    state.session.group_status =
+                        "Only the group admin can revoke private invites.".into();
+                    return Task::none();
+                }
+
+                let before = group.issued_invites.len();
+                group.issued_invites.retain(|issued| {
+                    issued
+                        .private_binding
+                        .as_ref()
+                        .map(|binding| binding.request_id != request_id)
+                        .unwrap_or(true)
+                });
+                if group.issued_invites.len() == before {
+                    state.session.group_status = "Private invite is no longer pending.".into();
+                    return Task::none();
+                }
+
+                match storage::save_group_meta(&group) {
+                    Ok(()) => {
+                        state.session.groups[group_idx] = group.clone();
+                        state.update_open_group_roster(&group);
+                        if group_invite::response_request_id(
+                            &state.session.group_generated_private_invite_string,
+                        )
+                        .map(|generated_id| generated_id == request_id)
+                        .unwrap_or(false)
+                        {
+                            state.session.group_generated_private_invite_string.clear();
+                        }
+                        state.session.group_status = "Revoked private group invite.".into();
+                    }
+                    Err(err) => {
+                        state.session.group_status =
+                            format!("Private group invite revocation failed: {err}");
+                    }
+                }
+                return Task::none();
+            }
+
             Message::ImportGroupInviteStringPressed => {
                 let invite_string = state.session.group_invite_string_input.trim().to_string();
 
@@ -2713,7 +2979,22 @@ impl IcedCommApp {
                     return Task::none();
                 }
 
-                match Self::import_group_invite_string(&invite_string) {
+                let import_result = match group_invite::input_kind(
+                    &invite_string,
+                    GROUP_INVITE_STRING_PREFIX,
+                ) {
+                    group_invite::InputKind::Shareable => {
+                        Self::import_group_invite_string(&invite_string)
+                    }
+                    group_invite::InputKind::Private => {
+                        Self::import_private_group_invite_string(&invite_string)
+                    }
+                    group_invite::InputKind::Unknown => {
+                        Err("group invite string has an unsupported prefix".into())
+                    }
+                };
+
+                match import_result {
                     Ok(group_key) => match storage::load_groups() {
                         Ok(groups) => {
                             state.session.groups = groups;
@@ -2728,6 +3009,8 @@ impl IcedCommApp {
                                 .map(|group| group.my_name.clone())
                                 .unwrap_or_default();
                             state.session.group_generated_invite_string.clear();
+                            state.session.group_private_request_input.clear();
+                            state.session.group_generated_private_invite_string.clear();
                             if let Some(group) = state
                                 .session
                                 .groups
@@ -2857,6 +3140,8 @@ impl IcedCommApp {
                                 .map(|group| group.my_name.clone())
                                 .unwrap_or_default();
                             state.session.group_generated_invite_string.clear();
+                            state.session.group_private_request_input.clear();
+                            state.session.group_generated_private_invite_string.clear();
                             if let Some(group) = state
                                 .session
                                 .groups
@@ -3089,6 +3374,18 @@ impl IcedCommApp {
                                         .session
                                         .group_generated_invite_string
                                         .clone(),
+                                    group_private_request_string: state
+                                        .session
+                                        .group_private_request_string
+                                        .clone(),
+                                    group_private_request_input: state
+                                        .session
+                                        .group_private_request_input
+                                        .clone(),
+                                    group_generated_private_invite_string: state
+                                        .session
+                                        .group_generated_private_invite_string
+                                        .clone(),
                                     group_status: state.session.group_status.clone(),
                                     tabs: vec![Self::new_app_home_tab()],
                                     active_tab_idx: Some(0),
@@ -3318,6 +3615,8 @@ impl IcedCommApp {
                                         .unwrap_or_default();
                                 }
                                 state.session.group_generated_invite_string.clear();
+                                state.session.group_private_request_input.clear();
+                                state.session.group_generated_private_invite_string.clear();
                                 state.session.group_status = format!("Deleted group: {name}");
                                 return Task::none();
                             }
@@ -3680,6 +3979,12 @@ impl IcedCommApp {
 
             Message::ActionPressed(action) => match action {
                 GuiAction::Connect => {
+                    if state.session.profile == "default"
+                        && state.session.show_rendezvous_panel
+                    {
+                        return Task::none();
+                    }
+
                     if state.session.profile != "default" {
                         if let Some(peer) = state.session.stored_peer.clone() {
                             let Some(connect_task) =
@@ -4037,6 +4342,7 @@ impl IcedCommApp {
                         GuiAction::Connect => {
                             if !value.is_empty() {
                                 let peer = value.clone();
+                                state.session.rendezvous_outgoing = None;
                                 let Some(connect_task) =
                                     state.start_one_to_one_connect(peer.clone())
                                 else {
@@ -4174,6 +4480,160 @@ impl IcedCommApp {
                     state.session.show_logs = false;
                     state.session.show_deaddrop_panel = false;
                 }
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::ToggleRendezvousPanelPressed => {
+                if state.session.profile == "default"
+                    && !state.active_tab_is_group()
+                    && !state.session.offline_mode
+                    && !state.has_active_connection_attempt()
+                    && state.session.pending_action != Some(GuiAction::Connect)
+                {
+                    state.session.show_rendezvous_panel =
+                        !state.session.show_rendezvous_panel;
+                    state.store_active_runtime();
+                }
+                return Task::none();
+            }
+
+            Message::RendezvousInputChanged(value) => {
+                if value.len() <= 16 * 1_024 {
+                    state.session.rendezvous_input = value;
+                    state.store_active_runtime();
+                }
+                return Task::none();
+            }
+
+            Message::GenerateRendezvousRequestPressed => {
+                if state.session.profile != "default" || state.active_tab_is_group() {
+                    return Task::none();
+                }
+
+                match rendezvous::generate_request(Self::now_epoch_millis()) {
+                    Ok((request, encoded)) => {
+                        state.session.rendezvous_request = Some(request);
+                        state.session.rendezvous_outgoing = None;
+                        state.session.rendezvous_output = encoded;
+                        state.session.rendezvous_status =
+                            "One-time request generated. Send it through the separate channel."
+                                .into();
+                    }
+                    Err(err) => {
+                        state.session.rendezvous_status =
+                            format!("Rendezvous request generation failed: {err}");
+                    }
+                }
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::AnswerRendezvousRequestPressed => {
+                if state.session.profile != "default" || state.active_tab_is_group() {
+                    return Task::none();
+                }
+                let Some(my_b32) = state.session.my_b32.clone() else {
+                    state.session.rendezvous_status =
+                        "Transient address is not ready yet.".into();
+                    state.store_active_runtime();
+                    return Task::none();
+                };
+                let encoded = state.session.rendezvous_input.trim().to_string();
+                match rendezvous::answer_request(&encoded, &my_b32, Self::now_epoch_millis()) {
+                    Ok((issued, response)) => {
+                        state.session.rendezvous_issued = Some(issued);
+                        state.session.rendezvous_output = response;
+                        state.session.rendezvous_status =
+                            "Sealed one-time response generated. Return it to the requester."
+                                .into();
+                    }
+                    Err(err) => {
+                        state.session.rendezvous_status =
+                            format!("Rendezvous request rejected: {err}");
+                    }
+                }
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::ConnectRendezvousResponsePressed => {
+                if state.session.profile != "default" || state.active_tab_is_group() {
+                    return Task::none();
+                }
+                let Some(request) = state.session.rendezvous_request.as_ref() else {
+                    state.session.rendezvous_status =
+                        "Generate a request before importing its response.".into();
+                    state.store_active_runtime();
+                    return Task::none();
+                };
+                let encoded = state.session.rendezvous_input.trim().to_string();
+                match rendezvous::open_response(&encoded, request, Self::now_epoch_millis()) {
+                    Ok(access) if Self::is_valid_b32_address(&access.destination_b32) => {
+                        let peer = access.destination_b32.clone();
+                        state.session.rendezvous_outgoing = Some(access);
+                        let Some(task) = state.start_one_to_one_connect(peer.clone()) else {
+                            state.session.rendezvous_status =
+                                "Close the current call before using a rendezvous response."
+                                    .into();
+                            state.store_active_runtime();
+                            return Task::none();
+                        };
+                        state.session.rendezvous_request = None;
+                        state.session.rendezvous_input.clear();
+                        state.session.rendezvous_output.clear();
+                        state.session.show_rendezvous_panel = false;
+                        state.session.rendezvous_status =
+                            "Connecting with one-time rendezvous authentication...".into();
+                        state.session.network_status = NetworkStatus::Visible;
+                        state.post_system(format!("Connecting to {peer}..."));
+                        state.store_active_runtime();
+                        return task;
+                    }
+                    Ok(_) => {
+                        state.session.rendezvous_status =
+                            "Rendezvous response contains an invalid destination.".into();
+                    }
+                    Err(err) => {
+                        state.session.rendezvous_status =
+                            format!("Rendezvous response rejected: {err}");
+                    }
+                }
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::CopyRendezvousOutputPressed => {
+                if !state.session.rendezvous_output.is_empty() {
+                    state.copy_text_to_clipboard(
+                        state.session.rendezvous_output.clone(),
+                        "rendezvous value",
+                    );
+                    state.session.rendezvous_status = "Rendezvous value copied.".into();
+                    state.store_active_runtime();
+                }
+                return Task::none();
+            }
+
+            Message::ClearRendezvousPressed => {
+                state.session.rendezvous_input.clear();
+                state.session.rendezvous_output.clear();
+                state.session.rendezvous_status =
+                    "Text fields cleared; active one-time state is unchanged.".into();
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::RevokeRendezvousPressed => {
+                if let Some(issued) = state.session.rendezvous_issued.as_mut() {
+                    issued.state = RendezvousIssuedState::Revoked;
+                }
+                state.session.rendezvous_request = None;
+                state.session.rendezvous_outgoing = None;
+                state.session.pending_rendezvous_request_id = None;
+                state.session.rendezvous_input.clear();
+                state.session.rendezvous_output.clear();
+                state.session.rendezvous_status = "One-time rendezvous state revoked.".into();
                 state.store_active_runtime();
                 return Task::none();
             }
@@ -4746,6 +5206,7 @@ impl IcedCommApp {
             }
 
             Message::ConnectFinished(tab_id, generation, result) => {
+                let msg_id_auth = state.generate_msg_id();
                 let msg_id_s = state.generate_msg_id();
                 let msg_id_k = state.generate_msg_id();
                 let mut tasks: Vec<Task<Message>> = Vec::new();
@@ -4753,7 +5214,7 @@ impl IcedCommApp {
 
                 match result {
                     Ok((peer, conn)) => {
-                        let mut handshake: Option<(String, Frame, Frame)> = None;
+                        let mut handshake: Option<(String, Option<Frame>, Frame, Frame)> = None;
                         let mut keep_outbound = false;
 
                         if let Some(tab) = state.tab_by_id_mut(tab_id) {
@@ -4802,6 +5263,7 @@ impl IcedCommApp {
                                         tab.session.log_lines.push(format!(
                                             "Connection collision: kept outbound session with {peer}."
                                         ));
+                                        Self::release_pending_rendezvous(tab);
                                         tab.pending_conn = None;
                                         tab.session.pending_peer_addr = None;
                                         tab.session.pending_peer_dest_b64 = None;
@@ -4872,18 +5334,88 @@ impl IcedCommApp {
                                     if let Some(my_dest_b64) =
                                         tab.session.my_pub_dest_b64.clone()
                                     {
-                                        let line = format!("{my_dest_b64}\n");
-                                        let frame_s = Frame {
-                                            msg_type: MsgType::S,
-                                            msg_id: msg_id_s,
-                                            payload: my_dest_b64.into_bytes(),
+                                        let auth_frame_result = if let Some(access) =
+                                            tab.session.rendezvous_outgoing.take()
+                                        {
+                                            let auth_result = tab
+                                                .session
+                                                .my_b32
+                                                .as_deref()
+                                                .ok_or_else(|| {
+                                                    "local transient address is unavailable"
+                                                        .to_string()
+                                                })
+                                                .and_then(|my_b32| {
+                                                    if !access
+                                                        .destination_b32
+                                                        .eq_ignore_ascii_case(&peer)
+                                                    {
+                                                        return Err(
+                                                            "rendezvous destination changed"
+                                                                .to_string(),
+                                                        );
+                                                    }
+                                                    rendezvous::make_auth_signal(
+                                                        &access,
+                                                        my_b32,
+                                                        &peer,
+                                                        Self::now_epoch_millis(),
+                                                    )
+                                                });
+
+                                            auth_result.map(|signal| Some(Frame {
+                                                    msg_type: MsgType::S,
+                                                    msg_id: msg_id_auth,
+                                                    payload: signal.into_bytes(),
+                                                }))
+                                        } else {
+                                            Ok(None)
                                         };
-                                        let frame_k = Frame {
-                                            msg_type: MsgType::K,
-                                            msg_id: msg_id_k,
-                                            payload: tab.e2e.public_bytes(),
-                                        };
-                                        handshake = Some((line, frame_s, frame_k));
+
+                                        match auth_frame_result {
+                                            Ok(auth_frame) => {
+                                                let line = format!("{my_dest_b64}\n");
+                                                let frame_s = Frame {
+                                                    msg_type: MsgType::S,
+                                                    msg_id: msg_id_s,
+                                                    payload: my_dest_b64.into_bytes(),
+                                                };
+                                                let frame_k = Frame {
+                                                    msg_type: MsgType::K,
+                                                    msg_id: msg_id_k,
+                                                    payload: tab.e2e.public_bytes(),
+                                                };
+                                                handshake =
+                                                    Some((line, auth_frame, frame_s, frame_k));
+                                            }
+                                            Err(err) => {
+                                                    tab.session.rendezvous_status = format!(
+                                                        "Rendezvous authentication failed: {err}"
+                                                    );
+                                                    tab.session.log_lines.push(
+                                                        "Rendezvous call authentication could not be prepared."
+                                                            .into(),
+                                                    );
+                                                    tab.live_conn = None;
+                                                    tab.connection_direction = None;
+                                                    tab.session.current_peer_addr = None;
+                                                    tab.session.peer_b32 = None;
+                                                    tab.session.network_status =
+                                                        NetworkStatus::LocalOk;
+                                                    let conn_to_close = conn.clone();
+                                                    tasks.push(Task::perform(
+                                                        async move {
+                                                            conn_to_close
+                                                                .close()
+                                                                .await
+                                                                .map_err(|e| e.to_string())
+                                                        },
+                                                        move |result| {
+                                                            Message::CloseFinished(tab_id, result)
+                                                        },
+                                                    ));
+                                            }
+                                            }
                                     }
                                 } else if tab.pending_conn.is_none()
                                     && tab.live_conn.is_none()
@@ -4902,12 +5434,17 @@ impl IcedCommApp {
                             ));
                         }
 
-                        if let Some((line, frame_s, frame_k)) = handshake {
+                        if let Some((line, auth_frame, frame_s, frame_k)) = handshake {
                             tasks.push(Task::perform(
                                 async move {
                                     conn.send_raw_line(&line)
                                         .await
                                         .map_err(|e| e.to_string())?;
+                                    if let Some(auth_frame) = auth_frame {
+                                        conn.send_frame(&auth_frame)
+                                            .await
+                                            .map_err(|e| e.to_string())?;
+                                    }
                                     conn.send_frame(&frame_s)
                                         .await
                                         .map_err(|e| e.to_string())?;
@@ -5257,6 +5794,7 @@ impl IcedCommApp {
                                 tab.session.pending_peer_addr = Some(incoming.peer_b32.clone());
                                 tab.session.pending_peer_dest_b64 =
                                     Some(incoming.peer_dest_b64.clone());
+                                tab.session.pending_rendezvous_request_id = None;
 
                                 let tofu_ok = match &tab.session.stored_peer_dest_b64 {
                                     Some(stored) => stored == &incoming.peer_dest_b64,
@@ -7350,6 +7888,34 @@ impl IcedCommApp {
                 .spacing(6)
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
+                button(text("Generate Private Request").size(12))
+                    .padding([4, 8])
+                    .width(Length::Fill)
+                    .style(app_button_style)
+                    .on_press_maybe(
+                        group_buttons_allowed
+                            .then_some(Message::GeneratePrivateGroupRequestPressed)
+                    ),
+                row![
+                    text_input(
+                        "Private request appears here...",
+                        &state.session.group_private_request_string,
+                    )
+                    .padding(8)
+                    .size(12)
+                    .width(Length::Fill),
+                    button(text("Copy").size(12))
+                        .padding([4, 8])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (group_buttons_allowed
+                                && !state.session.group_private_request_string.trim().is_empty())
+                            .then_some(Message::CopyPrivateGroupRequestPressed)
+                        ),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
             ]
             .spacing(8)
             .width(Length::Fill)
@@ -7866,6 +8432,58 @@ impl IcedCommApp {
             .padding([6, 4])
             .width(Length::Fill)
         };
+        let now_ms = Self::now_epoch_millis();
+        let pending_private_invites = selected_group
+            .filter(|_| selected_group_is_admin)
+            .map(|group| {
+                group
+                    .issued_invites
+                    .iter()
+                    .filter_map(|issued| {
+                        issued
+                            .private_binding
+                            .as_ref()
+                            .filter(|binding| binding.expires_ms > now_ms)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let pending_private_invite_rows = if pending_private_invites.is_empty() {
+            column![]
+        } else {
+            pending_private_invites.into_iter().fold(
+                column![text("Pending private invites").size(12)]
+                    .spacing(6)
+                    .width(Length::Fill),
+                |rows, binding| {
+                    let request_id = binding.request_id.clone();
+                    let short_id = binding.request_id.chars().take(12).collect::<String>();
+                    let remaining_minutes =
+                        binding.expires_ms.saturating_sub(now_ms).div_ceil(60_000);
+                    rows.push(
+                        container(
+                            row![
+                                text(format!(
+                                    "Request {short_id}  expires in {remaining_minutes} min"
+                                ))
+                                .size(11)
+                                .width(Length::Fill),
+                                button(text("Revoke").size(12))
+                                    .padding([4, 8])
+                                    .style(app_button_style)
+                                    .on_press(Message::RevokePrivateGroupInvitePressed(request_id)),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding(8)
+                        .width(Length::Fill)
+                        .style(|_| operation_panel_style()),
+                    )
+                },
+            )
+        };
         let group_status_line: Element<'_, Message> =
             if state.session.group_status.trim().is_empty() {
                 Space::new().height(0).into()
@@ -7933,7 +8551,7 @@ impl IcedCommApp {
                 .spacing(8)
                 .align_y(Alignment::Center),
                 row![
-                    button(text("Generate New Invite").size(12))
+                    button(text("Generate Public Invite").size(12))
                         .padding([6, 10])
                         .style(app_button_style)
                         .on_press_maybe(
@@ -7947,7 +8565,7 @@ impl IcedCommApp {
                     .padding(8)
                     .size(12)
                     .width(Length::Fixed(360.0)),
-                    button(text("Copy New Invite").size(12))
+                    button(text("Copy Public Invite").size(12))
                         .padding([6, 10])
                         .style(app_button_style)
                         .on_press_maybe(
@@ -7962,7 +8580,56 @@ impl IcedCommApp {
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
-                scrollable(group_roster_rows)
+                row![
+                    button(text("Generate Private Invite").size(12))
+                        .padding([6, 10])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (group_selected && selected_group_is_admin)
+                                .then_some(Message::GeneratePrivateGroupInvitePressed)
+                        ),
+                    text_input(
+                        "Paste recipient's private request...",
+                        &state.session.group_private_request_input,
+                    )
+                    .on_input_maybe(
+                        selected_group_is_admin
+                            .then_some(Message::PrivateGroupRequestInputChanged)
+                    )
+                    .on_submit_maybe(
+                        selected_group_is_admin
+                            .then_some(Message::GeneratePrivateGroupInvitePressed)
+                    )
+                    .padding(8)
+                    .size(12)
+                    .width(Length::Fixed(260.0)),
+                    text_input(
+                        "Generated private invite appears here...",
+                        &state.session.group_generated_private_invite_string,
+                    )
+                    .padding(8)
+                    .size(12)
+                    .width(Length::Fixed(260.0)),
+                    button(text("Copy Private Invite").size(12))
+                        .padding([6, 10])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (selected_group_is_admin
+                                && !state
+                                    .session
+                                    .group_generated_private_invite_string
+                                    .trim()
+                                    .is_empty())
+                            .then_some(Message::CopyGeneratedPrivateGroupInvitePressed),
+                        ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                scrollable(
+                    column![pending_private_invite_rows, group_roster_rows]
+                        .spacing(8)
+                        .width(Length::Fill)
+                )
                     .height(Length::Fill)
                     .width(Length::Fill),
                 group_status_line,
@@ -8151,6 +8818,11 @@ impl IcedCommApp {
         .padding(8)
         .style(container::rounded_box);
 
+        let rendezvous_ui_available = state.session.profile == "default"
+            && !state.active_tab_is_group()
+            && !state.session.offline_mode
+            && !state.has_active_connection_attempt();
+
         let actions_row = state
             .available_actions()
             .into_iter()
@@ -8167,7 +8839,7 @@ impl IcedCommApp {
                     .padding([6, 10])
                     .style(app_button_style);
 
-                    if IcedCommApp::action_enabled(action) {
+                    if IcedCommApp::action_enabled_for_session(&state.session, action) {
                         row_acc.push(btn.on_press(Message::ActionPressed(action)))
                     } else {
                         row_acc.push(btn)
@@ -8211,6 +8883,28 @@ impl IcedCommApp {
                 .padding([6, 10])
                 .style(app_button_style),
         );
+
+        let actions_row = if rendezvous_ui_available {
+            let rendezvous_toggle_enabled =
+                state.session.pending_action != Some(GuiAction::Connect);
+            actions_row.push(
+                button(
+                    text(if state.session.show_rendezvous_panel {
+                        "Hide Rendezvous"
+                    } else {
+                        "Rendezvous"
+                    })
+                    .size(13),
+                )
+                .padding([6, 10])
+                .style(app_button_style)
+                .on_press_maybe(
+                    rendezvous_toggle_enabled.then_some(Message::ToggleRendezvousPanelPressed),
+                ),
+            )
+        } else {
+            actions_row
+        };
 
         let command_panel_content = if let Some(action) = state.session.pending_action {
             if IcedCommApp::action_needs_param(action) {
@@ -8271,6 +8965,104 @@ impl IcedCommApp {
             .padding(8)
             .style(container::rounded_box);
 
+        let rendezvous_panel: Element<'_, Message> = if rendezvous_ui_available
+            && state.session.show_rendezvous_panel
+        {
+            let has_input = !state.session.rendezvous_input.trim().is_empty();
+            let has_output = !state.session.rendezvous_output.trim().is_empty();
+            let rendezvous_input_kind =
+                rendezvous::input_kind(&state.session.rendezvous_input);
+            let can_answer_request = has_input
+                && rendezvous_input_kind == rendezvous::InputKind::Request
+                && state.session.my_b32.is_some();
+            let can_connect_response = has_input
+                && rendezvous_input_kind == rendezvous::InputKind::Response
+                && state
+                    .session
+                    .rendezvous_request
+                    .as_ref()
+                    .map(|pending| {
+                        rendezvous::response_matches_pending(
+                            &state.session.rendezvous_input,
+                            pending,
+                        )
+                    })
+                    .unwrap_or(false);
+            let has_state = state.session.rendezvous_request.is_some()
+                || state.session.rendezvous_issued.is_some()
+                || state.session.rendezvous_outgoing.is_some();
+
+            container(
+                column![
+                    row![
+                        button(text("Generate Request").size(12))
+                            .padding([6, 10])
+                            .style(app_button_style)
+                            .on_press(Message::GenerateRendezvousRequestPressed),
+                        button(text("Copy Output").size(12))
+                            .padding([6, 10])
+                            .style(app_button_style)
+                            .on_press_maybe(
+                                has_output.then_some(Message::CopyRendezvousOutputPressed)
+                            ),
+                        button(text("Revoke").size(12))
+                            .padding([6, 10])
+                            .style(app_button_style)
+                            .on_press_maybe(has_state.then_some(Message::RevokeRendezvousPressed)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    row![
+                        text_input(
+                            "Paste a rendezvous request or response...",
+                            &state.session.rendezvous_input
+                        )
+                        .on_input(Message::RendezvousInputChanged)
+                        .padding(8)
+                        .size(12)
+                        .width(Length::Fill),
+                        button(text("Answer Request").size(12))
+                            .padding([6, 10])
+                            .style(app_button_style)
+                            .on_press_maybe(
+                                can_answer_request
+                                    .then_some(Message::AnswerRendezvousRequestPressed)
+                            ),
+                        button(text("Connect Response").size(12))
+                            .padding([6, 10])
+                            .style(app_button_style)
+                            .on_press_maybe(
+                                can_connect_response
+                                    .then_some(Message::ConnectRendezvousResponsePressed)
+                            ),
+                        button(text("Clear").size(12))
+                            .padding([6, 10])
+                            .style(app_button_style)
+                            .on_press(Message::ClearRendezvousPressed),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text_input(
+                        "Generated request or sealed response appears here...",
+                        &state.session.rendezvous_output
+                    )
+                    .padding(8)
+                    .size(12)
+                    .width(Length::Fill),
+                    text(&state.session.rendezvous_status)
+                        .size(11)
+                        .color(Color::from_rgb8(155, 155, 164)),
+                ]
+                .spacing(8),
+            )
+            .width(Length::Fill)
+            .padding(8)
+            .style(|_| log_panel_style())
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
         let main_column = if is_app_home {
             column![tab_panel, center_panel]
                 .spacing(10)
@@ -8282,6 +9074,7 @@ impl IcedCommApp {
                 status_bar,
                 center_panel,
                 message_input_panel,
+                rendezvous_panel,
                 command_panel
             ]
             .spacing(10)
@@ -8442,6 +9235,100 @@ impl IcedCommApp {
         )
     }
 
+    fn verify_pending_rendezvous_auth(
+        tab: &mut OpenedTab,
+        body: &str,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if !body.starts_with(rendezvous::AUTH_SIGNAL_PREFIX) {
+            return Ok(false);
+        }
+        if tab.session.profile != "default" {
+            return Err("rendezvous proof received outside transient mode".into());
+        }
+
+        let caller_b32 = tab
+            .session
+            .pending_peer_addr
+            .clone()
+            .ok_or_else(|| "pending caller address is unavailable".to_string())?;
+        let receiver_b32 = tab
+            .session
+            .my_b32
+            .clone()
+            .ok_or_else(|| "local transient address is unavailable".to_string())?;
+        let issued = tab
+            .session
+            .rendezvous_issued
+            .as_ref()
+            .ok_or_else(|| "no one-time rendezvous invitation is active".to_string())?;
+
+        rendezvous::verify_auth_signal(body, issued, &caller_b32, &receiver_b32, now_ms)?;
+        let request_id = issued.request_id;
+        if let Some(issued) = tab.session.rendezvous_issued.as_mut() {
+            issued.state = RendezvousIssuedState::Reserved;
+        }
+        tab.session.pending_rendezvous_request_id = Some(request_id);
+        tab.session.rendezvous_status =
+            "Authenticated rendezvous caller is awaiting Accept / Decline.".into();
+        Ok(true)
+    }
+
+    fn verify_live_rendezvous_auth(
+        tab: &mut OpenedTab,
+        body: &str,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if !body.starts_with(rendezvous::AUTH_SIGNAL_PREFIX) {
+            return Ok(false);
+        }
+        if tab.session.profile != "default"
+            || tab.connection_direction != Some(ConnectionDirection::Inbound)
+        {
+            return Err("unexpected rendezvous proof".into());
+        }
+
+        let caller_b32 = tab
+            .session
+            .current_peer_addr
+            .clone()
+            .ok_or_else(|| "caller address is unavailable".to_string())?;
+        let receiver_b32 = tab
+            .session
+            .my_b32
+            .clone()
+            .ok_or_else(|| "local transient address is unavailable".to_string())?;
+        let issued = tab
+            .session
+            .rendezvous_issued
+            .as_ref()
+            .ok_or_else(|| "no one-time rendezvous invitation is active".to_string())?;
+
+        rendezvous::verify_auth_signal(body, issued, &caller_b32, &receiver_b32, now_ms)?;
+        if let Some(issued) = tab.session.rendezvous_issued.as_mut() {
+            issued.state = RendezvousIssuedState::Consumed;
+        }
+        tab.session.rendezvous_status = "One-time rendezvous authentication accepted.".into();
+        Ok(true)
+    }
+
+    fn release_pending_rendezvous(tab: &mut OpenedTab) {
+        let Some(request_id) = tab.session.pending_rendezvous_request_id.take() else {
+            return;
+        };
+        if let Some(issued) = tab.session.rendezvous_issued.as_mut() {
+            if issued.request_id == request_id
+                && issued.state == RendezvousIssuedState::Reserved
+            {
+                issued.state = if issued.expires_ms > Self::now_epoch_millis() {
+                    RendezvousIssuedState::Available
+                } else {
+                    RendezvousIssuedState::Revoked
+                };
+            }
+        }
+    }
+
     fn track_group_send_task(&self, tab_id: u64, task: Task<Message>) -> Task<Message> {
         if let Some(tab) = self
             .opened_tabs
@@ -8456,6 +9343,7 @@ impl IcedCommApp {
 
     fn reset_connection_state(&mut self) {
         if let Some(tab) = self.active_tab_mut() {
+            Self::release_pending_rendezvous(tab);
             Self::invalidate_one_to_one_connect(tab, true);
             tab.connection_direction = None;
         }
@@ -8466,6 +9354,7 @@ impl IcedCommApp {
         self.session.peer_b32 = None;
         self.session.pending_peer_addr = None;
         self.session.pending_peer_dest_b64 = None;
+        self.session.pending_rendezvous_request_id = None;
         self.session.live_ready = false;
         self.session.offline_mode = false;
         self.session.network_status = NetworkStatus::LocalOk;
@@ -8589,6 +9478,52 @@ impl IcedCommApp {
         ))
     }
 
+    fn encode_private_group_invite_string(
+        group: &GroupMeta,
+        request: &str,
+    ) -> Result<(GroupMeta, String), String> {
+        if group.my_b32.is_none() {
+            return Err("open this group once before generating its invite".into());
+        }
+        if !Self::group_is_admin(group) {
+            return Err("only the group admin can issue private invites".into());
+        }
+
+        let now_ms = Self::now_epoch_millis();
+        let token = Self::generate_group_invite_token();
+        let mut updated_group = group.clone();
+        updated_group.issued_invites.retain(|issued| {
+            issued
+                .private_binding
+                .as_ref()
+                .map(|binding| binding.expires_ms > now_ms)
+                .unwrap_or(true)
+        });
+        Self::sign_group_roster_if_admin(&mut updated_group)?;
+        let invite =
+            Self::group_invite_from_meta_with_token(&updated_group, Some(token.clone()))?;
+        let invite_json = serde_json::to_vec(&invite).map_err(|err| err.to_string())?;
+        let (binding, encoded) = group_invite::seal_invite(request, &invite_json, now_ms)?;
+
+        if updated_group.issued_invites.iter().any(|issued| {
+            issued
+                .private_binding
+                .as_ref()
+                .map(|existing| existing.request_id == binding.request_id)
+                .unwrap_or(false)
+        }) {
+            return Err("that private group request was already answered".into());
+        }
+
+        updated_group.issued_invites.push(GroupIssuedInvite {
+            token,
+            redeemed_b32: None,
+            private_binding: Some(binding),
+        });
+        storage::save_group_meta(&updated_group).map_err(|err| err.to_string())?;
+        Ok((updated_group, encoded))
+    }
+
     fn import_group_invite_string(value: &str) -> Result<String, String> {
         let trimmed = value.trim();
         let encoded = trimmed
@@ -8603,6 +9538,36 @@ impl IcedCommApp {
         decoder.read_to_end(&mut json).map_err(|e| e.to_string())?;
         let invite: GroupInvite = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
         Self::merge_group_invite(invite)
+    }
+
+    fn import_private_group_invite_string(value: &str) -> Result<String, String> {
+        let request_id = group_invite::response_request_id(value)?;
+        let mut pending = storage::load_pending_private_group_invites()
+            .map_err(|err| err.to_string())?;
+        let Some(request_idx) = pending
+            .iter()
+            .position(|request| request.request_id == request_id)
+        else {
+            return Err("this private invite belongs to a different request".into());
+        };
+
+        let request = pending[request_idx].clone();
+        let (invite_json, credential) =
+            group_invite::open_invite(value, &request, Self::now_epoch_millis())?;
+        let invite: GroupInvite =
+            serde_json::from_slice(&invite_json).map_err(|err| err.to_string())?;
+        if invite.invite_token.is_none() {
+            return Err("private group invite is missing its join token".into());
+        }
+
+        let group_key = Self::merge_group_invite_with_private_credential(
+            invite,
+            Some(credential),
+        )?;
+        pending.remove(request_idx);
+        storage::save_pending_private_group_invites(&pending)
+            .map_err(|err| format!("group imported but private request cleanup failed: {err}"))?;
+        Ok(group_key)
     }
 
     fn group_invite_from_meta(group: &GroupMeta) -> Result<GroupInvite, String> {
@@ -8623,6 +9588,7 @@ impl IcedCommApp {
         updated_group.issued_invites.push(GroupIssuedInvite {
             token: token.clone(),
             redeemed_b32: None,
+            private_binding: None,
         });
         storage::save_group_meta(&updated_group).map_err(|e| e.to_string())?;
 
@@ -8870,6 +9836,13 @@ impl IcedCommApp {
     }
 
     fn merge_group_invite(invite: GroupInvite) -> Result<String, String> {
+        Self::merge_group_invite_with_private_credential(invite, None)
+    }
+
+    fn merge_group_invite_with_private_credential(
+        invite: GroupInvite,
+        private_credential: Option<PrivateJoinCredential>,
+    ) -> Result<String, String> {
         if invite.format != "commtools-i2p-group-invite" || invite.version != 1 {
             return Err("unsupported group invite".into());
         }
@@ -8987,6 +9960,7 @@ impl IcedCommApp {
 
         if invite_token.is_some() {
             group.join_token = invite_token;
+            group.private_join_credential = private_credential;
         }
 
         storage::save_group_meta(&group).map_err(|e| e.to_string())?;
@@ -9052,6 +10026,7 @@ impl IcedCommApp {
             if self_removed {
                 group.members.clear();
                 group.join_token = None;
+                group.private_join_credential = None;
                 group.roster_version = roster.roster_version;
                 group.roster_signing_pubkey = Some(roster.roster_signing_pubkey);
                 group.roster_signature = Some(roster.roster_signature);
@@ -9073,6 +10048,21 @@ impl IcedCommApp {
             group.roster_version = roster.roster_version;
             group.roster_signing_pubkey = Some(roster.roster_signing_pubkey);
             group.roster_signature = Some(roster.roster_signature);
+            if group.private_join_credential.is_some()
+                && my_b32
+                    .as_ref()
+                    .map(|my_b32| {
+                        roster.owner_b32.eq_ignore_ascii_case(my_b32)
+                            || roster
+                                .members
+                                .iter()
+                                .any(|member| member.b32.eq_ignore_ascii_case(my_b32))
+                    })
+                    .unwrap_or(false)
+            {
+                group.private_join_credential = None;
+                group.join_token = None;
+            }
             storage::save_group_meta(&group).map_err(|e| e.to_string())?;
         }
 
@@ -9116,6 +10106,9 @@ impl IcedCommApp {
         else {
             return Err("invite token is unknown".into());
         };
+        if invite.private_binding.is_some() {
+            return Err("private invite requires proof of possession".into());
+        }
 
         let mut changed = false;
 
@@ -9149,6 +10142,44 @@ impl IcedCommApp {
             Self::sign_group_roster_if_admin(group)?;
         }
 
+        Ok(())
+    }
+
+    fn redeem_private_group_invite_token(
+        group: &mut GroupMeta,
+        token: &str,
+        member: GroupMember,
+        proof: &PrivateJoinProof,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        Self::validate_group_display_name(&member.name)?;
+        let Some(invite_idx) = group
+            .issued_invites
+            .iter()
+            .position(|invite| invite.token == token)
+        else {
+            return Err("private invite token is unknown".into());
+        };
+        let Some(binding) = group.issued_invites[invite_idx].private_binding.clone() else {
+            return Err("invite token is not a private invite".into());
+        };
+        let Some(owner_b32) = group.owner_b32.as_deref() else {
+            return Err("group owner address is missing".into());
+        };
+
+        group_invite::verify_join_proof(
+            &binding,
+            owner_b32,
+            token,
+            &member.b32,
+            proof,
+            now_ms,
+        )?;
+
+        Self::merge_group_member(group, member);
+        group.issued_invites.remove(invite_idx);
+        group.roster_version = group.roster_version.saturating_add(1);
+        Self::sign_group_roster_if_admin(group)?;
         Ok(())
     }
 
@@ -9242,6 +10273,9 @@ impl IcedCommApp {
             token: String::new(),
             b32: my_b32,
             name: display_name.clone(),
+            private_request_id: None,
+            private_proof_nonce: None,
+            private_proof_signature: None,
         };
 
         let payload = match serde_json::to_vec(&control) {
@@ -9673,12 +10707,14 @@ impl IcedCommApp {
 
     fn mock_disconnect(&mut self) {
         if let Some(tab) = self.active_tab_mut() {
+            Self::release_pending_rendezvous(tab);
             Self::invalidate_one_to_one_connect(tab, true);
             tab.connection_direction = None;
         }
         self.session.current_peer_addr = None;
         self.session.current_peer_dest_b64 = None;
         self.session.peer_b32 = None;
+        self.session.pending_rendezvous_request_id = None;
         self.session.live_ready = false;
         self.session.offline_mode = false;
         self.session.network_status = NetworkStatus::LocalOk;
@@ -9720,6 +10756,17 @@ impl IcedCommApp {
             }
 
             self.session.peer_b32 = Some(accepted_from.clone());
+            if let Some(request_id) = self.session.pending_rendezvous_request_id.take() {
+                if let Some(issued) = self.session.rendezvous_issued.as_mut() {
+                    if issued.request_id == request_id
+                        && issued.state == RendezvousIssuedState::Reserved
+                    {
+                        issued.state = RendezvousIssuedState::Consumed;
+                        self.session.rendezvous_status =
+                            "One-time rendezvous invitation consumed.".into();
+                    }
+                }
+            }
             self.session.call_blink_on = true;
             self.session.call_blink_ticks = 0;
             self.post_system(format!("Accepted incoming call from {accepted_from}"));
@@ -9737,6 +10784,15 @@ impl IcedCommApp {
         }
         self.session.pending_peer_addr = None;
         self.session.pending_peer_dest_b64 = None;
+        if let Some(request_id) = self.session.pending_rendezvous_request_id.take() {
+            if let Some(issued) = self.session.rendezvous_issued.as_mut() {
+                if issued.request_id == request_id {
+                    issued.state = RendezvousIssuedState::Revoked;
+                    self.session.rendezvous_status =
+                        "Declined caller; one-time rendezvous invitation revoked.".into();
+                }
+            }
+        }
 
         self.session.current_peer_addr = None;
         self.session.current_peer_dest_b64 = None;
@@ -9754,6 +10810,7 @@ impl IcedCommApp {
     }
 
     fn clear_pending_dead_call(tab: &mut OpenedTab, message: &str) {
+        Self::release_pending_rendezvous(tab);
         Self::invalidate_one_to_one_connect(tab, true);
         tab.connection_direction = None;
         tab.pending_conn = None;
@@ -10024,6 +11081,13 @@ impl IcedCommApp {
 
     fn action_enabled(action: GuiAction) -> bool {
         !matches!(action, GuiAction::Help | GuiAction::Pq)
+    }
+
+    fn action_enabled_for_session(session: &SessionState, action: GuiAction) -> bool {
+        Self::action_enabled(action)
+            && !(action == GuiAction::Connect
+                && session.profile == "default"
+                && session.show_rendezvous_panel)
     }
 
     fn action_needs_param(action: GuiAction) -> bool {
@@ -10548,6 +11612,53 @@ impl IcedCommApp {
 
                         MsgType::S => match String::from_utf8(frame.payload) {
                             Ok(body) => {
+                                match Self::verify_live_rendezvous_auth(tab, &body, now_ms) {
+                                    Ok(true) => {
+                                        push_log(
+                                            tab,
+                                            "One-time rendezvous proof verified.".to_string(),
+                                        );
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        push_log(
+                                            tab,
+                                            format!("Rendezvous authentication rejected: {err}"),
+                                        );
+                                        tab.live_conn = None;
+                                        tab.connection_direction = None;
+                                        tab.session.current_peer_addr = None;
+                                        tab.session.current_peer_dest_b64 = None;
+                                        tab.session.peer_b32 = None;
+                                        tab.session.pending_rendezvous_request_id = None;
+                                        tab.session.live_ready = false;
+                                        tab.session.network_status = NetworkStatus::LocalOk;
+                                        tab.session.heartbeat_last_rx_ms = 0;
+                                        tab.session.heartbeat_last_ping_ms = 0;
+                                        tab.e2e = E2E::new(tab.session.pq_enabled);
+                                        tab.session.accept_armed = true;
+                                        if let Some((sam, cancelled)) =
+                                            tab.sam_runtime.accept_parts()
+                                        {
+                                            tasks.push(Self::incoming_accept_task_from_parts(
+                                                tab_id, sam, cancelled,
+                                            ));
+                                        }
+                                        let close_conn = conn.clone();
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                close_conn
+                                                    .close()
+                                                    .await
+                                                    .map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
+                                        break;
+                                    }
+                                    Ok(false) => {}
+                                }
+
                                 if body == "__SIGNAL__:QUIT" {
                                     tab.live_conn = None;
                                     tab.connection_direction = None;
@@ -11025,7 +12136,56 @@ impl IcedCommApp {
                     match frame.msg_type {
                         MsgType::S => match String::from_utf8(frame.payload) {
                             Ok(body) => {
+                                match Self::verify_pending_rendezvous_auth(
+                                    tab,
+                                    &body,
+                                    Self::now_epoch_millis(),
+                                ) {
+                                    Ok(true) => {
+                                        push_log(
+                                            tab,
+                                            "One-time rendezvous proof verified for pending caller."
+                                                .to_string(),
+                                        );
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        push_log(
+                                            tab,
+                                            format!("Rendezvous authentication rejected: {err}"),
+                                        );
+                                        tab.pending_conn = None;
+                                        tab.connection_direction = None;
+                                        tab.session.pending_peer_addr = None;
+                                        tab.session.pending_peer_dest_b64 = None;
+                                        tab.session.pending_rendezvous_request_id = None;
+                                        tab.session.call_blink_on = true;
+                                        tab.session.call_blink_ticks = 0;
+                                        tab.session.accept_armed = true;
+                                        let close_conn = conn.clone();
+                                        tasks.push(Task::perform(
+                                            async move {
+                                                close_conn
+                                                    .close()
+                                                    .await
+                                                    .map_err(|e| e.to_string())
+                                            },
+                                            move |result| Message::CloseFinished(tab_id, result),
+                                        ));
+                                        if let Some((sam, cancelled)) =
+                                            tab.sam_runtime.accept_parts()
+                                        {
+                                            tasks.push(Self::incoming_accept_task_from_parts(
+                                                tab_id, sam, cancelled,
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                    Ok(false) => {}
+                                }
+
                                 if body == "__SIGNAL__:QUIT" {
+                                    Self::release_pending_rendezvous(tab);
                                     tab.pending_conn = None;
                                     tab.connection_direction = None;
                                     tab.session.pending_peer_addr = None;
@@ -11085,6 +12245,7 @@ impl IcedCommApp {
                 if conn.is_closed() && !conn.has_pending_frames() {
                     let had_visible_call = tab.session.pending_peer_addr.is_some();
 
+                    Self::release_pending_rendezvous(tab);
                     tab.pending_conn = None;
                     tab.connection_direction = None;
                     tab.session.pending_peer_addr = None;
@@ -11539,11 +12700,65 @@ impl IcedCommApp {
                                         b32: control.b32,
                                     };
 
-                                    match Self::redeem_group_invite_token(
-                                        &mut group.meta,
-                                        &control.token,
-                                        member.clone(),
-                                    ) {
+                                    let private_binding = group
+                                        .meta
+                                        .issued_invites
+                                        .iter()
+                                        .find(|invite| invite.token == control.token)
+                                        .and_then(|invite| invite.private_binding.as_ref())
+                                        .cloned();
+                                    let private_fields_present =
+                                        control.private_request_id.is_some()
+                                            || control.private_proof_nonce.is_some()
+                                            || control.private_proof_signature.is_some();
+
+                                    if private_binding.is_none()
+                                        && private_fields_present
+                                        && peer.authorized
+                                        && group.meta.members.iter().any(|existing| {
+                                            existing.b32.eq_ignore_ascii_case(&member.b32)
+                                        })
+                                    {
+                                        tab.session.log_lines.push(format!(
+                                            "Ignored completed private invite proof from {}.",
+                                            peer.member.name
+                                        ));
+                                        continue;
+                                    }
+
+                                    let redeem_result = if private_binding.is_some() {
+                                        match (
+                                            control.private_request_id,
+                                            control.private_proof_nonce,
+                                            control.private_proof_signature,
+                                        ) {
+                                            (Some(request_id), Some(nonce), Some(signature)) => {
+                                                let proof = PrivateJoinProof {
+                                                    request_id,
+                                                    nonce,
+                                                    signature,
+                                                };
+                                                Self::redeem_private_group_invite_token(
+                                                    &mut group.meta,
+                                                    &control.token,
+                                                    member.clone(),
+                                                    &proof,
+                                                    now_ms,
+                                                )
+                                            }
+                                            _ => Err(
+                                                "private invite proof is incomplete".to_string()
+                                            ),
+                                        }
+                                    } else {
+                                        Self::redeem_group_invite_token(
+                                            &mut group.meta,
+                                            &control.token,
+                                            member.clone(),
+                                        )
+                                    };
+
+                                    match redeem_result {
                                         Ok(()) => {
                                             peer.member = member.clone();
                                             peer.authorized = true;
@@ -12017,12 +13232,43 @@ impl IcedCommApp {
                         {
                             if peer.member.b32.eq_ignore_ascii_case(&owner_b32) {
                                 let control = if let Some(token) = group.meta.join_token.clone() {
-                                    Some(GroupControlMessage {
-                                        kind: GROUP_CONTROL_JOIN_PROOF.into(),
-                                        token,
-                                        b32: my_b32,
-                                        name: Self::group_self_display_name(&group.meta),
-                                    })
+                                    if let Some(credential) =
+                                        group.meta.private_join_credential.as_ref()
+                                    {
+                                        match group_invite::sign_join_proof(
+                                            credential,
+                                            &owner_b32,
+                                            &token,
+                                            &my_b32,
+                                            now_ms,
+                                        ) {
+                                            Ok(proof) => Some(GroupControlMessage {
+                                                kind: GROUP_CONTROL_JOIN_PROOF.into(),
+                                                token,
+                                                b32: my_b32,
+                                                name: Self::group_self_display_name(&group.meta),
+                                                private_request_id: Some(proof.request_id),
+                                                private_proof_nonce: Some(proof.nonce),
+                                                private_proof_signature: Some(proof.signature),
+                                            }),
+                                            Err(err) => {
+                                                tab.session.log_lines.push(format!(
+                                                    "Private group invite proof failed: {err}"
+                                                ));
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        Some(GroupControlMessage {
+                                            kind: GROUP_CONTROL_JOIN_PROOF.into(),
+                                            token,
+                                            b32: my_b32,
+                                            name: Self::group_self_display_name(&group.meta),
+                                            private_request_id: None,
+                                            private_proof_nonce: None,
+                                            private_proof_signature: None,
+                                        })
+                                    }
                                 } else if !is_group_admin
                                     && !group.meta.my_name.trim().is_empty()
                                 {
@@ -12031,6 +13277,9 @@ impl IcedCommApp {
                                         token: String::new(),
                                         b32: my_b32,
                                         name: Self::group_self_display_name(&group.meta),
+                                        private_request_id: None,
+                                        private_proof_nonce: None,
+                                        private_proof_signature: None,
                                     })
                                 } else {
                                     None

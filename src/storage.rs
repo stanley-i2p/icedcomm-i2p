@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 
 use crate::constants::{DEFAULT_SAM_HOST, DEFAULT_SAM_PORT};
+use crate::group_invite::{PendingPrivateRequest, PrivateInviteBinding, PrivateJoinCredential};
 
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -64,6 +65,8 @@ pub struct GroupIssuedInvite {
     pub token: String,
     #[serde(default)]
     pub redeemed_b32: Option<String>,
+    #[serde(default)]
+    pub private_binding: Option<PrivateInviteBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +87,8 @@ pub struct GroupMeta {
     pub members: Vec<GroupMember>,
     #[serde(default)]
     pub join_token: Option<String>,
+    #[serde(default)]
+    pub private_join_credential: Option<PrivateJoinCredential>,
     #[serde(default)]
     pub issued_invites: Vec<GroupIssuedInvite>,
     #[serde(default)]
@@ -236,6 +241,7 @@ impl GroupMeta {
             roster_version: 1,
             members: Vec::new(),
             join_token: None,
+            private_join_credential: None,
             issued_invites: Vec::new(),
             roster_signing_pubkey: None,
             roster_signing_secret: None,
@@ -336,6 +342,10 @@ pub fn app_config_path() -> PathBuf {
     base_dir().join("app_config.json")
 }
 
+pub fn pending_private_group_invites_path() -> PathBuf {
+    base_dir().join("pending_private_group_invites.json")
+}
+
 pub fn ensure_base_layout() -> Result<(), StorageError> {
     create_dir_secure_all(&base_dir())?;
     create_dir_secure_all(&contacts_dir())?;
@@ -376,6 +386,26 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), StorageError> {
     let text =
         serde_json::to_string_pretty(config).map_err(|e| StorageError::Serde(e.to_string()))?;
     atomic_write_text(&app_config_path(), &text)
+}
+
+pub fn load_pending_private_group_invites() -> Result<Vec<PendingPrivateRequest>, StorageError> {
+    ensure_base_layout()?;
+    let path = pending_private_group_invites_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(path).map_err(|e| StorageError::Io(e.to_string()))?;
+    serde_json::from_str(&text).map_err(|e| StorageError::Serde(e.to_string()))
+}
+
+pub fn save_pending_private_group_invites(
+    pending: &[PendingPrivateRequest],
+) -> Result<(), StorageError> {
+    ensure_base_layout()?;
+    let text =
+        serde_json::to_string_pretty(pending).map_err(|e| StorageError::Serde(e.to_string()))?;
+    atomic_write_text(&pending_private_group_invites_path(), &text)
 }
 
 pub fn acquire_app_lock() -> Result<AppLock, StorageError> {
