@@ -54,7 +54,7 @@ jobs:
 
           version="$(
             cargo metadata \
-              --manifest-path my_iced_app/Cargo.toml \
+              --manifest-path Cargo.toml \
               --no-deps \
               --locked \
               --format-version 1 \
@@ -109,7 +109,7 @@ jobs:
             pkg-config
 
       - name: Build release binary
-        run: cargo build --release --locked --manifest-path my_iced_app/Cargo.toml
+        run: cargo build --release --locked --manifest-path Cargo.toml
 
       - name: Download verified AppImage tools
         shell: bash
@@ -140,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          bash my_iced_app/scripts/package-linux.sh \
+          bash scripts/package-linux.sh \
             "${{ steps.metadata.outputs.version }}" \
             "$GITHUB_WORKSPACE/.release-tools/squashfs-root/AppRun" \
             "$GITHUB_WORKSPACE/.release-tools/runtime-x86_64"
@@ -154,9 +154,9 @@ jobs:
 
           test -s "$archive"
           test -x "$appimage"
-          desktop-file-validate my_iced_app/packaging/linux/icedcomm-i2p.desktop
-          file my_iced_app/target/release/icedcomm-i2p | grep -Eq 'ELF 64-bit.*x86-64'
-          ! ldd my_iced_app/target/release/icedcomm-i2p | grep -q 'not found'
+          desktop-file-validate packaging/linux/icedcomm-i2p.desktop
+          file target/release/icedcomm-i2p | grep -Eq 'ELF 64-bit.*x86-64'
+          ! ldd target/release/icedcomm-i2p | grep -q 'not found'
 
           mkdir -p .appimage-check
           (
