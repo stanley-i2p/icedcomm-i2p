@@ -25,5 +25,8 @@ target/
 /.linux-package/
 /.server-check/
 /.server-linux-package/
+/.windows-check/
+/.windows-package/
+/.release-input/
 /.release-tools/
 /dist/
