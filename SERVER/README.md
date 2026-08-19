@@ -54,6 +54,48 @@ target/release/deaddrop-server
 ./target/release/deaddrop-server
 ```
 
-The server persists its SAM identities and stored data in its configured data
-directory. Preserve that directory across restarts if the server should retain
-the same I2P destinations and queued blobs.
+## Data Directory
+
+The server stores its persistent SAM identities and opaque queued blobs under:
+
+```text
+~/.deaddrop-server/
+|-- identities/
+|   |-- drop_0.dat
+|   |-- drop_1.dat
+|   `-- drop_2.dat
+`-- storage/
+    |-- drop_0/
+    |-- drop_1/
+    `-- drop_2/
+```
+
+On Windows, the equivalent location is
+`%USERPROFILE%\.deaddrop-server`. Preserve this complete directory across
+restarts to retain the same I2P destinations and queued blobs.
+
+## Migrating From `.termchat-server`
+
+Older releases used `.termchat-server` as the data directory. The directory can
+be renamed without changing the persistent B32 addresses or stored blobs.
+
+Before migrating:
+
+1. Stop the old server completely.
+2. Confirm that no server process is still running.
+3. Confirm that `.deaddrop-server` does not already exist.
+
+On Linux or macOS, run:
+
+```bash
+mv "$HOME/.termchat-server" "$HOME/.deaddrop-server"
+```
+
+On Windows PowerShell, run:
+
+```powershell
+Rename-Item -Path "$env:USERPROFILE\.termchat-server" -NewName ".deaddrop-server"
+```
+
+Start the updated server only after the rename completes. Move the entire
+directory as one unit; do not move only `identities` or only `storage`.

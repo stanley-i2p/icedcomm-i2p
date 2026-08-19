@@ -127,11 +127,11 @@ impl Shutdown {
 
 fn base_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
-        Path::new(&home).join(".termchat-server")
+        Path::new(&home).join(".deaddrop-server")
     } else if let Ok(profile) = std::env::var("USERPROFILE") {
-        Path::new(&profile).join(".termchat-server")
+        Path::new(&profile).join(".deaddrop-server")
     } else {
-        PathBuf::from(".termchat-server")
+        PathBuf::from(".deaddrop-server")
     }
 }
 
