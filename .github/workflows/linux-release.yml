@@ -1,0 +1,248 @@
+name: Linux release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build artifacts only or create a draft GitHub release
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - draft-release
+      release_tag:
+        description: Optional for build-only; required for draft-release (for example, v1.0.1)
+        required: false
+        type: string
+      prerelease:
+        description: Mark a created draft release as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      version: ${{ steps.metadata.outputs.version }}
+
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read and validate release metadata
+        id: metadata
+        shell: bash
+        env:
+          REQUESTED_MODE: ${{ inputs.mode }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          version="$(
+            cargo metadata \
+              --manifest-path my_iced_app/Cargo.toml \
+              --no-deps \
+              --locked \
+              --format-version 1 \
+              | jq -r '.packages[] | select(.name == "icedcomm-i2p") | .version'
+          )"
+
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "Unable to read icedcomm-i2p version from Cargo.toml." >&2
+            exit 1
+          fi
+
+          expected_tag="v${version}"
+          release_tag="${REQUESTED_TAG:-$expected_tag}"
+
+          if [[ "$release_tag" != "$expected_tag" ]]; then
+            echo "Release tag '$release_tag' does not match Cargo.toml version '$expected_tag'." >&2
+            exit 1
+          fi
+
+          if [[ "$REQUESTED_MODE" == "draft-release" ]]; then
+            if [[ -z "${REQUESTED_TAG:-}" ]]; then
+              echo "release_tag is required when creating a draft release." >&2
+              exit 1
+            fi
+
+            if ! git show-ref --verify --quiet "refs/tags/$release_tag"; then
+              echo "Tag '$release_tag' does not exist. Create it before running draft-release." >&2
+              exit 1
+            fi
+
+            tag_commit="$(git rev-list -n 1 "$release_tag")"
+            selected_commit="$(git rev-parse HEAD)"
+            if [[ "$tag_commit" != "$selected_commit" ]]; then
+              echo "Tag '$release_tag' does not point to the selected workflow revision." >&2
+              exit 1
+            fi
+          fi
+
+          artifact_name="icedcomm-i2p-${release_tag}-linux-x86_64"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            file \
+            desktop-file-utils \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Build release binary
+        run: cargo build --release --locked --manifest-path my_iced_app/Cargo.toml
+
+      - name: Download verified AppImage tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .release-tools
+
+          curl --fail --location --retry 3 \
+            --output .release-tools/appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  .release-tools/appimagetool.AppImage" \
+            | sha256sum --check --strict
+
+          curl --fail --location --retry 3 \
+            --output .release-tools/runtime-x86_64 \
+            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  .release-tools/runtime-x86_64" \
+            | sha256sum --check --strict
+
+          chmod 755 .release-tools/appimagetool.AppImage
+          (
+            cd .release-tools
+            ./appimagetool.AppImage --appimage-extract >/dev/null
+          )
+
+      - name: Package Linux artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          bash my_iced_app/scripts/package-linux.sh \
+            "${{ steps.metadata.outputs.version }}" \
+            "$GITHUB_WORKSPACE/.release-tools/squashfs-root/AppRun" \
+            "$GITHUB_WORKSPACE/.release-tools/runtime-x86_64"
+
+      - name: Validate packaged artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/icedcomm-i2p-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.tar.gz"
+          appimage="dist/icedcomm-i2p-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.AppImage"
+
+          test -s "$archive"
+          test -x "$appimage"
+          desktop-file-validate my_iced_app/packaging/linux/icedcomm-i2p.desktop
+          file my_iced_app/target/release/icedcomm-i2p | grep -Eq 'ELF 64-bit.*x86-64'
+          ! ldd my_iced_app/target/release/icedcomm-i2p | grep -q 'not found'
+
+          mkdir -p .appimage-check
+          (
+            cd .appimage-check
+            "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          )
+          test -x .appimage-check/squashfs-root/usr/bin/icedcomm-i2p
+          test -f .appimage-check/squashfs-root/icedcomm-i2p.desktop
+          test -f .appimage-check/squashfs-root/commtools-i2p.png
+          grep -qx 'Exec=icedcomm-i2p' .appimage-check/squashfs-root/icedcomm-i2p.desktop
+          grep -qx 'Icon=commtools-i2p' .appimage-check/squashfs-root/icedcomm-i2p.desktop
+
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            dist/*.AppImage
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  create-draft-release:
+    name: Create draft release
+    if: ${{ inputs.mode == 'draft-release' }}
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-linux.outputs.artifact_name }}
+          path: dist
+
+      - name: Revalidate release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.build-linux.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Create draft GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build-linux.outputs.release_tag }}
+          VERSION: ${{ needs.build-linux.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "A GitHub release already exists for '$RELEASE_TAG'. Refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          args=(
+            "$RELEASE_TAG"
+            --verify-tag
+            --draft
+            --generate-notes
+            --title "IcedComm-I2P $VERSION"
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${args[@]}" dist/*

@@ -21,3 +21,7 @@ target/
 # MacOS system files
 #.DS_Store
 
+/.appimage-check/
+/.linux-package/
+/.release-tools/
+/dist/

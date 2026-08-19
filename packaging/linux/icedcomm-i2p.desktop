@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=IcedComm-I2P
+Comment=Compartmentalized communication over I2P
+Exec=icedcomm-i2p
+Icon=commtools-i2p
+Terminal=false
+Categories=Network;Chat;
