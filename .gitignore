@@ -23,5 +23,7 @@ target/
 
 /.appimage-check/
 /.linux-package/
+/.server-check/
+/.server-linux-package/
 /.release-tools/
 /dist/

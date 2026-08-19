@@ -66,6 +66,25 @@ jobs:
             exit 1
           fi
 
+          server_version="$(
+            cargo metadata \
+              --manifest-path SERVER/Cargo.toml \
+              --no-deps \
+              --locked \
+              --format-version 1 \
+              | jq -r '.packages[] | select(.name == "deaddrop-server") | .version'
+          )"
+
+          if [[ -z "$server_version" || "$server_version" == "null" ]]; then
+            echo "Unable to read deaddrop-server version from SERVER/Cargo.toml." >&2
+            exit 1
+          fi
+
+          if [[ "$server_version" != "$version" ]]; then
+            echo "Client version '$version' and server version '$server_version' do not match." >&2
+            exit 1
+          fi
+
           expected_tag="v${version}"
           release_tag="${REQUESTED_TAG:-$expected_tag}"
 
@@ -108,8 +127,10 @@ jobs:
             libxkbcommon-dev \
             pkg-config
 
-      - name: Build release binary
-        run: cargo build --release --locked --manifest-path Cargo.toml
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked --manifest-path Cargo.toml
+          cargo build --release --locked --manifest-path SERVER/Cargo.toml
 
       - name: Download verified AppImage tools
         shell: bash
@@ -144,6 +165,17 @@ jobs:
             "${{ steps.metadata.outputs.version }}" \
             "$GITHUB_WORKSPACE/.release-tools/squashfs-root/AppRun" \
             "$GITHUB_WORKSPACE/.release-tools/runtime-x86_64"
+          bash scripts/package-server-linux.sh \
+            "${{ steps.metadata.outputs.version }}"
+
+          (
+            cd dist
+            sha256sum \
+              "icedcomm-i2p-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.AppImage" \
+              "icedcomm-i2p-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.tar.gz" \
+              "deaddrop-server-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.tar.gz" \
+              > SHA256SUMS
+          )
 
       - name: Validate packaged artifacts
         shell: bash
@@ -151,12 +183,17 @@ jobs:
           set -euo pipefail
           archive="dist/icedcomm-i2p-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.tar.gz"
           appimage="dist/icedcomm-i2p-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.AppImage"
+          server_archive="dist/deaddrop-server-${{ steps.metadata.outputs.release_tag }}-linux-x86_64.tar.gz"
+          server_package="deaddrop-server-${{ steps.metadata.outputs.release_tag }}-linux-x86_64"
 
           test -s "$archive"
           test -x "$appimage"
+          test -s "$server_archive"
           desktop-file-validate packaging/linux/icedcomm-i2p.desktop
           file target/release/icedcomm-i2p | grep -Eq 'ELF 64-bit.*x86-64'
           ! ldd target/release/icedcomm-i2p | grep -q 'not found'
+          file SERVER/target/release/deaddrop-server | grep -Eq 'ELF 64-bit.*x86-64'
+          ! ldd SERVER/target/release/deaddrop-server | grep -q 'not found'
 
           mkdir -p .appimage-check
           (
@@ -168,6 +205,13 @@ jobs:
           test -f .appimage-check/squashfs-root/commtools-i2p.png
           grep -qx 'Exec=icedcomm-i2p' .appimage-check/squashfs-root/icedcomm-i2p.desktop
           grep -qx 'Icon=commtools-i2p' .appimage-check/squashfs-root/icedcomm-i2p.desktop
+
+          mkdir -p .server-check
+          tar -xzf "$server_archive" -C .server-check
+          test -x ".server-check/$server_package/deaddrop-server"
+          test -f ".server-check/$server_package/README.md"
+          test -f ".server-check/$server_package/LICENSE"
+          test -f ".server-check/$server_package/NOTICE"
 
           (
             cd dist
