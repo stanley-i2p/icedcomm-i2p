@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Check out selected revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -175,7 +175,7 @@ jobs:
           )
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.metadata.outputs.artifact_name }}
           path: |
@@ -195,13 +195,13 @@ jobs:
 
     steps:
       - name: Check out selected revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download verified build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build-linux.outputs.artifact_name }}
           path: dist
