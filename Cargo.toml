@@ -26,3 +26,6 @@ rfd = "0.15"
 arboard = "3"
 hex = "0.4"
 hmac = "0.12"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
