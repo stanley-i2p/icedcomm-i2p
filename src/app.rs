@@ -137,8 +137,9 @@ const DD_STATS_EMA_ALPHA: f64 = 0.30;
 const DD_FAILURE_PENALTY: f64 = 2500.0;
 const DD_UNKNOWN_SERVER_SCORE: f64 = -1e18;
 const DD_STATS_SAVE_INTERVAL_MS: u64 = 15_000;
-const DEADDROP_PANEL_HEIGHT_PORTION: u16 = 4;
-const GROUP_PANEL_HEIGHT_PORTION: u16 = 4;
+const DEADDROP_PANEL_HEIGHT_PORTION: u16 = 5;
+const GROUP_PANEL_HEIGHT_PORTION: u16 = 5;
+const LOG_PANEL_HEIGHT_PORTION: u16 = 5;
 const OFFLINE_SECRET_REQUEST_SIGNAL: &str = "__SIGNAL__:OFFLINE_SECRET_REQUEST";
 const TEXT_BUBBLE_MAX_WIDTH: f32 = 460.0;
 const TEXT_BUBBLE_MIN_BODY_WIDTH: f32 = 92.0;
@@ -8048,6 +8049,30 @@ impl IcedCommApp {
         )
         .padding([4, 10])
         .style(peer_status_address_button_style);
+        let my_b32_control: Element<'_, Message> = if my_b32_available {
+            tooltip(
+                my_b32_button.on_press(Message::CopyStatusMyB32Pressed),
+                container(text("Copy my B32 address").size(11))
+                    .padding([4, 6])
+                    .style(|_| log_panel_style()),
+                tooltip::Position::Bottom,
+            )
+            .into()
+        } else {
+            my_b32_button.into()
+        };
+        let peer_b32_control: Element<'_, Message> = if peer_b32_available {
+            tooltip(
+                peer_b32_button.on_press(Message::CopyStatusPeerB32Pressed),
+                container(text("Copy peer B32 address").size(11))
+                    .padding([4, 6])
+                    .style(|_| log_panel_style()),
+                tooltip::Position::Bottom,
+            )
+            .into()
+        } else {
+            peer_b32_button.into()
+        };
         let group_active_label = active_group_counts
             .map(|(active, total)| format!("{active}/{total} active"))
             .unwrap_or_else(|| "0/0 active".into());
@@ -8061,28 +8086,16 @@ impl IcedCommApp {
 
         let right_status = container(if active_group_counts.is_some() {
             row![
-                if my_b32_available {
-                    my_b32_button.on_press(Message::CopyStatusMyB32Pressed)
-                } else {
-                    my_b32_button
-                },
+                my_b32_control,
                 text(" : ").size(13),
                 group_active_indicator,
             ]
             .align_y(Alignment::Center)
         } else {
             row![
-                if my_b32_available {
-                    my_b32_button.on_press(Message::CopyStatusMyB32Pressed)
-                } else {
-                    my_b32_button
-                },
+                my_b32_control,
                 text(" : ").size(13),
-                if peer_b32_available {
-                    peer_b32_button.on_press(Message::CopyStatusPeerB32Pressed)
-                } else {
-                    peer_b32_button
-                },
+                peer_b32_control,
             ]
             .align_y(Alignment::Center)
         });
@@ -8182,7 +8195,7 @@ impl IcedCommApp {
         .padding(6)
         .style(|_| log_panel_style());
 
-        let log_panel = log_inner.height(Length::FillPortion(1));
+        let log_panel = log_inner.height(Length::FillPortion(LOG_PANEL_HEIGHT_PORTION));
 
         let dd_delete_confirm = state.session.deaddrop_delete_confirm.clone();
         let deaddrop_rows = if state.session.deaddrop_servers.is_empty() {
