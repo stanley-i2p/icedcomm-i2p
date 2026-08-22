@@ -137,6 +137,16 @@ impl SamClient {
         &mut self,
         session_id: String,
     ) -> Result<SamInitResult, SamError> {
+        self.initialize_transient_with_tunnels(session_id, 2, 3)
+            .await
+    }
+
+    pub async fn initialize_transient_with_tunnels(
+        &mut self,
+        session_id: String,
+        tunnel_hops: u8,
+        tunnel_quantity: u8,
+    ) -> Result<SamInitResult, SamError> {
         let stream = TcpStream::connect((self.sam_host.as_str(), self.sam_port))
             .await
             .map_err(|e| SamError::Io(e.to_string()))?;
@@ -159,8 +169,14 @@ impl SamClient {
         let my_dest_b64 =
             extract_field(&dest_resp, "PRIV").ok_or(SamError::MissingField("PRIV"))?;
 
-        self.finish_session_create(ctrl, session_id, my_dest_b64)
-            .await
+        self.finish_session_create(
+            ctrl,
+            session_id,
+            my_dest_b64,
+            tunnel_hops,
+            tunnel_quantity,
+        )
+        .await
     }
 
     pub async fn initialize_persistent(
@@ -180,8 +196,37 @@ impl SamClient {
         };
 
         self.hello(&mut ctrl).await?;
-        self.finish_session_create(ctrl, session_id, my_dest_b64)
+        self.finish_session_create(ctrl, session_id, my_dest_b64, 2, 3)
             .await
+    }
+
+    pub async fn initialize_persistent_with_tunnels(
+        &mut self,
+        session_id: String,
+        my_dest_b64: String,
+        tunnel_hops: u8,
+        tunnel_quantity: u8,
+    ) -> Result<SamInitResult, SamError> {
+        let stream = TcpStream::connect((self.sam_host.as_str(), self.sam_port))
+            .await
+            .map_err(|e| SamError::Io(e.to_string()))?;
+
+        let (read_half, write_half) = stream.into_split();
+
+        let mut ctrl = SamControl {
+            reader: BufReader::new(read_half),
+            writer: write_half,
+        };
+
+        self.hello(&mut ctrl).await?;
+        self.finish_session_create(
+            ctrl,
+            session_id,
+            my_dest_b64,
+            tunnel_hops,
+            tunnel_quantity,
+        )
+        .await
     }
 
     async fn hello(&self, ctrl: &mut SamControl) -> Result<(), SamError> {
@@ -203,10 +248,17 @@ impl SamClient {
         mut ctrl: SamControl,
         session_id: String,
         my_dest_b64: String,
+        tunnel_hops: u8,
+        tunnel_quantity: u8,
     ) -> Result<SamInitResult, SamError> {
         let session_cmd = format!(
-            "SESSION CREATE STYLE=STREAM ID={} DESTINATION={} SIGNATURE_TYPE=7 OPTION inbound.length=2 outbound.length=2 inbound.quantity=3 outbound.quantity=3\n",
-            session_id, my_dest_b64
+            "SESSION CREATE STYLE=STREAM ID={} DESTINATION={} SIGNATURE_TYPE=7 OPTION inbound.length={} outbound.length={} inbound.quantity={} outbound.quantity={}\n",
+            session_id,
+            my_dest_b64,
+            tunnel_hops,
+            tunnel_hops,
+            tunnel_quantity,
+            tunnel_quantity,
         );
 
         ctrl.writer

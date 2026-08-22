@@ -148,7 +148,7 @@ fn remove_if_exists(path: &Path) -> Result<(), VaultError> {
 fn validate_vault_tree(root: &Path) -> Result<(), VaultError> {
     if !root.join("profiles").is_dir() {
         return Err(VaultError::Format(
-            "vault is missing profiles directory".into(),
+            "vault is missing contact storage directory".into(),
         ));
     }
     if !root.join("files").is_dir() {

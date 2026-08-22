@@ -5,6 +5,7 @@ use crate::constants::{
 use crate::deaddrop::{DeadDropClient, DeaddropOpStat};
 use crate::e2e::E2E;
 use crate::group_invite::{self, PrivateJoinCredential, PrivateJoinProof};
+use crate::history::{self, HistoryRecord, HistoryScope};
 use crate::protocol::{Frame, MsgType};
 use crate::rendezvous::{
     self, IssuedAccess as RendezvousIssuedAccess, IssuedState as RendezvousIssuedState,
@@ -18,8 +19,8 @@ use iced::border;
 use iced::widget::Id as ScrollableId;
 use iced::widget::operation;
 use iced::widget::{
-    Space, button, column, container, image, opaque, progress_bar, row, scrollable, stack, text,
-    text_editor, text_input, tooltip,
+    Space, button, checkbox, column, container, image, opaque, progress_bar, row, scrollable, slider,
+    stack, text, text_editor, text_input, tooltip,
 };
 use iced::{
     Alignment, Background, Color, ContentFit, Element, Font, Length, Subscription, Task, exit,
@@ -112,6 +113,19 @@ const APP_TAB_TEXT: Color = Color::WHITE;
 const APP_TAB_DISABLED_TEXT: Color = APP_BUTTON_DISABLED_TEXT;
 const APP_TAB_BORDER_WIDTH: f32 = 2.0;
 const APP_TAB_BORDER_RADIUS: f32 = 6.0;
+
+const APP_SIDEBAR_TAB_SELECTED_BG: Option<Color> = Some(PY_CYAN30);
+const APP_SIDEBAR_TAB_UNSELECTED_BG: Option<Color> = Some(PY_GREY_SYS);
+const APP_SIDEBAR_TAB_HOVER_BG: Option<Color> = Some(Color::from_rgb8(0, 90, 90));
+const APP_SIDEBAR_TAB_PRESSED_BG: Option<Color> = Some(PY_CYAN);
+const APP_SIDEBAR_TAB_SELECTED_BORDER: Color = PY_CYAN;
+const APP_SIDEBAR_TAB_UNSELECTED_BORDER: Color = PY_GREY_SYS;
+const APP_SIDEBAR_TAB_HOVER_BORDER: Color = PY_CYAN30;
+const APP_SIDEBAR_TAB_PRESSED_BORDER: Color = PY_CYAN;
+const APP_SIDEBAR_TAB_TEXT: Color = Color::WHITE;
+const APP_SIDEBAR_TAB_DISABLED_TEXT: Color = APP_BUTTON_DISABLED_TEXT;
+const APP_SIDEBAR_TAB_BORDER_WIDTH: f32 = 2.0;
+const APP_SIDEBAR_TAB_BORDER_RADIUS: f32 = 4.0;
 
 const APP_TAB_SPINNER_FRAMES: [&str; 12] = [
     "⠉⠉", "⠈⠙", "⠀⠹", "⠀⢸", "⠀⣰", "⢀⣠", "⣀⣀", "⣄⡀", "⣆⠀", "⡇⠀", "⠏⠀", "⠋⠁",
@@ -376,6 +390,12 @@ pub enum SidebarConfirm {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryClearConfirm {
+    Contact,
+    Group,
+}
+
 impl ProfileEntry {
     fn transient() -> Self {
         Self {
@@ -499,14 +519,14 @@ impl Bubble {
         }
     }
 
-    fn peer(text: impl Into<String>) -> Self {
+    fn peer_with_id(text: impl Into<String>, msg_id: u64) -> Self {
         Self {
             author: "Peer".into(),
             content: BubbleContent::Text(text.into()),
             mine: false,
             offline: false,
             timestamp_utc: IcedCommApp::now_utc_hms(),
-            msg_id: None,
+            msg_id: if msg_id == 0 { None } else { Some(msg_id) },
             delivered: false,
             group_expected_acks: Vec::new(),
             group_received_acks: Vec::new(),
@@ -531,17 +551,31 @@ impl Bubble {
         }
     }
 
-    fn peer_offline(text: impl Into<String>) -> Self {
+    fn peer_offline_with_id(text: impl Into<String>, msg_id: u64) -> Self {
         Self {
             author: "Peer-Offline".into(),
             content: BubbleContent::Text(text.into()),
             mine: false,
             offline: true,
             timestamp_utc: IcedCommApp::now_utc_hms(),
-            msg_id: None,
+            msg_id: if msg_id == 0 { None } else { Some(msg_id) },
             delivered: false,
             group_expected_acks: Vec::new(),
             group_received_acks: Vec::new(),
+        }
+    }
+
+    fn from_history(record: HistoryRecord) -> Self {
+        Self {
+            author: record.author,
+            content: BubbleContent::Text(record.text),
+            mine: record.mine,
+            offline: record.offline,
+            timestamp_utc: record.timestamp_utc,
+            msg_id: record.msg_id,
+            delivered: record.delivered,
+            group_expected_acks: record.group_expected_acks,
+            group_received_acks: record.group_received_acks,
         }
     }
 
@@ -651,6 +685,8 @@ pub struct SessionState {
     pub my_dest_b64: Option<String>,
     pub my_pub_dest_b64: Option<String>,
     pub sam_session_id: Option<String>,
+    pub sam_tunnel_hops: u8,
+    pub sam_tunnel_quantity: u8,
     pub peer_b32: Option<String>,
 
     pub network_status: NetworkStatus,
@@ -697,6 +733,10 @@ pub struct SessionState {
     pub show_logs: bool,
     pub show_deaddrop_panel: bool,
     pub show_group_panel: bool,
+    pub show_profile_panel: bool,
+    pub history_enabled: bool,
+    pub history_loaded: bool,
+    pub history_clear_confirm: Option<HistoryClearConfirm>,
     pub deaddrop_server_input: String,
     pub deaddrop_delete_confirm: Option<DdServerDeleteConfirm>,
     pub log_lines: LogLines,
@@ -758,6 +798,8 @@ impl Default for SessionState {
             my_dest_b64: None,
             my_pub_dest_b64: None,
             sam_session_id: None,
+            sam_tunnel_hops: storage::DEFAULT_CONTACT_TUNNEL_HOPS,
+            sam_tunnel_quantity: storage::DEFAULT_CONTACT_TUNNEL_QUANTITY,
             peer_b32: None,
             network_status: NetworkStatus::Initializing,
             live_ready: false,
@@ -797,17 +839,21 @@ impl Default for SessionState {
             status_lines: vec![
                 format!("{APP_NAME} {APP_VERSION}"),
                 "Application ready.".into(),
-                "Open a profile to start a chat tab.".into(),
+                "Open a contact to start a chat tab.".into(),
             ],
             show_logs: false,
             show_deaddrop_panel: false,
             show_group_panel: false,
+            show_profile_panel: false,
+            history_enabled: false,
+            history_loaded: false,
+            history_clear_confirm: None,
             deaddrop_server_input: String::new(),
             deaddrop_delete_confirm: None,
             log_lines: LogLines::from_messages(vec![
                 format!("{APP_NAME} {APP_VERSION}"),
                 "Application ready.".into(),
-                "Open a profile to start a chat tab.".into(),
+                "Open a contact to start a chat tab.".into(),
             ]),
             messages_scroll_id: ScrollableId::unique(),
             logs_scroll_id: ScrollableId::unique(),
@@ -833,6 +879,16 @@ impl Default for SessionState {
 pub struct IcedCommApp {
     pub session: SessionState,
     pub opened_tabs: Vec<OpenedTab>,
+    pub active_sidebar_section: SidebarSection,
+    pub contact_details_open: bool,
+    pub contact_details_meta: Option<ContactMeta>,
+    pub contact_details_offline_key_ready: bool,
+    pub contact_details_rename_mode: bool,
+    pub contact_details_rename_input: String,
+    pub contact_details_tunnel_hops_input: String,
+    pub contact_details_tunnel_quantity_input: String,
+    pub contact_details_clear_history_confirm: bool,
+    pub contact_details_status: String,
     pub app_lock: Option<AppLock>,
     pub clipboard: Option<Clipboard>,
     pub window_id: Option<window::Id>,
@@ -888,6 +944,12 @@ pub enum BackupOperation {
     AwaitingWipeConfirm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSection {
+    OneToOne,
+    Groups,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     InputChanged(text_editor::Action),
@@ -933,7 +995,23 @@ pub enum Message {
     ProfileBackupImportReplaceConfirmed,
     ProfileBackupImportReplaceCancelled,
 
+    SidebarSectionSelected(SidebarSection),
     ProfileSelected(usize),
+    ToggleContactDetailsPressed,
+    BeginContactRenamePressed,
+    ContactRenameInputChanged(String),
+    SaveContactRenamePressed,
+    CancelContactRenamePressed,
+    ContactHistoryEnabledChanged(bool),
+    ContactClearHistoryPressed,
+    ContactClearHistoryConfirmed,
+    ContactClearHistoryCancelled,
+    ContactTunnelHopsChanged(String),
+    ContactTunnelQuantityChanged(String),
+    SaveContactTunnelsPressed,
+    ResetContactTunnelsPressed,
+    CopyContactMyB32Pressed,
+    CopyContactPeerB32Pressed,
     ProfileNameInputChanged(String),
     CreateProfilePressed,
     DeleteProfilePressed,
@@ -960,6 +1038,11 @@ pub enum Message {
     CopyLogsPressed,
     ToggleLogsPressed,
     ToggleGroupPanelPressed,
+    ToggleProfilePanelPressed,
+    HistoryEnabledChanged(bool),
+    ClearHistoryPressed,
+    ClearHistoryConfirmed,
+    ClearHistoryCancelled,
     ToggleRendezvousPanelPressed,
     RendezvousInputChanged(String),
     GenerateRendezvousRequestPressed,
@@ -1057,6 +1140,18 @@ impl Default for IcedCommApp {
         Self {
             session: SessionState::default(),
             opened_tabs: vec![],
+            active_sidebar_section: SidebarSection::OneToOne,
+            contact_details_open: false,
+            contact_details_meta: None,
+            contact_details_offline_key_ready: false,
+            contact_details_rename_mode: false,
+            contact_details_rename_input: String::new(),
+            contact_details_tunnel_hops_input:
+                storage::DEFAULT_CONTACT_TUNNEL_HOPS.to_string(),
+            contact_details_tunnel_quantity_input:
+                storage::DEFAULT_CONTACT_TUNNEL_QUANTITY.to_string(),
+            contact_details_clear_history_confirm: false,
+            contact_details_status: String::new(),
             app_lock: None,
             clipboard: Clipboard::new().ok(),
             window_id: None,
@@ -1088,11 +1183,11 @@ impl Default for IcedCommApp {
             pending_backup_import_path: None,
             pending_backup_import_passphrase: String::new(),
             wipe_all_passphrase: String::new(),
-            wipe_all_status: "Wipe deletes all profiles and stored files.".into(),
+            wipe_all_status: "Wipe deletes all contacts and stored files.".into(),
             profile_export_passphrase: String::new(),
-            profile_export_status: "Export selected profile without files.".into(),
+            profile_export_status: "Export selected contact without files.".into(),
             profile_import_passphrase: String::new(),
-            profile_import_status: "Import one persistent profile without files.".into(),
+            profile_import_status: "Import one persistent contact without files.".into(),
             pending_profile_import_path: None,
             pending_profile_import_passphrase: String::new(),
             pending_profile_import_name: None,
@@ -1155,7 +1250,161 @@ impl IcedCommApp {
         self.session.tabs = vec![Self::new_app_home_tab()];
         self.session.active_tab_idx = Some(0);
         self.session.profile = "__app__".into();
+        self.close_contact_details();
         Ok(())
+    }
+
+    fn selected_persistent_contact_name(&self) -> Option<String> {
+        self.session
+            .profiles
+            .get(self.session.selected_profile_idx)
+            .filter(|profile| profile.persistent)
+            .map(|profile| profile.name.clone())
+    }
+
+    fn close_contact_details(&mut self) {
+        self.contact_details_open = false;
+        self.contact_details_meta = None;
+        self.contact_details_offline_key_ready = false;
+        self.contact_details_rename_mode = false;
+        self.contact_details_rename_input.clear();
+        self.contact_details_clear_history_confirm = false;
+        self.contact_details_status.clear();
+    }
+
+    fn refresh_contact_details(&mut self) {
+        let Some(name) = self.selected_persistent_contact_name() else {
+            self.close_contact_details();
+            return;
+        };
+
+        match storage::load_contact_meta(&name) {
+            Ok(meta) => {
+                self.contact_details_tunnel_hops_input = meta.tunnel_hops.to_string();
+                self.contact_details_tunnel_quantity_input = meta.tunnel_quantity.to_string();
+                self.contact_details_offline_key_ready = meta
+                    .locked_peer
+                    .as_deref()
+                    .and_then(|peer| storage::load_offline_state(&name, peer).ok())
+                    .map(|offline| offline.offline_shared_secret.iter().any(|byte| *byte != 0))
+                    .unwrap_or(false);
+                self.contact_details_meta = Some(meta);
+            }
+            Err(err) => {
+                self.contact_details_meta = None;
+                self.contact_details_offline_key_ready = false;
+                self.contact_details_status = format!("Load contact details failed: {err}");
+            }
+        }
+    }
+
+    fn set_selected_contact_history(&mut self, enabled: bool) -> Result<(), String> {
+        let name = self
+            .selected_persistent_contact_name()
+            .ok_or_else(|| "No persistent contact selected.".to_string())?;
+        let mut meta = storage::load_contact_meta(&name).map_err(|err| err.to_string())?;
+        meta.history_enabled = enabled;
+        storage::save_contact_meta(&meta).map_err(|err| err.to_string())?;
+
+        let scope = HistoryScope::Contact(name.clone());
+        for tab in &mut self.opened_tabs {
+            if tab.meta.kind == TabKind::Chat && tab.session.profile == name {
+                tab.session.history_enabled = enabled;
+                if enabled {
+                    Self::load_history_into_tab(tab, scope.clone());
+                }
+            }
+        }
+        if self.session.profile == name && !self.active_tab_is_group() {
+            self.session.history_enabled = enabled;
+            if enabled {
+                Self::load_history_into_session(&mut self.session, &scope);
+            }
+            self.store_active_runtime();
+        }
+
+        self.contact_details_meta = Some(meta);
+        Ok(())
+    }
+
+    fn clear_selected_contact_history(&mut self) -> Result<(), String> {
+        let name = self
+            .selected_persistent_contact_name()
+            .ok_or_else(|| "No persistent contact selected.".to_string())?;
+        history::clear(&HistoryScope::Contact(name.clone()))?;
+
+        for tab in &mut self.opened_tabs {
+            if tab.meta.kind == TabKind::Chat && tab.session.profile == name {
+                tab.session
+                    .bubbles
+                    .retain(|bubble| !matches!(&bubble.content, BubbleContent::Text(_)));
+                tab.session.history_loaded = true;
+            }
+        }
+        if self.session.profile == name && !self.active_tab_is_group() {
+            self.session
+                .bubbles
+                .retain(|bubble| !matches!(&bubble.content, BubbleContent::Text(_)));
+            self.session.history_loaded = true;
+            self.store_active_runtime();
+        }
+        Ok(())
+    }
+
+    fn save_selected_contact_tunnels(
+        &mut self,
+        tunnel_hops: u8,
+        tunnel_quantity: u8,
+    ) -> Result<(), String> {
+        let name = self
+            .selected_persistent_contact_name()
+            .ok_or_else(|| "No persistent contact selected.".to_string())?;
+        if self.is_profile_open_in_any_tab(&name) {
+            return Err("Close the contact before changing tunnel settings.".into());
+        }
+        if !(storage::MIN_CONTACT_TUNNEL_HOPS..=storage::MAX_CONTACT_TUNNEL_HOPS)
+            .contains(&tunnel_hops)
+        {
+            return Err(format!(
+                "Tunnel length must be {}-{}.",
+                storage::MIN_CONTACT_TUNNEL_HOPS,
+                storage::MAX_CONTACT_TUNNEL_HOPS
+            ));
+        }
+        if !(storage::MIN_CONTACT_TUNNEL_QUANTITY..=storage::MAX_CONTACT_TUNNEL_QUANTITY)
+            .contains(&tunnel_quantity)
+        {
+            return Err(format!(
+                "Tunnel quantity must be {}-{}.",
+                storage::MIN_CONTACT_TUNNEL_QUANTITY,
+                storage::MAX_CONTACT_TUNNEL_QUANTITY
+            ));
+        }
+
+        let mut meta = storage::load_contact_meta(&name).map_err(|err| err.to_string())?;
+        meta.tunnel_hops = tunnel_hops;
+        meta.tunnel_quantity = tunnel_quantity;
+        storage::save_contact_meta(&meta).map_err(|err| err.to_string())?;
+        self.contact_details_tunnel_hops_input = tunnel_hops.to_string();
+        self.contact_details_tunnel_quantity_input = tunnel_quantity.to_string();
+        self.contact_details_meta = Some(meta);
+        Ok(())
+    }
+
+    fn copy_contact_detail_to_clipboard(&mut self, value: Option<String>, label: &str) {
+        let Some(value) = value else {
+            self.contact_details_status = format!("{label} is not available.");
+            return;
+        };
+        match self.clipboard.as_mut() {
+            Some(clipboard) => match clipboard.set_text(value) {
+                Ok(()) => self.contact_details_status = format!("Copied {label}."),
+                Err(err) => {
+                    self.contact_details_status = format!("Clipboard copy failed: {err}")
+                }
+            },
+            None => self.contact_details_status = "Clipboard is not available.".into(),
+        }
     }
 
     fn generate_tab_id() -> u64 {
@@ -1287,11 +1536,19 @@ impl IcedCommApp {
             }
         }
 
+        if tab.session.history_enabled {
+            Self::load_history_into_tab(
+                &mut tab,
+                HistoryScope::Contact(profile_name.to_string()),
+            );
+        }
+
         tab
     }
 
     fn new_opened_group_tab(&self, group_meta: GroupMeta) -> OpenedTab {
-        let profile_name = format!("group:{}", storage::group_storage_key(&group_meta));
+        let group_key = storage::group_storage_key(&group_meta);
+        let profile_name = format!("group:{group_key}");
         let mut tab = self.new_opened_tab(&profile_name);
 
         tab.meta.kind = TabKind::Group;
@@ -1307,6 +1564,7 @@ impl IcedCommApp {
         tab.session.pending_peer_addr = None;
         tab.session.pending_peer_dest_b64 = None;
         tab.session.offline_mode = false;
+        tab.session.history_enabled = group_meta.history_enabled;
         tab.session.deaddrop_servers.clear();
         tab.session.show_deaddrop_panel = false;
         tab.session.log_lines = LogLines::from_messages(vec![
@@ -1328,6 +1586,10 @@ impl IcedCommApp {
             accept_armed: false,
             publish_ready: false,
         });
+
+        if tab.session.history_enabled {
+            Self::load_history_into_tab(&mut tab, HistoryScope::Group(group_key));
+        }
 
         tab
     }
@@ -2162,7 +2424,16 @@ impl IcedCommApp {
     }
 
     fn start_tab_runtime_task(&self, tab_idx: usize) -> Task<Message> {
-        let (tab_id, tab_kind, profile_name, sam_host, sam_port, saved_dest_b64) =
+        let (
+            tab_id,
+            tab_kind,
+            profile_name,
+            sam_host,
+            sam_port,
+            saved_dest_b64,
+            tunnel_hops,
+            tunnel_quantity,
+        ) =
             if let Some(tab) = self.opened_tabs.get(tab_idx) {
                 (
                     tab.id,
@@ -2174,6 +2445,8 @@ impl IcedCommApp {
                         .as_ref()
                         .and_then(|group| group.meta.my_dest_b64.clone())
                         .or_else(|| tab.session.my_dest_b64.clone()),
+                    tab.session.sam_tunnel_hops,
+                    tab.session.sam_tunnel_quantity,
                 )
             } else {
                 return Task::none();
@@ -2215,11 +2488,20 @@ impl IcedCommApp {
                             .map_err(|e| e.to_string())?
                     }
                 } else if let Some(my_dest_b64) = saved_dest_b64 {
-                    sam.initialize_persistent(session_id, my_dest_b64)
+                    sam.initialize_persistent_with_tunnels(
+                        session_id,
+                        my_dest_b64,
+                        tunnel_hops,
+                        tunnel_quantity,
+                    )
                         .await
                         .map_err(|e| e.to_string())?
                 } else {
-                    sam.initialize_transient(session_id)
+                    sam.initialize_transient_with_tunnels(
+                        session_id,
+                        tunnel_hops,
+                        tunnel_quantity,
+                    )
                         .await
                         .map_err(|e| e.to_string())?
                 };
@@ -2268,12 +2550,23 @@ impl IcedCommApp {
     fn message_editor_key_binding(
         key_press: text_editor::KeyPress,
     ) -> Option<text_editor::Binding<Message>> {
-        let is_paste = matches!(key_press.status, text_editor::Status::Focused { .. })
+        let editor_focused = matches!(key_press.status, text_editor::Status::Focused { .. });
+        let is_send = editor_focused
+            && key_press.modifiers.command()
+            && !key_press.modifiers.shift()
+            && !key_press.modifiers.alt()
+            && matches!(
+                key_press.key.as_ref(),
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+            );
+        let is_paste = editor_focused
             && key_press.modifiers.command()
             && !key_press.modifiers.alt()
             && key_press.key.to_latin(key_press.physical_key) == Some('v');
 
-        if is_paste {
+        if is_send {
+            Some(text_editor::Binding::Custom(Message::SendPressed))
+        } else if is_paste {
             Some(text_editor::Binding::Custom(Message::PasteFromClipboard))
         } else {
             text_editor::Binding::from_key_press(key_press)
@@ -2383,15 +2676,287 @@ impl IcedCommApp {
                 return Task::none();
             }
 
+            Message::SidebarSectionSelected(section) => {
+                let sidebar_confirmation_active = matches!(
+                    state.session.sidebar_confirm,
+                    Some(
+                        SidebarConfirm::DeleteProfile(_)
+                            | SidebarConfirm::ResetProfile(_)
+                            | SidebarConfirm::DeleteGroup { .. }
+                    )
+                ) || state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm;
+                if !sidebar_confirmation_active {
+                    state.active_sidebar_section = section;
+                    if section == SidebarSection::Groups {
+                        state.contact_details_rename_mode = false;
+                        state.contact_details_clear_history_confirm = false;
+                    }
+                }
+                return Task::none();
+            }
+
             Message::ProfileSelected(idx) => {
+                if state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
                 if idx < state.session.profiles.len() {
                     state.session.selected_profile_idx = idx;
                     state.session.sidebar_confirm = None;
+                    state.contact_details_rename_mode = false;
+                    state.contact_details_clear_history_confirm = false;
+                    state.contact_details_status.clear();
+                    if state.contact_details_open {
+                        state.refresh_contact_details();
+                    }
                     return Task::none();
                 }
             }
 
+            Message::ToggleContactDetailsPressed => {
+                if state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
+                if state.selected_persistent_contact_name().is_none() {
+                    state.close_contact_details();
+                    return Task::none();
+                }
+                if state.contact_details_open {
+                    state.close_contact_details();
+                } else {
+                    state.contact_details_open = true;
+                    state.contact_details_status.clear();
+                    state.refresh_contact_details();
+                }
+                return Task::none();
+            }
+
+            Message::BeginContactRenamePressed => {
+                let Some(name) = state.selected_persistent_contact_name() else {
+                    return Task::none();
+                };
+                if state.is_profile_open_in_any_tab(&name) {
+                    state.contact_details_status =
+                        "Close the contact before renaming it.".into();
+                    return Task::none();
+                }
+                state.contact_details_open = true;
+                state.refresh_contact_details();
+                state.contact_details_rename_mode = true;
+                state.contact_details_rename_input = name;
+                state.contact_details_clear_history_confirm = false;
+                state.contact_details_status.clear();
+                return Task::none();
+            }
+
+            Message::ContactRenameInputChanged(value) => {
+                state.contact_details_rename_input = value;
+                return Task::none();
+            }
+
+            Message::SaveContactRenamePressed => {
+                let Some(old_name) = state.selected_persistent_contact_name() else {
+                    return Task::none();
+                };
+                if state.is_profile_open_in_any_tab(&old_name) {
+                    state.contact_details_status =
+                        "Close the contact before renaming it.".into();
+                    return Task::none();
+                }
+                let new_name = state.contact_details_rename_input.trim().to_string();
+                if new_name.is_empty() {
+                    state.contact_details_status = "Contact name cannot be empty.".into();
+                    return Task::none();
+                }
+                if state.session.profiles.iter().any(|profile| {
+                    profile.name != old_name && profile.name.eq_ignore_ascii_case(&new_name)
+                }) || state
+                    .session
+                    .groups
+                    .iter()
+                    .any(|group| group.name.eq_ignore_ascii_case(&new_name))
+                {
+                    state.contact_details_status = "That name already exists.".into();
+                    return Task::none();
+                }
+
+                match storage::rename_contact(&old_name, &new_name) {
+                    Ok(meta) => {
+                        if let Some(profile) = state
+                            .session
+                            .profiles
+                            .iter_mut()
+                            .find(|profile| profile.name == old_name)
+                        {
+                            profile.name = new_name.clone();
+                        }
+                        state.contact_details_meta = Some(meta);
+                        state.contact_details_rename_mode = false;
+                        state.contact_details_rename_input = new_name.clone();
+                        state.contact_details_status =
+                            format!("Renamed contact to {new_name}.");
+                    }
+                    Err(err) => {
+                        state.contact_details_status = format!("Rename contact failed: {err}");
+                    }
+                }
+                return Task::none();
+            }
+
+            Message::CancelContactRenamePressed => {
+                state.contact_details_rename_mode = false;
+                state.contact_details_rename_input = state
+                    .selected_persistent_contact_name()
+                    .unwrap_or_default();
+                state.contact_details_status.clear();
+                return Task::none();
+            }
+
+            Message::ContactHistoryEnabledChanged(enabled) => {
+                state.contact_details_clear_history_confirm = false;
+                match state.set_selected_contact_history(enabled) {
+                    Ok(()) => {
+                        state.contact_details_status = if enabled {
+                            "Text history enabled.".into()
+                        } else {
+                            "Text history disabled.".into()
+                        }
+                    }
+                    Err(err) => {
+                        state.contact_details_status =
+                            format!("Save history setting failed: {err}")
+                    }
+                }
+                return Task::none();
+            }
+
+            Message::ContactClearHistoryPressed => {
+                state.contact_details_clear_history_confirm = true;
+                state.contact_details_status.clear();
+                return Task::none();
+            }
+
+            Message::ContactClearHistoryConfirmed => {
+                match state.clear_selected_contact_history() {
+                    Ok(()) => state.contact_details_status = "Text history cleared.".into(),
+                    Err(err) => {
+                        state.contact_details_status = format!("Clear text history failed: {err}")
+                    }
+                }
+                state.contact_details_clear_history_confirm = false;
+                return Task::none();
+            }
+
+            Message::ContactClearHistoryCancelled => {
+                state.contact_details_clear_history_confirm = false;
+                return Task::none();
+            }
+
+            Message::ContactTunnelHopsChanged(value) => {
+                let contact_open = state
+                    .selected_persistent_contact_name()
+                    .map(|name| state.is_profile_open_in_any_tab(&name))
+                    .unwrap_or(true);
+                let profile_confirmation_active = matches!(
+                    state.session.sidebar_confirm,
+                    Some(SidebarConfirm::DeleteProfile(_) | SidebarConfirm::ResetProfile(_))
+                );
+                if contact_open
+                    || profile_confirmation_active
+                    || state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
+                if value.is_empty() || value.chars().all(|ch| ch.is_ascii_digit()) {
+                    state.contact_details_tunnel_hops_input = value;
+                }
+                return Task::none();
+            }
+
+            Message::ContactTunnelQuantityChanged(value) => {
+                let contact_open = state
+                    .selected_persistent_contact_name()
+                    .map(|name| state.is_profile_open_in_any_tab(&name))
+                    .unwrap_or(true);
+                let profile_confirmation_active = matches!(
+                    state.session.sidebar_confirm,
+                    Some(SidebarConfirm::DeleteProfile(_) | SidebarConfirm::ResetProfile(_))
+                );
+                if contact_open
+                    || profile_confirmation_active
+                    || state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
+                if value.is_empty() || value.chars().all(|ch| ch.is_ascii_digit()) {
+                    state.contact_details_tunnel_quantity_input = value;
+                }
+                return Task::none();
+            }
+
+            Message::SaveContactTunnelsPressed => {
+                let hops = state.contact_details_tunnel_hops_input.parse::<u8>();
+                let quantity = state.contact_details_tunnel_quantity_input.parse::<u8>();
+                match (hops, quantity) {
+                    (Ok(hops), Ok(quantity)) => {
+                        match state.save_selected_contact_tunnels(hops, quantity) {
+                            Ok(()) => {
+                                state.contact_details_status = "Tunnel settings saved.".into()
+                            }
+                            Err(err) => state.contact_details_status = err,
+                        }
+                    }
+                    _ => {
+                        state.contact_details_status =
+                            "Enter valid numeric tunnel settings.".into()
+                    }
+                }
+                return Task::none();
+            }
+
+            Message::ResetContactTunnelsPressed => {
+                match state.save_selected_contact_tunnels(
+                    storage::DEFAULT_CONTACT_TUNNEL_HOPS,
+                    storage::DEFAULT_CONTACT_TUNNEL_QUANTITY,
+                ) {
+                    Ok(()) => {
+                        state.contact_details_status = "Default tunnel settings restored.".into()
+                    }
+                    Err(err) => state.contact_details_status = err,
+                }
+                return Task::none();
+            }
+
+            Message::CopyContactMyB32Pressed => {
+                let value = state
+                    .contact_details_meta
+                    .as_ref()
+                    .and_then(|meta| meta.my_b32.clone());
+                state.copy_contact_detail_to_clipboard(value, "my B32 address");
+                return Task::none();
+            }
+
+            Message::CopyContactPeerB32Pressed => {
+                let value = state
+                    .contact_details_meta
+                    .as_ref()
+                    .and_then(|meta| meta.locked_peer.clone());
+                state.copy_contact_detail_to_clipboard(value, "peer B32 address");
+                return Task::none();
+            }
+
             Message::OpenSelectedProfilePressed => {
+                if state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
                 let idx = state.session.selected_profile_idx;
 
                 if idx < state.session.profiles.len() {
@@ -3395,7 +3960,7 @@ impl IcedCommApp {
                                     status_lines: vec![
                                         format!("{APP_NAME} {APP_VERSION}"),
                                         "Application ready.".into(),
-                                        "Open a profile to start a chat tab.".into(),
+                                        "Open a contact to start a chat tab.".into(),
                                     ],
                                     log_lines: state.session.log_lines.clone(),
                                     ..SessionState::default()
@@ -3433,10 +3998,15 @@ impl IcedCommApp {
             }
 
             Message::CreateProfilePressed => {
+                if state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
                 let name = state.session.profile_name_input.trim().to_string();
 
                 if name.is_empty() {
-                    state.post_system("Profile name cannot be empty.");
+                    state.post_system("Contact name cannot be empty.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
@@ -3444,7 +4014,7 @@ impl IcedCommApp {
                     || name.eq_ignore_ascii_case("__app__")
                     || name.eq_ignore_ascii_case("global")
                 {
-                    state.post_system("That profile name is reserved.");
+                    state.post_system("That contact name is reserved.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
@@ -3472,17 +4042,25 @@ impl IcedCommApp {
                         state.session.selected_profile_idx = state.session.profiles.len() - 1;
                         state.session.profile_name_input.clear();
                         state.session.sidebar_confirm = None;
-                        state.post_system(format!("Created profile: {name}"));
+                        if state.contact_details_open {
+                            state.refresh_contact_details();
+                        }
+                        state.post_system(format!("Created contact: {name}"));
                         return operation::snap_to_end(state.session.logs_scroll_id.clone());
                     }
                     Err(err) => {
-                        state.post_system(format!("Create profile failed: {err}"));
+                        state.post_system(format!("Create contact failed: {err}"));
                         return operation::snap_to_end(state.session.logs_scroll_id.clone());
                     }
                 }
             }
 
             Message::DeleteProfilePressed => {
+                if state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
                 let idx = state.session.selected_profile_idx;
 
                 if idx >= state.session.profiles.len() {
@@ -3492,12 +4070,12 @@ impl IcedCommApp {
                 let selected = state.session.profiles[idx].clone();
 
                 if !selected.persistent {
-                    state.post_system("Transient profile cannot be deleted.");
+                    state.post_system("The transient contact cannot be deleted.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
                 if state.is_profile_open_in_any_tab(&selected.name) {
-                    state.post_system("Close that profile tab before deleting it.");
+                    state.post_system("Close that contact tab before deleting it.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
@@ -3507,6 +4085,11 @@ impl IcedCommApp {
             }
 
             Message::ResetProfilePressed => {
+                if state.contact_details_rename_mode
+                    || state.contact_details_clear_history_confirm
+                {
+                    return Task::none();
+                }
                 let idx = state.session.selected_profile_idx;
 
                 if idx >= state.session.profiles.len() {
@@ -3516,12 +4099,12 @@ impl IcedCommApp {
                 let selected = state.session.profiles[idx].clone();
 
                 if !selected.persistent {
-                    state.post_system("Transient profile cannot be reset.");
+                    state.post_system("The transient contact cannot be reset.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
                 if state.is_profile_open_in_any_tab(&selected.name) {
-                    state.post_system("Close that profile tab before resetting it.");
+                    state.post_system("Close that contact tab before resetting it.");
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
@@ -3539,7 +4122,7 @@ impl IcedCommApp {
                 match confirm {
                     SidebarConfirm::DeleteProfile(name) => {
                         if state.is_profile_open_in_any_tab(&name) {
-                            state.post_system("Close that profile tab before deleting it.");
+                            state.post_system("Close that contact tab before deleting it.");
                             return operation::snap_to_end(state.session.logs_scroll_id.clone());
                         }
 
@@ -3552,13 +4135,14 @@ impl IcedCommApp {
                                 }
                                 state.session.selected_profile_idx = 0;
                                 state.session.profile = state.session.profiles[0].name.clone();
-                                state.post_system(format!("Deleted profile: {name}"));
+                                state.close_contact_details();
+                                state.post_system(format!("Deleted contact: {name}"));
                                 return operation::snap_to_end(
                                     state.session.logs_scroll_id.clone(),
                                 );
                             }
                             Err(err) => {
-                                state.post_system(format!("Delete profile failed: {err}"));
+                                state.post_system(format!("Delete contact failed: {err}"));
                                 return operation::snap_to_end(
                                     state.session.logs_scroll_id.clone(),
                                 );
@@ -3567,19 +4151,22 @@ impl IcedCommApp {
                     }
                     SidebarConfirm::ResetProfile(name) => {
                         if state.is_profile_open_in_any_tab(&name) {
-                            state.post_system("Close that profile tab before resetting it.");
+                            state.post_system("Close that contact tab before resetting it.");
                             return operation::snap_to_end(state.session.logs_scroll_id.clone());
                         }
 
                         match storage::reset_contact(&name) {
                             Ok(_) => {
-                                state.post_system(format!("Reset profile: {name}"));
+                                if state.contact_details_open {
+                                    state.refresh_contact_details();
+                                }
+                                state.post_system(format!("Reset contact: {name}"));
                                 return operation::snap_to_end(
                                     state.session.logs_scroll_id.clone(),
                                 );
                             }
                             Err(err) => {
-                                state.post_system(format!("Reset profile failed: {err}"));
+                                state.post_system(format!("Reset contact failed: {err}"));
                                 return operation::snap_to_end(
                                     state.session.logs_scroll_id.clone(),
                                 );
@@ -3783,6 +4370,8 @@ impl IcedCommApp {
                             msg_id,
                             expected_acks,
                         ));
+                        let sender_b32 = state.session.my_b32.clone();
+                        state.append_active_latest_text_history(sender_b32);
                         Self::clear_message_draft(&mut state.session);
                         state.session.reply_to = None;
                         state.store_active_runtime();
@@ -3822,6 +4411,8 @@ impl IcedCommApp {
                             .session
                             .bubbles
                             .push(Bubble::me_with_id(outgoing_text, msg_id));
+                        let sender_b32 = state.session.my_b32.clone();
+                        state.append_active_latest_text_history(sender_b32);
 
                         Self::clear_message_draft(&mut state.session);
                         state.session.reply_to = None;
@@ -3938,6 +4529,8 @@ impl IcedCommApp {
                             outgoing_text.clone(),
                             offline_msg_id,
                         ));
+                        let sender_b32 = state.session.my_b32.clone();
+                        state.append_active_latest_text_history(sender_b32);
 
                         Self::clear_message_draft(&mut state.session);
                         state.session.reply_to = None;
@@ -4241,7 +4834,7 @@ impl IcedCommApp {
                 GuiAction::DdList => {
                     if !Self::deaddrop_panel_allowed(&state.session) {
                         state.post_system(
-                            "Deaddrop servers are available only for persistent locked profiles.",
+                            "Deaddrop servers are available only for persistent locked contacts.",
                         );
                         return operation::snap_to_end(state.session.logs_scroll_id.clone());
                     }
@@ -4251,6 +4844,7 @@ impl IcedCommApp {
                     if show_deaddrop_panel {
                         state.session.show_logs = false;
                         state.session.show_group_panel = false;
+                        state.session.show_profile_panel = false;
                     }
                     state.store_active_runtime();
                     return operation::snap_to_end(state.session.messages_scroll_id.clone());
@@ -4462,6 +5056,7 @@ impl IcedCommApp {
                 if show_logs {
                     state.session.show_deaddrop_panel = false;
                     state.session.show_group_panel = false;
+                    state.session.show_profile_panel = false;
                 }
                 state.store_active_runtime();
                 if state.session.show_logs {
@@ -4480,7 +5075,115 @@ impl IcedCommApp {
                 if show_group_panel {
                     state.session.show_logs = false;
                     state.session.show_deaddrop_panel = false;
+                    state.session.show_profile_panel = false;
                 }
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::ToggleProfilePanelPressed => {
+                let profile_panel_allowed = state
+                    .active_tab()
+                    .map(Self::is_persistent_contact_tab)
+                    .unwrap_or(false);
+                if !profile_panel_allowed {
+                    return Task::none();
+                }
+
+                let show_profile_panel = !state.session.show_profile_panel;
+                state.session.show_profile_panel = show_profile_panel;
+                if show_profile_panel {
+                    state.session.show_logs = false;
+                    state.session.show_deaddrop_panel = false;
+                    state.session.show_group_panel = false;
+                }
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::HistoryEnabledChanged(enabled) => {
+                let Some(scope) = state.active_history_scope() else {
+                    return Task::none();
+                };
+
+                state.session.history_enabled = enabled;
+                state.session.history_clear_confirm = None;
+                if enabled {
+                    Self::load_history_into_session(&mut state.session, &scope);
+                }
+                state.store_active_runtime();
+
+                match scope {
+                    HistoryScope::Contact(_) => state.save_active_contact_meta(),
+                    HistoryScope::Group(group_key) => {
+                        let updated_group = state.active_tab_mut().and_then(|tab| {
+                            let group = tab.group.as_mut()?;
+                            group.meta.history_enabled = enabled;
+                            Some(group.meta.clone())
+                        });
+
+                        if let Some(group) = updated_group {
+                            if let Err(err) = storage::save_group_meta(&group) {
+                                state.session.log_lines.push(format!(
+                                    "Save group history setting failed: {err}"
+                                ));
+                            } else if let Some(stored) = state
+                                .session
+                                .groups
+                                .iter_mut()
+                                .find(|stored| storage::group_storage_key(stored) == group_key)
+                            {
+                                stored.history_enabled = enabled;
+                            }
+                        }
+                    }
+                }
+
+                return Task::none();
+            }
+
+            Message::ClearHistoryPressed => {
+                state.session.history_clear_confirm = match state.active_tab().map(|tab| tab.meta.kind) {
+                    Some(TabKind::Chat)
+                        if state
+                            .active_tab()
+                            .map(Self::is_persistent_contact_tab)
+                            .unwrap_or(false) => Some(HistoryClearConfirm::Contact),
+                    Some(TabKind::Group) => Some(HistoryClearConfirm::Group),
+                    _ => None,
+                };
+                state.store_active_runtime();
+                return Task::none();
+            }
+
+            Message::ClearHistoryConfirmed => {
+                let Some(scope) = state.active_history_scope() else {
+                    state.session.history_clear_confirm = None;
+                    state.store_active_runtime();
+                    return Task::none();
+                };
+
+                match history::clear(&scope) {
+                    Ok(()) => {
+                        state
+                            .session
+                            .bubbles
+                            .retain(|bubble| !matches!(&bubble.content, BubbleContent::Text(_)));
+                        state.session.history_loaded = true;
+                        state.session.log_lines.push("Text history cleared.".into());
+                    }
+                    Err(err) => state
+                        .session
+                        .log_lines
+                        .push(format!("Clear text history failed: {err}")),
+                }
+                state.session.history_clear_confirm = None;
+                state.store_active_runtime();
+                return operation::snap_to_end(state.session.messages_scroll_id.clone());
+            }
+
+            Message::ClearHistoryCancelled => {
+                state.session.history_clear_confirm = None;
                 state.store_active_runtime();
                 return Task::none();
             }
@@ -4648,7 +5351,7 @@ impl IcedCommApp {
             Message::DdServerAddPressed => {
                 if !Self::deaddrop_panel_allowed(&state.session) {
                     state.post_system(
-                        "Deaddrop servers are available only for persistent locked profiles.",
+                        "Deaddrop servers are available only for persistent locked contacts.",
                     );
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
@@ -4688,7 +5391,7 @@ impl IcedCommApp {
             Message::DdServerDeletePressed(index) => {
                 if !Self::deaddrop_panel_allowed(&state.session) {
                     state.post_system(
-                        "Deaddrop servers are available only for persistent locked profiles.",
+                        "Deaddrop servers are available only for persistent locked contacts.",
                     );
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
@@ -4714,7 +5417,7 @@ impl IcedCommApp {
 
                 if !Self::deaddrop_panel_allowed(&state.session) {
                     state.post_system(
-                        "Deaddrop servers are available only for persistent locked profiles.",
+                        "Deaddrop servers are available only for persistent locked contacts.",
                     );
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
@@ -4759,7 +5462,7 @@ impl IcedCommApp {
             Message::DdServerSharePressed => {
                 if !Self::deaddrop_panel_allowed(&state.session) {
                     state.post_system(
-                        "Deaddrop servers are available only for persistent locked profiles.",
+                        "Deaddrop servers are available only for persistent locked contacts.",
                     );
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
@@ -6718,7 +7421,7 @@ impl IcedCommApp {
                 }
 
                 state.backup_operation = BackupOperation::AwaitingWipeConfirm;
-                state.wipe_all_status = "Confirm wipe: this deletes all profiles and files.".into();
+                state.wipe_all_status = "Confirm wipe: this deletes all contacts and files.".into();
                 return Task::none();
             }
 
@@ -6736,7 +7439,7 @@ impl IcedCommApp {
                     .filter(|profile| profile.persistent)
                 else {
                     state.profile_export_status =
-                        "Select a persistent profile before profile export.".into();
+                        "Select a persistent contact before contact export.".into();
                     return Task::none();
                 };
 
@@ -6746,13 +7449,13 @@ impl IcedCommApp {
                     .any(|tab| tab.session.profile == profile.name)
                 {
                     state.profile_export_status =
-                        format!("Close the {} chat tab before profile export.", profile.name);
+                        format!("Close the {} chat tab before contact export.", profile.name);
                     return Task::none();
                 }
 
                 if state.profile_export_passphrase.trim().is_empty() {
                     state.profile_export_status =
-                        "Enter profile export passphrase before export.".into();
+                        "Enter contact export passphrase before export.".into();
                     return Task::none();
                 }
 
@@ -6761,7 +7464,7 @@ impl IcedCommApp {
                     async move {
                         rfd::AsyncFileDialog::new()
                             .add_filter("IcedComm-I2P backup", &["tcbak"])
-                            .set_file_name(format!("{profile_name}-profile-v2.tcbak"))
+                            .set_file_name(format!("{profile_name}-contact-v2.tcbak"))
                             .save_file()
                             .await
                             .map(|f| f.path().to_path_buf())
@@ -6779,7 +7482,7 @@ impl IcedCommApp {
 
                 if state.profile_import_passphrase.trim().is_empty() {
                     state.profile_import_status =
-                        "Enter profile import passphrase before import.".into();
+                        "Enter contact import passphrase before import.".into();
                     return Task::none();
                 }
 
@@ -6833,7 +7536,7 @@ impl IcedCommApp {
                     .filter(|profile| profile.persistent)
                 else {
                     state.profile_export_status =
-                        "Select a persistent profile before profile export.".into();
+                        "Select a persistent contact before contact export.".into();
                     return Task::none();
                 };
 
@@ -6843,14 +7546,14 @@ impl IcedCommApp {
                     .any(|tab| tab.session.profile == profile.name)
                 {
                     state.profile_export_status =
-                        format!("Close the {} chat tab before profile export.", profile.name);
+                        format!("Close the {} chat tab before contact export.", profile.name);
                     return Task::none();
                 }
 
                 let profile_name = profile.name.clone();
                 let passphrase = state.profile_export_passphrase.clone();
                 state.profile_export_status =
-                    format!("Exporting encrypted profile backup for {profile_name}...");
+                    format!("Exporting encrypted contact backup for {profile_name}...");
                 state.backup_operation = BackupOperation::ProfileExporting;
 
                 return Task::perform(
@@ -6898,7 +7601,7 @@ impl IcedCommApp {
                         state.pending_backup_import_passphrase = passphrase;
                         state.backup_operation = BackupOperation::AwaitingReplaceConfirm;
                         let msg = format!(
-                            "Local profiles or files already exist. Confirm replacement before importing {}.",
+                            "Local contacts or files already exist. Confirm replacement before importing {}.",
                             path.display()
                         );
                         if state.startup_gate == StartupGate::Locked {
@@ -6937,7 +7640,7 @@ impl IcedCommApp {
                 };
 
                 let passphrase = state.profile_import_passphrase.clone();
-                state.profile_import_status = "Inspecting encrypted profile backup...".into();
+                state.profile_import_status = "Inspecting encrypted contact backup...".into();
                 state.backup_operation = BackupOperation::ProfileImporting;
 
                 return Task::perform(
@@ -6962,7 +7665,7 @@ impl IcedCommApp {
                         {
                             state.backup_operation = BackupOperation::Idle;
                             state.profile_import_status = format!(
-                                "Close the {profile_name} chat tab before replacing that profile."
+                                "Close the {profile_name} chat tab before replacing that contact."
                             );
                             Task::none()
                         } else {
@@ -6972,7 +7675,7 @@ impl IcedCommApp {
                             state.pending_profile_import_name = Some(profile_name.clone());
                             state.backup_operation = BackupOperation::AwaitingProfileReplaceConfirm;
                             state.profile_import_status = format!(
-                                "Profile {profile_name} already exists. Confirm replacement before importing {}.",
+                                "Contact {profile_name} already exists. Confirm replacement before importing {}.",
                                 path.display()
                             );
                             Task::none()
@@ -6981,13 +7684,13 @@ impl IcedCommApp {
                     Ok((path, profile_name, false)) => {
                         let passphrase = state.profile_import_passphrase.clone();
                         state.profile_import_status =
-                            format!("Importing encrypted profile backup for {profile_name}...");
+                            format!("Importing encrypted contact backup for {profile_name}...");
 
                         Task::perform(
                             async move {
                                 crate::backup::import_profile_backup(&path, &passphrase, false)
                                     .map(|name| {
-                                        format!("Imported profile {name} from {}", path.display())
+                                        format!("Imported contact {name} from {}", path.display())
                                     })
                                     .map_err(|e| e.to_string())
                             },
@@ -6997,7 +7700,7 @@ impl IcedCommApp {
                     Err(err) => {
                         state.backup_operation = BackupOperation::Idle;
                         state.profile_import_status =
-                            format!("Profile backup import failed: {err}");
+                            format!("Contact backup import failed: {err}");
                         Task::none()
                     }
                 };
@@ -7060,7 +7763,7 @@ impl IcedCommApp {
                 }
 
                 state.backup_operation = BackupOperation::Wiping;
-                state.wipe_all_status = "Wiping all profiles and stored files...".into();
+                state.wipe_all_status = "Wiping all contacts and stored files...".into();
 
                 return Task::perform(
                     async move {
@@ -7088,7 +7791,7 @@ impl IcedCommApp {
                 let profile_name = state
                     .pending_profile_import_name
                     .clone()
-                    .unwrap_or_else(|| "profile".into());
+                    .unwrap_or_else(|| "contact".into());
 
                 if state
                     .opened_tabs
@@ -7100,7 +7803,7 @@ impl IcedCommApp {
                     state.pending_profile_import_passphrase.clear();
                     state.pending_profile_import_name = None;
                     state.profile_import_status =
-                        format!("Close the {profile_name} chat tab before replacing that profile.");
+                        format!("Close the {profile_name} chat tab before replacing that contact.");
                     return Task::none();
                 }
 
@@ -7108,12 +7811,12 @@ impl IcedCommApp {
                 state.pending_profile_import_passphrase.clear();
                 state.pending_profile_import_name = None;
                 state.backup_operation = BackupOperation::ProfileImporting;
-                state.profile_import_status = format!("Replacing local profile {profile_name}...");
+                state.profile_import_status = format!("Replacing local contact {profile_name}...");
 
                 return Task::perform(
                     async move {
                         crate::backup::import_profile_backup(&path, &passphrase, true)
-                            .map(|name| format!("Imported profile {name} from {}", path.display()))
+                            .map(|name| format!("Imported contact {name} from {}", path.display()))
                             .map_err(|e| e.to_string())
                     },
                     Message::ProfileBackupImportFinished,
@@ -7125,7 +7828,7 @@ impl IcedCommApp {
                 state.pending_profile_import_passphrase.clear();
                 state.pending_profile_import_name = None;
                 state.backup_operation = BackupOperation::Idle;
-                state.profile_import_status = "Profile backup import cancelled.".into();
+                state.profile_import_status = "Contact backup import cancelled.".into();
                 return Task::none();
             }
 
@@ -7163,7 +7866,7 @@ impl IcedCommApp {
                         state.profile_export_passphrase.clear();
                         state.profile_import_passphrase.clear();
                         state.wipe_all_status =
-                            "Wipe deletes all profiles and stored files.".into();
+                            "Wipe deletes all contacts and stored files.".into();
                     }
                     Err(err) => {
                         state.wipe_all_status = format!("Wipe failed: {err}");
@@ -7177,13 +7880,13 @@ impl IcedCommApp {
                 match result {
                     Ok((path, profile_name)) => {
                         state.profile_export_status = format!(
-                            "Exported profile {profile_name} backup to {}",
+                            "Exported contact {profile_name} backup to {}",
                             path.display()
                         );
                     }
                     Err(err) => {
                         state.profile_export_status =
-                            format!("Profile backup export failed: {err}");
+                            format!("Contact backup export failed: {err}");
                     }
                 }
                 return Task::none();
@@ -7214,14 +7917,14 @@ impl IcedCommApp {
                             }
                             Err(err) => {
                                 state.profile_import_status = format!(
-                                    "Imported profile, but failed to refresh profiles: {err}"
+                                    "Imported contact, but failed to refresh contacts: {err}"
                                 );
                             }
                         }
                     }
                     Err(err) => {
                         state.profile_import_status =
-                            format!("Profile backup import failed: {err}");
+                            format!("Contact backup import failed: {err}");
                     }
                 }
                 return Task::none();
@@ -7263,7 +7966,7 @@ impl IcedCommApp {
                                 }
                                 Err(err) => {
                                     state.backup_import_status = format!(
-                                        "Imported backup, but failed to refresh profiles: {err}"
+                                        "Imported backup, but failed to refresh contacts: {err}"
                                     );
                                 }
                             }
@@ -7294,7 +7997,9 @@ impl IcedCommApp {
 
                             match status.as_str() {
                                 "OK" | "EXISTS" => {
-                                    Self::mark_delivered(tab, offline_msg_id);
+                                    if Self::mark_delivered(tab, offline_msg_id) {
+                                        Self::append_history_delivery(tab, offline_msg_id, None);
+                                    }
                                     if tab.session.drop_send_index == used_index {
                                         tab.session.drop_send_index = used_index + 1;
                                     }
@@ -7566,8 +8271,20 @@ impl IcedCommApp {
             state.session.sidebar_confirm,
             Some(SidebarConfirm::DeleteGroupMember { .. })
         );
-        let profile_buttons_allowed = !profile_confirm_active;
+        let contact_details_operation_active =
+            state.contact_details_rename_mode || state.contact_details_clear_history_confirm;
+        let profile_buttons_allowed =
+            !profile_confirm_active && !contact_details_operation_active;
         let profile_ops_allowed = delete_allowed && profile_buttons_allowed;
+        let selected_contact_open = selected_profile
+            .filter(|profile| profile.persistent)
+            .map(|profile| state.is_profile_open_in_any_tab(&profile.name))
+            .unwrap_or(false);
+        let contact_details_allowed = selected_profile
+            .map(|profile| profile.persistent)
+            .unwrap_or(false)
+            && profile_buttons_allowed;
+        let contact_rename_allowed = contact_details_allowed && !selected_contact_open;
         let group_buttons_allowed = !group_delete_confirm_active;
         let selected_group = state
             .session
@@ -7602,7 +8319,7 @@ impl IcedCommApp {
 
         let profile_sidebar_confirm = match &state.session.sidebar_confirm {
             Some(SidebarConfirm::DeleteProfile(name)) => column![
-                text(format!("Delete profile {name}?")).size(12),
+                text(format!("Delete contact {name}?")).size(12),
                 row![
                     button(text("Yes").size(12))
                         .padding([4, 8])
@@ -7617,7 +8334,7 @@ impl IcedCommApp {
             ]
             .spacing(6),
             Some(SidebarConfirm::ResetProfile(name)) => column![
-                text(format!("Reset profile {name}?")).size(12),
+                text(format!("Reset contact {name}?")).size(12),
                 row![
                     button(text("Yes").size(12))
                         .padding([4, 8])
@@ -7679,7 +8396,9 @@ impl IcedCommApp {
                     )
                     .width(Length::Fill)
                     .style(move |theme, status| profile_button_style(theme, status, selected))
-                    .on_press(Message::ProfileSelected(idx)),
+                    .on_press_maybe(
+                        profile_buttons_allowed.then_some(Message::ProfileSelected(idx)),
+                    ),
                 )
             },
         );
@@ -7724,203 +8443,537 @@ impl IcedCommApp {
             )
         };
 
-        let profile_sidebar = container(
-            column![
-                container(
-                    scrollable(profile_list)
-                        .height(Length::Fill)
-                        .width(Length::Fill)
-                )
-                .height(Length::FillPortion(2))
+        let sidebar_switch_allowed = !profile_confirm_active
+            && !group_delete_confirm_active
+            && !contact_details_operation_active;
+        let one_to_one_selected = state.active_sidebar_section == SidebarSection::OneToOne;
+        let groups_selected = state.active_sidebar_section == SidebarSection::Groups;
+        let sidebar_selector = row![
+            button(text("Contacts").size(12))
+                .padding([5, 8])
                 .width(Length::Fill)
-                .padding(4)
-                .style(|_| sidebar_panel_style()),
-                Space::new().height(8),
-                text_input("New profile name...", &state.session.profile_name_input)
-                    .on_input(Message::ProfileNameInputChanged)
-                    .padding(8)
-                    .size(13)
-                    .width(Length::Fill),
-                column![
-                    row![
-                        {
-                            let btn = button(text("Open").size(12))
-                                .padding([4, 8])
-                                .width(Length::Fill)
-                                .style(app_button_style);
+                .style(move |theme, status| {
+                    sidebar_tab_button_style(theme, status, one_to_one_selected)
+                })
+                .on_press_maybe(
+                    sidebar_switch_allowed
+                        .then_some(Message::SidebarSectionSelected(SidebarSection::OneToOne))
+                ),
+            button(text("Groups").size(12))
+                .padding([5, 8])
+                .width(Length::Fill)
+                .style(move |theme, status| {
+                    sidebar_tab_button_style(theme, status, groups_selected)
+                })
+                .on_press_maybe(
+                    sidebar_switch_allowed
+                        .then_some(Message::SidebarSectionSelected(SidebarSection::Groups))
+                ),
+        ]
+        .spacing(6)
+        .width(Length::Fill);
 
-                            if profile_buttons_allowed {
-                                btn.on_press(Message::OpenSelectedProfilePressed)
-                            } else {
-                                btn
-                            }
-                        },
-                        {
-                            let btn = button(text("New").size(12))
-                                .padding([4, 8])
-                                .width(Length::Fill)
-                                .style(app_button_style);
+        let contact_details_panel: Element<'_, Message> =
+            if state.contact_details_open {
+                if let Some(meta) = state.contact_details_meta.as_ref() {
+                    let locked =
+                        meta.locked_peer.is_some() && meta.locked_peer_dest_b64.is_some();
+                    let my_b32 = meta.my_b32.as_deref();
+                    let peer_b32 = meta.locked_peer.as_deref();
+                    let history_controls_enabled = !profile_confirm_active
+                        && !state.contact_details_rename_mode
+                        && !state.contact_details_clear_history_confirm;
+                    let tunnel_controls_enabled = !profile_confirm_active
+                        && !selected_contact_open
+                        && !state.contact_details_rename_mode
+                        && !state.contact_details_clear_history_confirm;
+                    let tunnel_length = state
+                        .contact_details_tunnel_hops_input
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|value| {
+                            (storage::MIN_CONTACT_TUNNEL_HOPS
+                                ..=storage::MAX_CONTACT_TUNNEL_HOPS)
+                                .contains(value)
+                        })
+                        .unwrap_or(meta.tunnel_hops);
+                    let tunnel_quantity = state
+                        .contact_details_tunnel_quantity_input
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|value| {
+                            (storage::MIN_CONTACT_TUNNEL_QUANTITY
+                                ..=storage::MAX_CONTACT_TUNNEL_QUANTITY)
+                                .contains(value)
+                        })
+                        .unwrap_or(meta.tunnel_quantity);
 
-                            if profile_buttons_allowed {
-                                btn.on_press(Message::CreateProfilePressed)
-                            } else {
-                                btn
-                            }
-                        },
-                    ]
-                    .spacing(6)
-                    .width(Length::Fill),
-                    row![
-                        {
-                            let btn = button(text("Delete").size(12))
-                                .padding([4, 8])
-                                .width(Length::Fill)
-                                .style(app_button_style);
-
-                            if profile_ops_allowed {
-                                btn.on_press(Message::DeleteProfilePressed)
-                            } else {
-                                btn
-                            }
-                        },
-                        {
-                            let btn = button(text("Reset").size(12))
-                                .padding([4, 8])
-                                .width(Length::Fill)
-                                .style(app_button_style);
-
-                            if profile_ops_allowed {
-                                btn.on_press(Message::ResetProfilePressed)
-                            } else {
-                                btn
-                            }
-                        },
-                    ]
-                    .spacing(6)
-                    .width(Length::Fill),
-                ]
-                .spacing(6)
-                .width(Length::Fill),
-                profile_sidebar_confirm,
-                Space::new().height(4),
-                container(Space::new().height(3))
+                    let my_b32_button = button(
+                        row![
+                            text("My B32").size(11).width(Length::Fixed(56.0)),
+                            text(short_b32(my_b32))
+                                .size(11)
+                                .color(PY_GREEN)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([4, 6])
                     .width(Length::Fill)
-                    .style(|_| sidebar_divider_style()),
-                Space::new().height(4),
-                container(
-                    scrollable(group_list)
-                        .height(Length::Fill)
-                        .width(Length::Fill)
-                )
-                .height(Length::FillPortion(1))
-                .width(Length::Fill)
-                .padding(4)
-                .style(|_| sidebar_panel_style()),
-                {
-                    let input = text_input("New group name...", &state.session.group_name_input)
-                        .on_input(Message::GroupNameInputChanged)
-                        .padding(8)
-                        .size(13)
-                        .width(Length::Fill);
+                    .style(copy_bubble_button_style)
+                    .on_press_maybe(my_b32.is_some().then_some(Message::CopyContactMyB32Pressed));
 
-                    if group_buttons_allowed {
-                        input.on_submit(Message::CreateGroupPressed)
-                    } else {
-                        input
-                    }
-                },
-                column![
-                    row![
-                        button(text("New").size(12))
-                            .padding([4, 8])
-                            .width(Length::Fill)
-                            .style(app_button_style)
-                            .on_press_maybe(
-                                group_buttons_allowed.then_some(Message::CreateGroupPressed)
-                            ),
-                        button(text("Open").size(12))
-                            .padding([4, 8])
-                            .width(Length::Fill)
-                            .style(app_button_style)
-                            .on_press_maybe(
-                                (group_selected && group_buttons_allowed)
-                                    .then_some(Message::OpenGroupPressed)
-                            ),
+                    let peer_b32_button = button(
+                        row![
+                            text("Peer B32").size(11).width(Length::Fixed(56.0)),
+                            text(short_b32(peer_b32))
+                                .size(11)
+                                .color(PY_CYAN)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([4, 6])
+                    .width(Length::Fill)
+                    .style(copy_bubble_button_style)
+                    .on_press_maybe(
+                        peer_b32
+                            .is_some()
+                            .then_some(Message::CopyContactPeerB32Pressed),
+                    );
+
+                    let rename_controls: Element<'_, Message> =
+                        if state.contact_details_rename_mode {
+                            column![
+                                text_input(
+                                    "New contact name...",
+                                    &state.contact_details_rename_input,
+                                )
+                                .on_input(Message::ContactRenameInputChanged)
+                                .on_submit(Message::SaveContactRenamePressed)
+                                .padding(6)
+                                .size(12)
+                                .width(Length::Fill),
+                                row![
+                                    button(text("Save New Name").size(11))
+                                        .padding([4, 6])
+                                        .width(Length::Fill)
+                                        .style(app_button_style)
+                                        .on_press(Message::SaveContactRenamePressed),
+                                    button(text("Cancel").size(11))
+                                        .padding([4, 6])
+                                        .width(Length::Fill)
+                                        .style(app_button_style)
+                                        .on_press(Message::CancelContactRenamePressed),
+                                ]
+                                .spacing(6)
+                                .width(Length::Fill),
+                            ]
+                            .spacing(6)
+                            .into()
+                        } else {
+                            Space::new().height(0).into()
+                        };
+
+                    let history_confirm: Element<'_, Message> =
+                        if state.contact_details_clear_history_confirm {
+                            column![
+                                text("Clear all text messages?").size(11),
+                                row![
+                                    button(text("Yes").size(11))
+                                        .padding([4, 8])
+                                        .style(app_button_style)
+                                        .on_press(Message::ContactClearHistoryConfirmed),
+                                    button(text("No").size(11))
+                                        .padding([4, 8])
+                                        .style(app_button_style)
+                                        .on_press(Message::ContactClearHistoryCancelled),
+                                ]
+                                .spacing(6),
+                            ]
+                            .spacing(5)
+                            .into()
+                        } else {
+                            Space::new().height(0).into()
+                        };
+
+                    let details = column![
+                        row![
+                            text("P").size(13).color(PY_GREEN),
+                            text(&meta.name)
+                                .size(13)
+                                .width(Length::Fill)
+                                .wrapping(iced::widget::text::Wrapping::None),
+                            text(if locked { "Locked" } else { "Unlocked" })
+                                .size(11)
+                                .color(if locked { PY_GREEN } else { PY_GREY62 }),
+                            text(if selected_contact_open { "Open" } else { "Closed" })
+                                .size(11)
+                                .color(if selected_contact_open {
+                                    PY_CYAN
+                                } else {
+                                    PY_GREY62
+                                }),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                        my_b32_button,
+                        peer_b32_button,
+                        row![
+                            text(format!(
+                                "Offline key: {}",
+                                if state.contact_details_offline_key_ready {
+                                    "Ready"
+                                } else {
+                                    "Missing"
+                                }
+                            ))
+                            .size(11)
+                            .color(if state.contact_details_offline_key_ready {
+                                PY_GREEN
+                            } else {
+                                PY_GREY62
+                            })
+                            .width(Length::Fill),
+                            text(format!("DD: {}", meta.deaddrop_servers.len())).size(11),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                        row![
+                            checkbox(meta.history_enabled)
+                                .label("History")
+                                .on_toggle_maybe(
+                                    history_controls_enabled
+                                        .then_some(Message::ContactHistoryEnabledChanged)
+                                )
+                                .text_size(11)
+                                .width(Length::Fill),
+                            button(text("Clear").size(11))
+                                .padding([4, 7])
+                                .style(app_button_style)
+                                .on_press_maybe(
+                                    history_controls_enabled
+                                        .then_some(Message::ContactClearHistoryPressed)
+                                ),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                        history_confirm,
+                        text("SAM tunnels (next open)")
+                            .size(11)
+                            .color(Color::from_rgb8(155, 155, 164)),
+                        text(format!("Length: {tunnel_length}")).size(11),
+                        slider(
+                            storage::MIN_CONTACT_TUNNEL_HOPS
+                                ..=storage::MAX_CONTACT_TUNNEL_HOPS,
+                            tunnel_length,
+                            |value| Message::ContactTunnelHopsChanged(value.to_string()),
+                        )
+                        .step(1u8)
+                        .width(Length::Fill),
+                        text(format!("Quantity: {tunnel_quantity}")).size(11),
+                        slider(
+                            storage::MIN_CONTACT_TUNNEL_QUANTITY
+                                ..=storage::MAX_CONTACT_TUNNEL_QUANTITY,
+                            tunnel_quantity,
+                            |value| Message::ContactTunnelQuantityChanged(value.to_string()),
+                        )
+                        .step(1u8)
+                        .width(Length::Fill),
+                        row![
+                            button(text("Save Tunnels").size(11))
+                                .padding([4, 6])
+                                .width(Length::Fill)
+                                .style(app_button_style)
+                                .on_press_maybe(
+                                    tunnel_controls_enabled
+                                        .then_some(Message::SaveContactTunnelsPressed)
+                                ),
+                            button(text("Defaults").size(11))
+                                .padding([4, 6])
+                                .width(Length::Fill)
+                                .style(app_button_style)
+                                .on_press_maybe(
+                                    tunnel_controls_enabled
+                                        .then_some(Message::ResetContactTunnelsPressed)
+                                ),
+                        ]
+                        .spacing(6)
+                        .width(Length::Fill),
+                        rename_controls,
+                        container(
+                            text(&state.contact_details_status)
+                                .size(10)
+                                .color(Color::from_rgb8(165, 165, 174))
+                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                        )
+                        .height(Length::Fixed(30.0))
+                        .width(Length::Fill),
                     ]
                     .spacing(6)
-                    .width(Length::Fill),
-                    button(text("Delete").size(12))
-                        .padding([4, 8])
+                    .width(Length::Fill);
+
+                    container(scrollable(details).width(Length::Fill).height(Length::Fill))
+                        .height(Length::FillPortion(3))
                         .width(Length::Fill)
-                        .style(app_button_style)
-                        .on_press_maybe(
-                            (group_delete_allowed && group_buttons_allowed)
-                                .then_some(Message::DeleteGroupPressed)
-                        ),
-                ]
-                .spacing(6)
+                        .padding(7)
+                        .style(|_| operation_panel_style())
+                        .into()
+                } else {
+                    container(
+                        text(&state.contact_details_status)
+                            .size(11)
+                            .color(Color::from_rgb8(165, 165, 174)),
+                    )
+                    .height(Length::FillPortion(3))
+                    .width(Length::Fill)
+                    .padding(7)
+                    .style(|_| operation_panel_style())
+                    .into()
+                }
+            } else {
+                Space::new().height(0).into()
+            };
+
+        let profile_sidebar_content = column![
+            container(
+                scrollable(profile_list)
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+            )
+            .height(if state.contact_details_open {
+                Length::FillPortion(2)
+            } else {
+                Length::Fill
+            })
+            .width(Length::Fill)
+            .padding(4)
+            .style(|_| sidebar_panel_style()),
+            Space::new().height(8),
+            text_input("New contact name...", &state.session.profile_name_input)
+                .on_input(Message::ProfileNameInputChanged)
+                .padding(8)
+                .size(13)
                 .width(Length::Fill),
-                group_delete_confirm,
+            column![
                 row![
                     {
-                        let input = text_input(
-                            "Paste group invite...",
-                            &state.session.group_invite_string_input,
-                        )
-                        .on_input(Message::GroupInviteStringInputChanged)
-                        .padding(8)
-                        .size(12)
-                        .width(Length::Fill);
+                        let btn = button(text("Open").size(12))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(app_button_style);
 
-                        if group_buttons_allowed {
-                            input.on_submit(Message::ImportGroupInviteStringPressed)
+                        if profile_buttons_allowed {
+                            btn.on_press(Message::OpenSelectedProfilePressed)
                         } else {
-                            input
+                            btn
                         }
                     },
-                    button(text("OK").size(12))
-                        .padding([4, 8])
-                        .style(app_button_style)
-                        .on_press_maybe(
-                            group_buttons_allowed
-                                .then_some(Message::ImportGroupInviteStringPressed)
-                        ),
+                    {
+                        let btn = button(text("New").size(12))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(app_button_style);
+
+                        if profile_buttons_allowed {
+                            btn.on_press(Message::CreateProfilePressed)
+                        } else {
+                            btn
+                        }
+                    },
                 ]
                 .spacing(6)
-                .align_y(Alignment::Center)
                 .width(Length::Fill),
-                button(text("Generate Private Request").size(12))
+                row![
+                    button(text(if state.contact_details_open {
+                        "Hide Details"
+                    } else {
+                        "Details"
+                    })
+                    .size(12))
                     .padding([4, 8])
                     .width(Length::Fill)
                     .style(app_button_style)
                     .on_press_maybe(
-                        group_buttons_allowed
-                            .then_some(Message::GeneratePrivateGroupRequestPressed)
+                        contact_details_allowed.then_some(Message::ToggleContactDetailsPressed)
                     ),
-                row![
-                    text_input(
-                        "Private request appears here...",
-                        &state.session.group_private_request_string,
-                    )
-                    .padding(8)
-                    .size(12)
-                    .width(Length::Fill),
-                    button(text("Copy").size(12))
+                    button(text("Rename").size(12))
                         .padding([4, 8])
+                        .width(Length::Fill)
                         .style(app_button_style)
                         .on_press_maybe(
-                            (group_buttons_allowed
-                                && !state.session.group_private_request_string.trim().is_empty())
-                            .then_some(Message::CopyPrivateGroupRequestPressed)
+                            contact_rename_allowed.then_some(Message::BeginContactRenamePressed)
                         ),
                 ]
                 .spacing(6)
-                .align_y(Alignment::Center)
+                .width(Length::Fill),
+                row![
+                    {
+                        let btn = button(text("Delete").size(12))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(app_button_style);
+
+                        if profile_ops_allowed {
+                            btn.on_press(Message::DeleteProfilePressed)
+                        } else {
+                            btn
+                        }
+                    },
+                    {
+                        let btn = button(text("Reset").size(12))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(app_button_style);
+
+                        if profile_ops_allowed {
+                            btn.on_press(Message::ResetProfilePressed)
+                        } else {
+                            btn
+                        }
+                    },
+                ]
+                .spacing(6)
                 .width(Length::Fill),
             ]
-            .spacing(8)
+            .spacing(6)
+            .width(Length::Fill),
+            profile_sidebar_confirm,
+            contact_details_panel,
+        ]
+        .spacing(8)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        let group_sidebar_content = column![
+            container(
+                scrollable(group_list)
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+            )
+            .height(Length::Fill)
             .width(Length::Fill)
-            .height(Length::Fill),
+            .padding(4)
+            .style(|_| sidebar_panel_style()),
+            {
+                let input = text_input("New group name...", &state.session.group_name_input)
+                    .on_input(Message::GroupNameInputChanged)
+                    .padding(8)
+                    .size(13)
+                    .width(Length::Fill);
+
+                if group_buttons_allowed {
+                    input.on_submit(Message::CreateGroupPressed)
+                } else {
+                    input
+                }
+            },
+            column![
+                row![
+                    button(text("New").size(12))
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            group_buttons_allowed.then_some(Message::CreateGroupPressed)
+                        ),
+                    button(text("Open").size(12))
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            (group_selected && group_buttons_allowed)
+                                .then_some(Message::OpenGroupPressed)
+                        ),
+                ]
+                .spacing(6)
+                .width(Length::Fill),
+                button(text("Delete").size(12))
+                    .padding([4, 8])
+                    .width(Length::Fill)
+                    .style(app_button_style)
+                    .on_press_maybe(
+                        (group_delete_allowed && group_buttons_allowed)
+                            .then_some(Message::DeleteGroupPressed)
+                    ),
+            ]
+            .spacing(6)
+            .width(Length::Fill),
+            group_delete_confirm,
+            row![
+                {
+                    let input = text_input(
+                        "Paste group invite...",
+                        &state.session.group_invite_string_input,
+                    )
+                    .on_input(Message::GroupInviteStringInputChanged)
+                    .padding(8)
+                    .size(12)
+                    .width(Length::Fill);
+
+                    if group_buttons_allowed {
+                        input.on_submit(Message::ImportGroupInviteStringPressed)
+                    } else {
+                        input
+                    }
+                },
+                button(text("OK").size(12))
+                    .padding([4, 8])
+                    .style(app_button_style)
+                    .on_press_maybe(
+                        group_buttons_allowed.then_some(Message::ImportGroupInviteStringPressed)
+                    ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+            button(text("Generate Private Request").size(12))
+                .padding([4, 8])
+                .width(Length::Fill)
+                .style(app_button_style)
+                .on_press_maybe(
+                    group_buttons_allowed.then_some(Message::GeneratePrivateGroupRequestPressed)
+                ),
+            row![
+                text_input(
+                    "Private request appears here...",
+                    &state.session.group_private_request_string,
+                )
+                .padding(8)
+                .size(12)
+                .width(Length::Fill),
+                button(text("Copy").size(12))
+                    .padding([4, 8])
+                    .style(app_button_style)
+                    .on_press_maybe(
+                        (group_buttons_allowed
+                            && !state.session.group_private_request_string.trim().is_empty())
+                        .then_some(Message::CopyPrivateGroupRequestPressed)
+                    ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+        ]
+        .spacing(8)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        let sidebar_content: Element<'_, Message> = match state.active_sidebar_section {
+            SidebarSection::OneToOne => profile_sidebar_content.into(),
+            SidebarSection::Groups => group_sidebar_content.into(),
+        };
+
+        let navigation_sidebar = container(
+            column![sidebar_selector, sidebar_content]
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill),
         )
         .width(220)
         .height(Length::Fill)
@@ -8121,7 +9174,15 @@ impl IcedCommApp {
         let show_deaddrop_panel =
             state.session.show_deaddrop_panel && Self::deaddrop_panel_allowed(&state.session);
         let show_group_panel = state.active_tab_is_group() && state.session.show_group_panel;
-        let bottom_panel_open = state.session.show_logs || show_deaddrop_panel || show_group_panel;
+        let show_profile_panel = state
+            .active_tab()
+            .map(Self::is_persistent_contact_tab)
+            .unwrap_or(false)
+            && state.session.show_profile_panel;
+        let bottom_panel_open = state.session.show_logs
+            || show_deaddrop_panel
+            || show_group_panel
+            || show_profile_panel;
 
         let messages = state.session.bubbles.iter().enumerate().fold(
             column!().spacing(12).padding([8, 4]).width(Length::Fill),
@@ -8196,6 +9257,60 @@ impl IcedCommApp {
         .style(|_| log_panel_style());
 
         let log_panel = log_inner.height(Length::FillPortion(LOG_PANEL_HEIGHT_PORTION));
+
+        let profile_history_confirm: Element<'_, Message> =
+            if state.session.history_clear_confirm == Some(HistoryClearConfirm::Contact) {
+                column![
+                    text("Clear all text messages for this contact?").size(12),
+                    row![
+                        button(text("Yes").size(12))
+                            .padding([4, 8])
+                            .style(app_button_style)
+                            .on_press(Message::ClearHistoryConfirmed),
+                        button(text("No").size(12))
+                            .padding([4, 8])
+                            .style(app_button_style)
+                            .on_press(Message::ClearHistoryCancelled),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6)
+                .into()
+            } else {
+                Space::new().height(0).into()
+            };
+        let profile_history_controls_enabled =
+            state.session.history_clear_confirm != Some(HistoryClearConfirm::Contact);
+        let profile_panel = container(
+            column![
+                text(format!("Contact: {}", state.session.profile)).size(13),
+                row![
+                    checkbox(state.session.history_enabled)
+                        .label("Keep text history")
+                        .on_toggle_maybe(
+                            profile_history_controls_enabled
+                                .then_some(Message::HistoryEnabledChanged)
+                        )
+                        .text_size(12)
+                        .width(Length::Shrink),
+                    button(text("Clear History").size(12))
+                        .padding([4, 8])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            profile_history_controls_enabled
+                                .then_some(Message::ClearHistoryPressed)
+                        ),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                profile_history_confirm,
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .padding(8)
+        .style(|_| log_panel_style());
 
         let dd_delete_confirm = state.session.deaddrop_delete_confirm.clone();
         let deaddrop_rows = if state.session.deaddrop_servers.is_empty() {
@@ -8503,6 +9618,29 @@ impl IcedCommApp {
             } else {
                 text(&state.session.group_status).size(12).into()
             };
+        let group_history_confirm: Element<'_, Message> =
+            if state.session.history_clear_confirm == Some(HistoryClearConfirm::Group) {
+                column![
+                    text("Clear all text messages for this group?").size(12),
+                    row![
+                        button(text("Yes").size(12))
+                            .padding([4, 8])
+                            .style(app_button_style)
+                            .on_press(Message::ClearHistoryConfirmed),
+                        button(text("No").size(12))
+                            .padding([4, 8])
+                            .style(app_button_style)
+                            .on_press(Message::ClearHistoryCancelled),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6)
+                .into()
+            } else {
+                Space::new().height(0).into()
+            };
+        let group_history_controls_enabled =
+            state.session.history_clear_confirm != Some(HistoryClearConfirm::Group);
 
         let group_panel = container(
             column![
@@ -8528,6 +9666,26 @@ impl IcedCommApp {
                 ]
                 .spacing(2)
                 .width(Length::Fill),
+                row![
+                    checkbox(state.session.history_enabled)
+                        .label("Keep text history")
+                        .on_toggle_maybe(
+                            group_history_controls_enabled
+                                .then_some(Message::HistoryEnabledChanged)
+                        )
+                        .text_size(12)
+                        .width(Length::Shrink),
+                    button(text("Clear History").size(12))
+                        .padding([4, 8])
+                        .style(app_button_style)
+                        .on_press_maybe(
+                            group_history_controls_enabled
+                                .then_some(Message::ClearHistoryPressed)
+                        ),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                group_history_confirm,
                 row![
                     button(text("Save New Name").size(12))
                         .padding([6, 10])
@@ -8689,6 +9847,12 @@ impl IcedCommApp {
             )
         } else if show_group_panel {
             column![chat_panel, group_panel]
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if show_profile_panel {
+            column![chat_panel, profile_panel]
                 .spacing(8)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -8953,11 +10117,11 @@ impl IcedCommApp {
                         text(IcedCommApp::action_confirm_prompt(action))
                             .size(13)
                             .width(Length::Fill),
-                        button(text("OK").size(12))
+                        button(text("Yes").size(12))
                             .padding([6, 10])
                             .style(app_button_style)
                             .on_press(Message::ActionConfirm),
-                        button(text("Cancel").size(13))
+                        button(text("No").size(13))
                             .padding([6, 10])
                             .style(app_button_style)
                             .on_press(Message::ActionCancel),
@@ -9097,7 +10261,7 @@ impl IcedCommApp {
 
         let app_content: Element<'_, Message> = container(
             row![
-                profile_sidebar,
+                navigation_sidebar,
                 container(main_column)
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -10516,6 +11680,122 @@ impl IcedCommApp {
             && !Self::is_transient_profile_name(&tab.session.profile)
     }
 
+    fn history_scope_for_tab(tab: &OpenedTab) -> Option<HistoryScope> {
+        match tab.meta.kind {
+            TabKind::Chat if Self::is_persistent_contact_tab(tab) => {
+                Some(HistoryScope::Contact(tab.session.profile.clone()))
+            }
+            TabKind::Group => tab.group.as_ref().map(|group| {
+                HistoryScope::Group(storage::group_storage_key(&group.meta))
+            }),
+            TabKind::AppHome | TabKind::Chat => None,
+        }
+    }
+
+    fn active_history_scope(&self) -> Option<HistoryScope> {
+        self.active_tab().and_then(Self::history_scope_for_tab)
+    }
+
+    fn load_history_into_tab(tab: &mut OpenedTab, scope: HistoryScope) {
+        Self::load_history_into_session(&mut tab.session, &scope);
+    }
+
+    fn load_history_into_session(session: &mut SessionState, scope: &HistoryScope) {
+        if session.history_loaded {
+            return;
+        }
+
+        match history::load(scope) {
+            Ok(records) => {
+                let mut loaded = records
+                    .into_iter()
+                    .map(Bubble::from_history)
+                    .collect::<Vec<_>>();
+                loaded.append(&mut session.bubbles);
+                session.bubbles = loaded;
+            }
+            Err(err) => session
+                .log_lines
+                .push(format!("Load text history failed: {err}")),
+        }
+        session.history_loaded = true;
+    }
+
+    fn append_latest_text_history(
+        session: &mut SessionState,
+        scope: Option<HistoryScope>,
+        sender_b32: Option<String>,
+    ) {
+        if !session.history_enabled {
+            return;
+        }
+
+        let Some(scope) = scope else {
+            return;
+        };
+        let Some(bubble) = session.bubbles.last() else {
+            return;
+        };
+        let BubbleContent::Text(text) = &bubble.content else {
+            return;
+        };
+
+        let record = HistoryRecord {
+            created_ms: Self::now_epoch_millis(),
+            timestamp_utc: bubble.timestamp_utc.clone(),
+            author: bubble.author.clone(),
+            sender_b32,
+            text: text.clone(),
+            mine: bubble.mine,
+            offline: bubble.offline,
+            msg_id: bubble.msg_id,
+            delivered: bubble.delivered,
+            group_expected_acks: bubble.group_expected_acks.clone(),
+            group_received_acks: bubble.group_received_acks.clone(),
+        };
+
+        if let Err(err) = history::append_message(&scope, &record) {
+            session
+                .log_lines
+                .push(format!("Save text history failed: {err}"));
+        }
+    }
+
+    fn append_active_latest_text_history(&mut self, sender_b32: Option<String>) {
+        let scope = self.active_history_scope();
+        Self::append_latest_text_history(&mut self.session, scope, sender_b32);
+    }
+
+    fn append_tab_latest_text_history(tab: &mut OpenedTab, sender_b32: Option<String>) {
+        let scope = Self::history_scope_for_tab(tab);
+        Self::append_latest_text_history(&mut tab.session, scope, sender_b32);
+    }
+
+    fn append_history_delivery(tab: &mut OpenedTab, msg_id: u64, peer_b32: Option<&str>) {
+        let scope = Self::history_scope_for_tab(tab);
+        Self::append_history_delivery_for_session(&mut tab.session, scope, msg_id, peer_b32);
+    }
+
+    fn append_history_delivery_for_session(
+        session: &mut SessionState,
+        scope: Option<HistoryScope>,
+        msg_id: u64,
+        peer_b32: Option<&str>,
+    ) {
+        if !session.history_enabled {
+            return;
+        }
+        let Some(scope) = scope else {
+            return;
+        };
+
+        if let Err(err) = history::append_delivery(&scope, msg_id, peer_b32) {
+            session
+                .log_lines
+                .push(format!("Update text history delivery failed: {err}"));
+        }
+    }
+
     fn active_contact_meta(&self) -> Option<ContactMeta> {
         let tab = self.active_tab()?;
         if !Self::is_persistent_contact_tab(tab) {
@@ -10525,10 +11805,14 @@ impl IcedCommApp {
         Some(ContactMeta {
             name: tab.session.profile.clone(),
             my_dest_b64: tab.session.my_dest_b64.clone(),
+            my_b32: tab.session.my_b32.clone(),
             locked_peer: tab.session.stored_peer.clone(),
             locked_peer_dest_b64: tab.session.stored_peer_dest_b64.clone(),
             pq_enabled: tab.session.pq_enabled,
+            history_enabled: tab.session.history_enabled,
             deaddrop_servers: tab.session.deaddrop_servers.clone(),
+            tunnel_hops: tab.session.sam_tunnel_hops,
+            tunnel_quantity: tab.session.sam_tunnel_quantity,
         })
     }
 
@@ -10550,10 +11834,14 @@ impl IcedCommApp {
             .map(|tab| ContactMeta {
                 name: profile_name.to_string(),
                 my_dest_b64: tab.session.my_dest_b64.clone(),
+                my_b32: tab.session.my_b32.clone(),
                 locked_peer: tab.session.stored_peer.clone(),
                 locked_peer_dest_b64: tab.session.stored_peer_dest_b64.clone(),
                 pq_enabled: tab.session.pq_enabled,
+                history_enabled: tab.session.history_enabled,
                 deaddrop_servers: tab.session.deaddrop_servers.clone(),
+                tunnel_hops: tab.session.sam_tunnel_hops,
+                tunnel_quantity: tab.session.sam_tunnel_quantity,
             });
 
         if let Some(meta) = maybe_meta {
@@ -10590,14 +11878,28 @@ impl IcedCommApp {
                 }
             }
         }
+
+        if self.contact_details_open
+            && self
+                .selected_persistent_contact_name()
+                .as_deref()
+                .map(|name| name == profile_name)
+                .unwrap_or(false)
+        {
+            self.refresh_contact_details();
+        }
     }
 
     fn apply_contact_meta_to_opened_tab(tab: &mut OpenedTab, meta: &ContactMeta) {
         tab.session.my_dest_b64 = meta.my_dest_b64.clone();
+        tab.session.my_b32 = meta.my_b32.clone();
         tab.session.stored_peer = meta.locked_peer.clone();
         tab.session.stored_peer_dest_b64 = meta.locked_peer_dest_b64.clone();
         tab.session.pq_enabled = meta.pq_enabled;
         tab.session.pq_active = meta.pq_enabled;
+        tab.session.history_enabled = meta.history_enabled;
+        tab.session.sam_tunnel_hops = meta.tunnel_hops;
+        tab.session.sam_tunnel_quantity = meta.tunnel_quantity;
         tab.session.tofu_verified = false;
         tab.session.tofu_mismatch = false;
         tab.session.deaddrop_servers = meta.deaddrop_servers.clone();
@@ -11113,8 +12415,8 @@ impl IcedCommApp {
 
     fn action_confirm_prompt(action: GuiAction) -> &'static str {
         match action {
-            GuiAction::Lock => "Lock the current peer to this profile?",
-            GuiAction::Unlock => "Unlock this profile from its stored peer?",
+            GuiAction::Lock => "Lock the current peer to this contact?",
+            GuiAction::Unlock => "Unlock this contact from its stored peer?",
             _ => "",
         }
     }
@@ -11548,7 +12850,11 @@ impl IcedCommApp {
 
                             match String::from_utf8(plain) {
                                 Ok(text) => {
-                                    tab.session.bubbles.push(Bubble::peer(text));
+                                    tab.session
+                                        .bubbles
+                                        .push(Bubble::peer_with_id(text, frame.msg_id));
+                                    let sender_b32 = tab.session.current_peer_addr.clone();
+                                    Self::append_tab_latest_text_history(tab, sender_b32);
 
                                     let ack_msg_id = {
                                         let millis = SystemTime::now()
@@ -11597,7 +12903,9 @@ impl IcedCommApp {
                                 bytes.copy_from_slice(&frame.payload);
                                 let delivered_id = u64::from_be_bytes(bytes);
 
-                                Self::mark_delivered(tab, delivered_id);
+                                if Self::mark_delivered(tab, delivered_id) {
+                                    Self::append_history_delivery(tab, delivered_id, None);
+                                }
                             } else {
                                 push_log(tab, "Invalid delivery ACK payload.".to_string());
                             }
@@ -12565,6 +13873,9 @@ impl IcedCommApp {
 
             tab_id = tab.id;
             let sam_runtime = tab.sam_runtime.clone();
+            let group_history_scope = tab.group.as_ref().map(|group| {
+                HistoryScope::Group(storage::group_storage_key(&group.meta))
+            });
             let Some(group) = tab.group.as_mut() else {
                 return tasks;
             };
@@ -13166,6 +14477,11 @@ impl IcedCommApp {
                                         group_expected_acks: Vec::new(),
                                         group_received_acks: Vec::new(),
                                     });
+                                    Self::append_latest_text_history(
+                                        &mut tab.session,
+                                        group_history_scope.clone(),
+                                        Some(peer.member.b32.clone()),
+                                    );
                                     if !is_active || !window_focused {
                                         tab.meta.has_unread = true;
                                     }
@@ -13203,11 +14519,19 @@ impl IcedCommApp {
                                 let mut bytes = [0u8; 8];
                                 bytes.copy_from_slice(&frame.payload);
                                 let delivered_id = u64::from_be_bytes(bytes);
-                                Self::mark_group_delivered(
+                                let text_history_updated = Self::mark_group_delivered(
                                     &mut tab.session.bubbles,
                                     delivered_id,
                                     &peer.member.b32,
                                 );
+                                if text_history_updated {
+                                    Self::append_history_delivery_for_session(
+                                        &mut tab.session,
+                                        group_history_scope.clone(),
+                                        delivered_id,
+                                        Some(&peer.member.b32),
+                                    );
+                                }
                             } else {
                                 tab.session.log_lines.push(format!(
                                     "Invalid group delivery ACK from {}.",
@@ -13930,16 +15254,22 @@ impl IcedCommApp {
         Ok(dir)
     }
 
-    fn mark_delivered(tab: &mut OpenedTab, delivered_id: u64) {
+    fn mark_delivered(tab: &mut OpenedTab, delivered_id: u64) -> bool {
         for bubble in tab.session.bubbles.iter_mut().rev() {
             if bubble.mine && bubble.msg_id == Some(delivered_id) {
+                let changed = !bubble.delivered;
                 bubble.delivered = true;
-                break;
+                return changed && matches!(&bubble.content, BubbleContent::Text(_));
             }
         }
+        false
     }
 
-    fn mark_group_delivered(bubbles: &mut [Bubble], delivered_id: u64, peer_b32: &str) {
+    fn mark_group_delivered(
+        bubbles: &mut [Bubble],
+        delivered_id: u64,
+        peer_b32: &str,
+    ) -> bool {
         let peer_b32 = peer_b32.to_ascii_lowercase();
 
         for bubble in bubbles.iter_mut().rev() {
@@ -13955,20 +15285,21 @@ impl IcedCommApp {
                 .iter()
                 .any(|b32| b32.eq_ignore_ascii_case(&peer_b32))
             {
-                break;
+                return false;
             }
 
-            if !bubble
+            let new_ack = !bubble
                 .group_received_acks
                 .iter()
-                .any(|b32| b32.eq_ignore_ascii_case(&peer_b32))
-            {
-                bubble.group_received_acks.push(peer_b32);
+                .any(|b32| b32.eq_ignore_ascii_case(&peer_b32));
+            if new_ack {
+                bubble.group_received_acks.push(peer_b32.clone());
             }
 
             bubble.delivered = bubble.group_received_acks.len() >= bubble.group_expected_acks.len();
-            break;
+            return new_ack && matches!(&bubble.content, BubbleContent::Text(_));
         }
+        false
     }
 
     fn left_status_indicators<'a>(session: &'a SessionState) -> iced::widget::Row<'a, Message> {
@@ -14607,10 +15938,14 @@ impl IcedCommApp {
             let meta = ContactMeta {
                 name: tab.session.profile.clone(),
                 my_dest_b64: tab.session.my_dest_b64.clone(),
+                my_b32: tab.session.my_b32.clone(),
                 locked_peer: tab.session.stored_peer.clone(),
                 locked_peer_dest_b64: tab.session.stored_peer_dest_b64.clone(),
                 pq_enabled: tab.session.pq_enabled,
+                history_enabled: tab.session.history_enabled,
                 deaddrop_servers: tab.session.deaddrop_servers.clone(),
+                tunnel_hops: tab.session.sam_tunnel_hops,
+                tunnel_quantity: tab.session.sam_tunnel_quantity,
             };
 
             if let Err(err) = storage::save_contact_meta(&meta) {
@@ -15107,7 +16442,13 @@ impl IcedCommApp {
                                 Ok(text) => {
                                     tab.session.seen_drop_msgs.push(blob_hash);
                                     got_valid_blob = true;
-                                    tab.session.bubbles.push(Bubble::peer_offline(text));
+                                    tab.session
+                                        .bubbles
+                                        .push(Bubble::peer_offline_with_id(text, frame.msg_id));
+                                    Self::append_tab_latest_text_history(
+                                        tab,
+                                        Some(peer_b32.clone()),
+                                    );
                                     if mark_unread {
                                         tab.meta.has_unread = true;
                                     }
@@ -15927,6 +17268,56 @@ fn tab_button_style(
     }
 }
 
+fn sidebar_tab_button_style(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+    selected: bool,
+) -> iced::widget::button::Style {
+    let (background, border_color, text_color) = match status {
+        iced::widget::button::Status::Hovered => (
+            APP_SIDEBAR_TAB_HOVER_BG,
+            APP_SIDEBAR_TAB_HOVER_BORDER,
+            APP_SIDEBAR_TAB_TEXT,
+        ),
+        iced::widget::button::Status::Pressed => (
+            APP_SIDEBAR_TAB_PRESSED_BG,
+            APP_SIDEBAR_TAB_PRESSED_BORDER,
+            APP_SIDEBAR_TAB_TEXT,
+        ),
+        iced::widget::button::Status::Disabled => (
+            APP_SIDEBAR_TAB_UNSELECTED_BG,
+            APP_SIDEBAR_TAB_UNSELECTED_BORDER,
+            APP_SIDEBAR_TAB_DISABLED_TEXT,
+        ),
+        iced::widget::button::Status::Active => {
+            if selected {
+                (
+                    APP_SIDEBAR_TAB_SELECTED_BG,
+                    APP_SIDEBAR_TAB_SELECTED_BORDER,
+                    APP_SIDEBAR_TAB_TEXT,
+                )
+            } else {
+                (
+                    APP_SIDEBAR_TAB_UNSELECTED_BG,
+                    APP_SIDEBAR_TAB_UNSELECTED_BORDER,
+                    APP_SIDEBAR_TAB_TEXT,
+                )
+            }
+        }
+    };
+
+    iced::widget::button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: border::Border {
+            color: border_color,
+            width: APP_SIDEBAR_TAB_BORDER_WIDTH,
+            radius: border::Radius::from(APP_SIDEBAR_TAB_BORDER_RADIUS),
+        },
+        ..Default::default()
+    }
+}
+
 fn tab_close_button_style(
     _theme: &iced::Theme,
     status: iced::widget::button::Status,
@@ -16144,13 +17535,6 @@ fn sidebar_panel_style() -> container::Style {
             width: 1.0,
             radius: border::Radius::from(6.0),
         },
-        ..Default::default()
-    }
-}
-
-fn sidebar_divider_style() -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgb8(76, 76, 84))),
         ..Default::default()
     }
 }

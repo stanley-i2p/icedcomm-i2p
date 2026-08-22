@@ -195,13 +195,13 @@ pub fn import_profile_backup(
 
     if meta.name != profile_name {
         return Err(BackupError::Format(
-            "profile backup metadata name does not match manifest".into(),
+            "contact backup metadata name does not match manifest".into(),
         ));
     }
 
     let profile_exists = storage::contact_dir(&profile_name).exists();
     if profile_exists && !replace {
-        return Err(BackupError::Format("profile already exists".into()));
+        return Err(BackupError::Format("contact already exists".into()));
     }
 
     if replace && profile_exists {
@@ -335,7 +335,7 @@ fn validate_v2_tree(root: &Path) -> Result<(), BackupError> {
 
     if !root.join("profiles").is_dir() {
         return Err(BackupError::Format(
-            "backup is missing profiles directory".into(),
+            "backup is missing contact data directory".into(),
         ));
     }
 
@@ -358,11 +358,11 @@ fn default_backup_scope() -> String {
 
 fn require_profile_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
     if manifest.scope != "profile" {
-        return Err(BackupError::Format("backup is not a profile backup".into()));
+        return Err(BackupError::Format("backup is not a contact backup".into()));
     }
     if manifest.profiles.len() != 1 {
         return Err(BackupError::Format(
-            "profile backup must contain exactly one profile".into(),
+            "contact backup must contain exactly one contact".into(),
         ));
     }
     Ok(())
@@ -414,7 +414,7 @@ fn ensure_import_target_empty() -> Result<(), BackupError> {
     let contacts = storage::load_contacts().map_err(|e| BackupError::Storage(e.to_string()))?;
     if !contacts.is_empty() {
         return Err(BackupError::Format(
-            "import requires an empty profile list".into(),
+            "import requires an empty contact list".into(),
         ));
     }
 

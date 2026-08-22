@@ -16,6 +16,21 @@ use crate::group_invite::{PendingPrivateRequest, PrivateInviteBinding, PrivateJo
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
+pub const DEFAULT_CONTACT_TUNNEL_HOPS: u8 = 2;
+pub const DEFAULT_CONTACT_TUNNEL_QUANTITY: u8 = 3;
+pub const MIN_CONTACT_TUNNEL_HOPS: u8 = 1;
+pub const MAX_CONTACT_TUNNEL_HOPS: u8 = 4;
+pub const MIN_CONTACT_TUNNEL_QUANTITY: u8 = 1;
+pub const MAX_CONTACT_TUNNEL_QUANTITY: u8 = 5;
+
+fn default_contact_tunnel_hops() -> u8 {
+    DEFAULT_CONTACT_TUNNEL_HOPS
+}
+
+fn default_contact_tunnel_quantity() -> u8 {
+    DEFAULT_CONTACT_TUNNEL_QUANTITY
+}
+
 const DEFAULT_DEADDROP_SERVERS: [&str; 3] = [
     "62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
     "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p",
@@ -47,11 +62,19 @@ impl std::error::Error for StorageError {}
 pub struct ContactMeta {
     pub name: String,
     pub my_dest_b64: Option<String>,
+    #[serde(default)]
+    pub my_b32: Option<String>,
     pub locked_peer: Option<String>,
     pub locked_peer_dest_b64: Option<String>,
     pub pq_enabled: bool,
     #[serde(default)]
+    pub history_enabled: bool,
+    #[serde(default)]
     pub deaddrop_servers: Vec<String>,
+    #[serde(default = "default_contact_tunnel_hops")]
+    pub tunnel_hops: u8,
+    #[serde(default = "default_contact_tunnel_quantity")]
+    pub tunnel_quantity: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +102,8 @@ pub struct GroupMeta {
     pub my_b32: Option<String>,
     #[serde(default)]
     pub my_name: String,
+    #[serde(default)]
+    pub history_enabled: bool,
     #[serde(default)]
     pub owner_b32: Option<String>,
     #[serde(default)]
@@ -218,13 +243,17 @@ impl ContactMeta {
         Self {
             name,
             my_dest_b64: None,
+            my_b32: None,
             locked_peer: None,
             locked_peer_dest_b64: None,
             pq_enabled: false,
+            history_enabled: false,
             deaddrop_servers: DEFAULT_DEADDROP_SERVERS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            tunnel_hops: DEFAULT_CONTACT_TUNNEL_HOPS,
+            tunnel_quantity: DEFAULT_CONTACT_TUNNEL_QUANTITY,
         }
     }
 }
@@ -237,6 +266,7 @@ impl GroupMeta {
             my_dest_b64: None,
             my_b32: None,
             my_name: String::new(),
+            history_enabled: false,
             owner_b32: None,
             roster_version: 1,
             members: Vec::new(),
@@ -608,8 +638,97 @@ pub fn reset_contact(name: &str) -> Result<ContactMeta, StorageError> {
 
     let mut new_meta = ContactMeta::new(name.to_string());
     new_meta.my_dest_b64 = old_meta.my_dest_b64;
+    new_meta.my_b32 = old_meta.my_b32;
     save_contact_meta(&new_meta)?;
     Ok(new_meta)
+}
+
+pub fn rename_contact(old_name: &str, new_name: &str) -> Result<ContactMeta, StorageError> {
+    validate_persistent_contact_name(old_name)?;
+    validate_persistent_contact_name(new_name)?;
+    ensure_base_layout()?;
+
+    let new_name = new_name.trim();
+    if old_name == new_name {
+        return load_contact_meta(old_name);
+    }
+
+    for entry in fs::read_dir(contacts_dir()).map_err(|e| StorageError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| StorageError::Io(e.to_string()))?;
+        let Some(existing) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if existing.eq_ignore_ascii_case(new_name) && !existing.eq_ignore_ascii_case(old_name) {
+            return Err(StorageError::InvalidName("contact already exists".into()));
+        }
+    }
+
+    let old_dir = contact_dir(old_name);
+    if !old_dir.is_dir() {
+        return Err(StorageError::Io("contact directory does not exist".into()));
+    }
+    let new_dir = contact_dir(new_name);
+    if new_dir.exists() && !old_name.eq_ignore_ascii_case(new_name) {
+        return Err(StorageError::InvalidName("contact already exists".into()));
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let staging_dir = base_dir().join(format!(".contact-rename-{nonce}"));
+    if staging_dir.exists() {
+        return Err(StorageError::Io("temporary rename path already exists".into()));
+    }
+
+    let mut meta = load_contact_meta(old_name)?;
+    fs::rename(&old_dir, &staging_dir).map_err(|e| StorageError::Io(e.to_string()))?;
+
+    let old_meta_path = staging_dir.join(format!("{old_name}.dat"));
+    let staged_old_meta_path = staging_dir.join(".old-contact.dat");
+    if let Err(err) = fs::rename(&old_meta_path, &staged_old_meta_path) {
+        let _ = fs::rename(&staging_dir, &old_dir);
+        return Err(StorageError::Io(err.to_string()));
+    }
+
+    meta.name = new_name.to_string();
+    let new_meta_path = staging_dir.join(format!("{new_name}.dat"));
+    let text = match serde_json::to_string_pretty(&meta) {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = fs::rename(&staged_old_meta_path, &old_meta_path);
+            let _ = fs::rename(&staging_dir, &old_dir);
+            return Err(StorageError::Serde(err.to_string()));
+        }
+    };
+    if let Err(err) = atomic_write_text(&new_meta_path, &text) {
+        let _ = fs::rename(&staged_old_meta_path, &old_meta_path);
+        let _ = fs::rename(&staging_dir, &old_dir);
+        return Err(err);
+    }
+
+    if let Err(err) = set_dir_mode(&staging_dir) {
+        let _ = fs::remove_file(&new_meta_path);
+        let _ = fs::rename(&staged_old_meta_path, &old_meta_path);
+        let _ = fs::rename(&staging_dir, &old_dir);
+        return Err(err);
+    }
+    if let Err(err) = set_file_mode(&new_meta_path) {
+        let _ = fs::remove_file(&new_meta_path);
+        let _ = fs::rename(&staged_old_meta_path, &old_meta_path);
+        let _ = fs::rename(&staging_dir, &old_dir);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&staging_dir, &new_dir) {
+        let _ = fs::remove_file(&new_meta_path);
+        let _ = fs::rename(&staged_old_meta_path, &old_meta_path);
+        let _ = fs::rename(&staging_dir, &old_dir);
+        return Err(StorageError::Io(err.to_string()));
+    }
+
+    let _ = fs::remove_file(new_dir.join(".old-contact.dat"));
+    Ok(meta)
 }
 
 pub fn wipe_all_profiles_and_files() -> Result<(), StorageError> {
@@ -641,11 +760,31 @@ pub fn load_contact_meta(name: &str) -> Result<ContactMeta, StorageError> {
     f.read_to_string(&mut s)
         .map_err(|e| StorageError::Io(e.to_string()))?;
 
-    serde_json::from_str(&s).map_err(|e| StorageError::Serde(e.to_string()))
+    let mut meta: ContactMeta =
+        serde_json::from_str(&s).map_err(|e| StorageError::Serde(e.to_string()))?;
+    if !(MIN_CONTACT_TUNNEL_HOPS..=MAX_CONTACT_TUNNEL_HOPS).contains(&meta.tunnel_hops) {
+        meta.tunnel_hops = DEFAULT_CONTACT_TUNNEL_HOPS;
+    }
+    if !(MIN_CONTACT_TUNNEL_QUANTITY..=MAX_CONTACT_TUNNEL_QUANTITY)
+        .contains(&meta.tunnel_quantity)
+    {
+        meta.tunnel_quantity = DEFAULT_CONTACT_TUNNEL_QUANTITY;
+    }
+    Ok(meta)
 }
 
 pub fn save_contact_meta(meta: &ContactMeta) -> Result<(), StorageError> {
     validate_persistent_contact_name(&meta.name)?;
+    if !(MIN_CONTACT_TUNNEL_HOPS..=MAX_CONTACT_TUNNEL_HOPS).contains(&meta.tunnel_hops) {
+        return Err(StorageError::InvalidName("invalid contact tunnel hops".into()));
+    }
+    if !(MIN_CONTACT_TUNNEL_QUANTITY..=MAX_CONTACT_TUNNEL_QUANTITY)
+        .contains(&meta.tunnel_quantity)
+    {
+        return Err(StorageError::InvalidName(
+            "invalid contact tunnel quantity".into(),
+        ));
+    }
 
     let dir = contact_dir(&meta.name);
     create_dir_secure_all(&dir)?;
@@ -702,7 +841,7 @@ fn validate_contact_name(name: &str) -> Result<(), StorageError> {
         || trimmed.eq_ignore_ascii_case("__app__")
         || trimmed.eq_ignore_ascii_case("global")
     {
-        return Err(StorageError::InvalidName("reserved profile name".into()));
+        return Err(StorageError::InvalidName("reserved contact name".into()));
     }
 
     if trimmed.contains('/') || trimmed.contains('\\') {
@@ -731,7 +870,7 @@ fn validate_persistent_contact_name(name: &str) -> Result<(), StorageError> {
     validate_contact_name(name)?;
     if is_group_contact_namespace(name) {
         return Err(StorageError::InvalidName(
-            "reserved profile name prefix".into(),
+            "reserved contact name prefix".into(),
         ));
     }
     Ok(())

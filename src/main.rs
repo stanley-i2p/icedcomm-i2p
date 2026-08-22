@@ -9,6 +9,7 @@ mod constants;
 mod deaddrop;
 mod e2e;
 mod group_invite;
+mod history;
 mod protocol;
 mod rendezvous;
 mod sam;
@@ -45,6 +46,7 @@ fn main() -> iced::Result {
         .subscription(IcedCommApp::subscription)
         .exit_on_close_request(false)
         .window(window::Settings {
+            size: iced::Size::new(1280.0, 800.0),
             min_size: Some(iced::Size::new(1280.0, 700.0)),
             icon: Some(app_icon),
             ..Default::default()

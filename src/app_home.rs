@@ -74,7 +74,7 @@ pub fn app_home_view<'a>(
     let import_confirm = if let Some(path) = pending_import_path {
         row![
             text(format!(
-                "Replace local profiles/files with {}?",
+                "Replace local contacts/files with {}?",
                 path.display()
             ))
             .size(12)
@@ -100,7 +100,7 @@ pub fn app_home_view<'a>(
 
     let wipe_confirm = if can_confirm_wipe {
         row![
-            text("Delete all profiles and stored files?")
+            text("Delete all contacts and stored files?")
                 .size(12)
                 .width(Length::Fill),
             button(text("OK").size(12))
@@ -147,7 +147,7 @@ pub fn app_home_view<'a>(
     {
         row![
             text(format!(
-                "Replace local profile {profile_name} with {}?",
+                "Replace local contact {profile_name} with {}?",
                 path.display()
             ))
             .size(12)
@@ -239,19 +239,19 @@ pub fn app_home_view<'a>(
     );
 
     let selected_profile_text = selected_profile_name
-        .map(|name| format!("Selected profile: {name}"))
-        .unwrap_or_else(|| "Selected profile: none".into());
+        .map(|name| format!("Selected contact: {name}"))
+        .unwrap_or_else(|| "Selected contact: none".into());
 
     let profile_export_block = operation_block(
         column![
             row![
-                button(text("Export Profile").size(13))
+                button(text("Export Contact").size(13))
                     .padding([6, 10])
                     .style(crate::app::app_button_style)
                     .on_press_maybe(
                         can_edit_profile_export.then_some(Message::ExportProfileBackupPressed)
                     ),
-                text_input("Profile export passphrase...", profile_export_passphrase)
+                text_input("Contact export passphrase...", profile_export_passphrase)
                     .on_input_maybe(
                         can_edit_profile_export.then_some(Message::ProfileExportPassphraseChanged)
                     )
@@ -275,13 +275,13 @@ pub fn app_home_view<'a>(
     let profile_import_block = operation_block(
         column![
             row![
-                button(text("Import Profile").size(13))
+                button(text("Import Contact").size(13))
                     .padding([6, 10])
                     .style(crate::app::app_button_style)
                     .on_press_maybe(
                         can_edit_profile_import.then_some(Message::ImportProfileBackupPressed)
                     ),
-                text_input("Profile import passphrase...", profile_import_passphrase)
+                text_input("Contact import passphrase...", profile_import_passphrase)
                     .on_input_maybe(
                         can_edit_profile_import.then_some(Message::ProfileImportPassphraseChanged)
                     )
