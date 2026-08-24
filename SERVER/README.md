@@ -54,6 +54,41 @@ target/release/deaddrop-server
 ./target/release/deaddrop-server
 ```
 
+The default configuration connects to SAM at `127.0.0.1:7656` and hosts one
+persistent drop identity. Available command-line options are:
+
+```text
+Usage: deaddrop-server [OPTIONS]
+
+Options:
+  --sam <HOST:PORT>  SAM endpoint [default: 127.0.0.1:7656]
+  --drops <COUNT>    Persistent drop identities to host [default: 1; max: 16]
+  -h, --help         Show help
+  -V, --version      Show version
+```
+
+For example:
+
+```bash
+./target/release/deaddrop-server --sam 127.0.0.1:7656 --drops 1
+```
+
+One server process can host multiple persistent drop identities, but drops on
+the same machine and I2P router share a common failure domain. For meaningful
+replication diversity, running one drop on each independently operated server
+is recommended.
+
+Earlier server builds started three identities by default. To continue serving
+all three existing `drop_0`, `drop_1`, and `drop_2` destinations, start the
+updated server with:
+
+```bash
+./target/release/deaddrop-server --drops 3
+```
+
+Using a lower count does not delete identities or blobs above that count; those
+drops are simply not served during that run.
+
 ## Data Directory
 
 The server stores its persistent SAM identities and opaque queued blobs under:
@@ -62,12 +97,10 @@ The server stores its persistent SAM identities and opaque queued blobs under:
 ~/.deaddrop-server/
 |-- identities/
 |   |-- drop_0.dat
-|   |-- drop_1.dat
-|   `-- drop_2.dat
+|   `-- ...
 `-- storage/
     |-- drop_0/
-    |-- drop_1/
-    `-- drop_2/
+    `-- ...
 ```
 
 On Windows, the equivalent location is

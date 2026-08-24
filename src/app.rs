@@ -9202,7 +9202,14 @@ impl IcedCommApp {
 
         let log_lines = state.session.log_lines.iter().fold(
             column!().spacing(4).padding([6, 4]).width(Length::Fill),
-            |col, line| col.push(text(line).size(12).width(Length::Fill)),
+            |col, line| {
+                col.push(
+                    text(line)
+                        .size(11)
+                        .color(Color::from_rgb8(155, 155, 160))
+                        .width(Length::Fill),
+                )
+            },
         );
 
         let copy_logs_button = button(
@@ -9316,7 +9323,7 @@ impl IcedCommApp {
         let deaddrop_rows = if state.session.deaddrop_servers.is_empty() {
             column![
                 text("No deaddrop servers configured.")
-                    .size(12)
+                    .size(11)
                     .color(PY_GREY62)
             ]
             .spacing(6)
@@ -9334,27 +9341,24 @@ impl IcedCommApp {
                     let get_fail = stats.map(|s| s.get_fail).unwrap_or(0);
                     let latency = stats.map(|s| s.latency_ema_ms).unwrap_or(0.0);
                     let server_record = row![
-                        column![
-                            text(format!(
-                                "{}.{} {}",
-                                idx + 1,
-                                if active { "*" } else { " " },
-                                server
-                            ))
-                            .size(12)
-                            .width(Length::Fill),
-                            text(format!(
-                                "put ok/fail={}/{}  get ok/fail={}/{}  lat={:.1}ms",
-                                put_ok, put_fail, get_ok, get_fail, latency
-                            ))
-                            .size(11)
-                            .color(Color::from_rgb8(155, 155, 160))
-                            .width(Length::Fill),
-                        ]
-                        .spacing(2)
-                        .width(Length::Fill),
-                        button(text("Delete").size(12))
-                            .padding([4, 8])
+                        text(format!(
+                            "{}.{} {}",
+                            idx + 1,
+                            if active { "*" } else { " " },
+                            server
+                        ))
+                        .size(11)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                        text(format!(
+                            "put ok/fail={}/{}  get ok/fail={}/{}  lat={:.1}ms",
+                            put_ok, put_fail, get_ok, get_fail, latency
+                        ))
+                        .size(11)
+                        .color(Color::from_rgb8(155, 155, 160))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                        button(text("Delete").size(11))
+                            .padding([4, 7])
                             .style(app_button_style)
                             .on_press_maybe(
                                 dd_delete_confirm
@@ -9362,34 +9366,39 @@ impl IcedCommApp {
                                     .then_some(Message::DdServerDeletePressed(idx))
                             ),
                     ]
-                    .spacing(8)
+                    .spacing(6)
                     .align_y(Alignment::Center)
                     .width(Length::Fill);
 
-                    let server_confirm = match &dd_delete_confirm {
+                    let server_entry: Element<'_, Message> = match &dd_delete_confirm {
                         Some(confirm) if confirm.index == idx && confirm.server == *server => {
                             column![
-                                text("Delete this deaddrop server?").size(12),
-                                row![
-                                    button(text("Yes").size(12))
-                                        .padding([4, 8])
-                                        .style(app_button_style)
-                                        .on_press(Message::DdServerDeleteConfirmed),
-                                    button(text("No").size(12))
-                                        .padding([4, 8])
-                                        .style(app_button_style)
-                                        .on_press(Message::DdServerDeleteCancelled),
+                                server_record,
+                                column![
+                                    text("Delete this deaddrop server?").size(11),
+                                    row![
+                                        button(text("Yes").size(11))
+                                            .padding([4, 8])
+                                            .style(app_button_style)
+                                            .on_press(Message::DdServerDeleteConfirmed),
+                                        button(text("No").size(11))
+                                            .padding([4, 8])
+                                            .style(app_button_style)
+                                            .on_press(Message::DdServerDeleteCancelled),
+                                    ]
+                                    .spacing(6),
                                 ]
-                                .spacing(6)
+                                .spacing(6),
                             ]
                             .spacing(6)
+                            .into()
                         }
-                        _ => column![],
+                        _ => server_record.into(),
                     };
 
                     col.push(
-                        container(column![server_record, server_confirm].spacing(8))
-                            .padding(12)
+                        container(server_entry)
+                            .padding([4, 8])
                             .width(Length::Fill)
                             .style(|_| operation_panel_style()),
                     )
@@ -9398,13 +9407,13 @@ impl IcedCommApp {
         };
 
         let share_button = if state.session.live_ready {
-            button(text("Share").size(12))
-                .padding([6, 10])
+            button(text("Share").size(11))
+                .padding([4, 6])
                 .style(app_button_style)
                 .on_press(Message::DdServerSharePressed)
         } else {
-            button(text("Share").size(12))
-                .padding([6, 10])
+            button(text("Share").size(11))
+                .padding([4, 6])
                 .style(app_button_style)
         };
 
@@ -9424,7 +9433,7 @@ impl IcedCommApp {
                     .width(Length::Fill),
                     share_button,
                 ]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
                 row![
                     text_input(
@@ -9433,32 +9442,32 @@ impl IcedCommApp {
                     )
                     .on_input(Message::DdServerInputChanged)
                     .on_submit(Message::DdServerAddPressed)
-                    .padding(8)
-                    .size(13)
+                    .padding(6)
+                    .size(12)
                     .width(Length::Fill),
-                    button(text("Add").size(12))
-                        .padding([6, 10])
+                    button(text("Add").size(11))
+                        .padding([4, 6])
                         .style(app_button_style)
                         .on_press(Message::DdServerAddPressed),
                 ]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
                 scrollable(deaddrop_rows)
                     .height(Length::Fill)
                     .width(Length::Fill),
             ]
-            .spacing(8),
+            .spacing(6),
         )
         .width(Length::Fill)
         .height(Length::FillPortion(DEADDROP_PANEL_HEIGHT_PORTION))
-        .padding(6)
+        .padding(7)
         .style(|_| log_panel_style());
 
         let group_roster_rows = if let Some(group) = selected_group {
             if group.members.is_empty() {
                 column![
                     text("Roster is empty.")
-                        .size(12)
+                        .size(11)
                         .color(Color::from_rgb8(150, 150, 158))
                 ]
                 .spacing(6)
@@ -9484,37 +9493,35 @@ impl IcedCommApp {
                         };
                         let row_content = row![
                             text(if active { "●" } else { "○" })
-                                .size(12)
+                                .size(11)
                                 .color(if active {
                                     PY_GREEN
                                 } else {
                                     Color::from_rgb8(105, 105, 114)
                                 }),
-                            column![
-                                text(&member.name)
-                                    .size(12)
-                                    .color(name_color)
-                                    .width(Length::Fill),
-                                text(&member.b32)
-                                    .size(11)
-                                    .color(b32_color)
-                                    .width(Length::Fill),
-                            ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            button(text("Delete").size(12))
-                                .padding([4, 8])
+                            text(&member.name)
+                                .size(11)
+                                .color(name_color)
+                                .width(Length::Fixed(160.0))
+                                .wrapping(iced::widget::text::Wrapping::None),
+                            text(&member.b32)
+                                .size(11)
+                                .color(b32_color)
+                                .width(Length::Fill)
+                                .wrapping(iced::widget::text::Wrapping::None),
+                            button(text("Delete").size(11))
+                                .padding([4, 7])
                                 .style(app_button_style)
                                 .on_press_maybe(
                                     (selected_group_is_admin && !group_member_confirm_active)
                                         .then_some(Message::DeleteGroupMemberPressed(member_idx))
                                 ),
                         ]
-                        .spacing(8)
+                        .spacing(6)
                         .align_y(Alignment::Center)
                         .width(Length::Fill);
 
-                        let member_confirm = match &state.session.sidebar_confirm {
+                        let member_record: Element<'_, Message> = match &state.session.sidebar_confirm {
                             Some(SidebarConfirm::DeleteGroupMember {
                                 group_key: confirm_group_key,
                                 member_b32,
@@ -9523,27 +9530,32 @@ impl IcedCommApp {
                                 && member_b32.eq_ignore_ascii_case(&member.b32) =>
                             {
                                 column![
-                                    text(format!("Delete member {member_name}?")).size(12),
-                                    row![
-                                        button(text("Yes").size(12))
-                                            .padding([4, 8])
-                                            .style(app_button_style)
-                                            .on_press(Message::SidebarConfirmYes),
-                                        button(text("No").size(12))
-                                            .padding([4, 8])
-                                            .style(app_button_style)
-                                            .on_press(Message::SidebarConfirmNo),
+                                    row_content,
+                                    column![
+                                        text(format!("Delete member {member_name}?")).size(11),
+                                        row![
+                                            button(text("Yes").size(11))
+                                                .padding([4, 8])
+                                                .style(app_button_style)
+                                                .on_press(Message::SidebarConfirmYes),
+                                            button(text("No").size(11))
+                                                .padding([4, 8])
+                                                .style(app_button_style)
+                                                .on_press(Message::SidebarConfirmNo),
+                                        ]
+                                        .spacing(6),
                                     ]
-                                    .spacing(6)
+                                    .spacing(6),
                                 ]
                                 .spacing(6)
+                                .into()
                             }
-                            _ => column![],
+                            _ => row_content.into(),
                         };
 
                         col.push(
-                            container(column![row_content, member_confirm].spacing(8))
-                                .padding(10)
+                            container(member_record)
+                                .padding([4, 8])
                                 .width(Length::Fill)
                                 .style(|_| operation_panel_style()),
                         )
@@ -9553,7 +9565,7 @@ impl IcedCommApp {
         } else {
             column![
                 text("Select or open a group.")
-                    .size(12)
+                    .size(11)
                     .color(Color::from_rgb8(150, 150, 158))
             ]
             .spacing(6)
@@ -9581,7 +9593,7 @@ impl IcedCommApp {
             column![]
         } else {
             pending_private_invites.into_iter().fold(
-                column![text("Pending private invites").size(12)]
+                column![text("Pending private invites").size(11)]
                     .spacing(6)
                     .width(Length::Fill),
                 |rows, binding| {
@@ -9597,15 +9609,15 @@ impl IcedCommApp {
                                 ))
                                 .size(11)
                                 .width(Length::Fill),
-                                button(text("Revoke").size(12))
-                                    .padding([4, 8])
+                                button(text("Revoke").size(11))
+                                    .padding([4, 7])
                                     .style(app_button_style)
                                     .on_press(Message::RevokePrivateGroupInvitePressed(request_id)),
                             ]
-                            .spacing(8)
+                            .spacing(6)
                             .align_y(Alignment::Center),
                         )
-                        .padding(8)
+                        .padding(7)
                         .width(Length::Fill)
                         .style(|_| operation_panel_style()),
                     )
@@ -9616,18 +9628,18 @@ impl IcedCommApp {
             if state.session.group_status.trim().is_empty() {
                 Space::new().height(0).into()
             } else {
-                text(&state.session.group_status).size(12).into()
+                text(&state.session.group_status).size(10).into()
             };
         let group_history_confirm: Element<'_, Message> =
             if state.session.history_clear_confirm == Some(HistoryClearConfirm::Group) {
                 column![
-                    text("Clear all text messages for this group?").size(12),
+                    text("Clear all text messages for this group?").size(11),
                     row![
-                        button(text("Yes").size(12))
+                        button(text("Yes").size(11))
                             .padding([4, 8])
                             .style(app_button_style)
                             .on_press(Message::ClearHistoryConfirmed),
-                        button(text("No").size(12))
+                        button(text("No").size(11))
                             .padding([4, 8])
                             .style(app_button_style)
                             .on_press(Message::ClearHistoryCancelled),
@@ -9673,22 +9685,22 @@ impl IcedCommApp {
                             group_history_controls_enabled
                                 .then_some(Message::HistoryEnabledChanged)
                         )
-                        .text_size(12)
+                        .text_size(11)
                         .width(Length::Shrink),
-                    button(text("Clear History").size(12))
-                        .padding([4, 8])
+                    button(text("Clear History").size(11))
+                        .padding([4, 7])
                         .style(app_button_style)
                         .on_press_maybe(
                             group_history_controls_enabled
                                 .then_some(Message::ClearHistoryPressed)
                         ),
                 ]
-                .spacing(10)
+                .spacing(6)
                 .align_y(Alignment::Center),
                 group_history_confirm,
                 row![
-                    button(text("Save New Name").size(12))
-                        .padding([6, 10])
+                    button(text("Save New Name").size(11))
+                        .padding([4, 6])
                         .style(app_button_style)
                         .on_press_maybe(
                             group_selected.then_some(Message::SaveGroupDisplayNamePressed)
@@ -9699,17 +9711,17 @@ impl IcedCommApp {
                     )
                     .on_input(Message::GroupDisplayNameInputChanged)
                     .on_submit(Message::SaveGroupDisplayNamePressed)
-                    .padding(8)
-                    .size(13)
+                    .padding(6)
+                    .size(12)
                     .width(Length::Fixed(220.0)),
-                    container(text(format!("Role: {selected_group_role}")).size(12).color(
+                    container(text(format!("Role: {selected_group_role}")).size(11).color(
                         if selected_group_is_admin {
                             PY_GREEN
                         } else {
                             Color::from_rgb8(175, 175, 184)
                         }
                     ),)
-                    .padding([4, 8])
+                    .padding([4, 6])
                     .style(move |_| {
                         let role_color = if selected_group_is_admin {
                             PY_GREEN
@@ -9719,11 +9731,11 @@ impl IcedCommApp {
                         indicator_style(Color::from_rgb8(35, 35, 40), role_color)
                     }),
                 ]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
                 row![
-                    button(text("Generate Public Invite").size(12))
-                        .padding([6, 10])
+                    button(text("Generate Public Invite").size(11))
+                        .padding([4, 6])
                         .style(app_button_style)
                         .on_press_maybe(
                             (group_selected && selected_group_is_admin)
@@ -9733,11 +9745,11 @@ impl IcedCommApp {
                         "Generated invite appears here...",
                         &state.session.group_generated_invite_string
                     )
-                    .padding(8)
+                    .padding(6)
                     .size(12)
                     .width(Length::Fixed(360.0)),
-                    button(text("Copy Public Invite").size(12))
-                        .padding([6, 10])
+                    button(text("Copy Public Invite").size(11))
+                        .padding([4, 6])
                         .style(app_button_style)
                         .on_press_maybe(
                             (selected_group_is_admin
@@ -9749,11 +9761,11 @@ impl IcedCommApp {
                             .then_some(Message::CopyGeneratedGroupInvitePressed),
                         ),
                 ]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
                 row![
-                    button(text("Generate Private Invite").size(12))
-                        .padding([6, 10])
+                    button(text("Generate Private Invite").size(11))
+                        .padding([4, 6])
                         .style(app_button_style)
                         .on_press_maybe(
                             (group_selected && selected_group_is_admin)
@@ -9771,18 +9783,18 @@ impl IcedCommApp {
                         selected_group_is_admin
                             .then_some(Message::GeneratePrivateGroupInvitePressed)
                     )
-                    .padding(8)
+                    .padding(6)
                     .size(12)
                     .width(Length::Fixed(260.0)),
                     text_input(
                         "Generated private invite appears here...",
                         &state.session.group_generated_private_invite_string,
                     )
-                    .padding(8)
+                    .padding(6)
                     .size(12)
                     .width(Length::Fixed(260.0)),
-                    button(text("Copy Private Invite").size(12))
-                        .padding([6, 10])
+                    button(text("Copy Private Invite").size(11))
+                        .padding([4, 6])
                         .style(app_button_style)
                         .on_press_maybe(
                             (selected_group_is_admin
@@ -9794,22 +9806,22 @@ impl IcedCommApp {
                             .then_some(Message::CopyGeneratedPrivateGroupInvitePressed),
                         ),
                 ]
-                .spacing(8)
+                .spacing(6)
                 .align_y(Alignment::Center),
                 scrollable(
                     column![pending_private_invite_rows, group_roster_rows]
-                        .spacing(8)
+                        .spacing(6)
                         .width(Length::Fill)
                 )
                     .height(Length::Fill)
                     .width(Length::Fill),
                 group_status_line,
             ]
-            .spacing(8),
+            .spacing(6),
         )
         .width(Length::Fill)
         .height(Length::FillPortion(GROUP_PANEL_HEIGHT_PORTION))
-        .padding(6)
+        .padding(7)
         .style(|_| log_panel_style());
 
         let selected_persistent_profile = state

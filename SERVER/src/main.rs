@@ -17,10 +17,9 @@ use tokio::net::{
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 
-const NUM_DROPS: usize = 3;
-
-const SAM_HOST: &str = "127.0.0.1";
-const SAM_PORT: u16 = 7656;
+const DEFAULT_SAM_ENDPOINT: &str = "127.0.0.1:7656";
+const DEFAULT_DROP_COUNT: usize = 1;
+const MAX_DROP_COUNT: usize = 16;
 
 const BLOB_TTL_SECONDS: u64 = 14 * 24 * 60 * 60; // 14 days
 const GC_INTERVAL_SECONDS: u64 = 60 * 60; // 1 hour
@@ -43,6 +42,138 @@ const SAM_CONFIG: [(&str, u32); 4] = [
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+struct Config {
+    sam_endpoint: String,
+    drop_count: usize,
+}
+
+impl Config {
+    fn from_args() -> Result<Option<Self>, String> {
+        let mut sam_endpoint = DEFAULT_SAM_ENDPOINT.to_string();
+        let mut drop_count = DEFAULT_DROP_COUNT;
+        let mut sam_seen = false;
+        let mut drops_seen = false;
+        let mut args = std::env::args().skip(1);
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    print_help();
+                    return Ok(None);
+                }
+                "-V" | "--version" => {
+                    println!("deaddrop-server {}", env!("CARGO_PKG_VERSION"));
+                    return Ok(None);
+                }
+                "--sam" => {
+                    if sam_seen {
+                        return Err("--sam may only be specified once".to_string());
+                    }
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--sam requires a HOST:PORT value".to_string())?;
+                    sam_endpoint = parse_sam_endpoint(&value)?;
+                    sam_seen = true;
+                }
+                "--drops" => {
+                    if drops_seen {
+                        return Err("--drops may only be specified once".to_string());
+                    }
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--drops requires a numeric value".to_string())?;
+                    drop_count = parse_drop_count(&value)?;
+                    drops_seen = true;
+                }
+                _ => {
+                    if let Some(value) = arg.strip_prefix("--sam=") {
+                        if sam_seen {
+                            return Err("--sam may only be specified once".to_string());
+                        }
+                        sam_endpoint = parse_sam_endpoint(value)?;
+                        sam_seen = true;
+                    } else if let Some(value) = arg.strip_prefix("--drops=") {
+                        if drops_seen {
+                            return Err("--drops may only be specified once".to_string());
+                        }
+                        drop_count = parse_drop_count(value)?;
+                        drops_seen = true;
+                    } else {
+                        return Err(format!("unknown option: {arg}"));
+                    }
+                }
+            }
+        }
+
+        Ok(Some(Self {
+            sam_endpoint,
+            drop_count,
+        }))
+    }
+}
+
+fn parse_sam_endpoint(value: &str) -> Result<String, String> {
+    let (host, port) = if let Some(bracketed) = value.strip_prefix('[') {
+        let (host, suffix) = bracketed
+            .split_once(']')
+            .ok_or_else(|| "--sam has an invalid bracketed IPv6 address".to_string())?;
+        let port = suffix
+            .strip_prefix(':')
+            .ok_or_else(|| "--sam must use the format [IPv6]:PORT".to_string())?;
+        (host, port)
+    } else {
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| "--sam must use the format HOST:PORT".to_string())?;
+        if host.contains(':') {
+            return Err("IPv6 SAM addresses must use the format [IPv6]:PORT".to_string());
+        }
+        (host, port)
+    };
+
+    if host.is_empty() {
+        return Err("--sam host must not be empty".to_string());
+    }
+
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "--sam port must be an integer from 1 to 65535".to_string())?;
+    if port == 0 {
+        return Err("--sam port must be an integer from 1 to 65535".to_string());
+    }
+
+    Ok(value.to_string())
+}
+
+fn parse_drop_count(value: &str) -> Result<usize, String> {
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| format!("--drops must be an integer from 1 to {MAX_DROP_COUNT}"))?;
+    if !(1..=MAX_DROP_COUNT).contains(&count) {
+        return Err(format!(
+            "--drops must be an integer from 1 to {MAX_DROP_COUNT}"
+        ));
+    }
+    Ok(count)
+}
+
+fn print_help() {
+    println!(
+        "deaddrop-server {version}\n\
+         CommTools-I2P DeadDrop Server\n\n\
+         Usage: deaddrop-server [OPTIONS]\n\n\
+         Options:\n\
+           --sam <HOST:PORT>  SAM endpoint [default: {sam}]\n\
+           --drops <COUNT>    Persistent drop identities to host [default: {drops}; max: {max}]\n\
+           -h, --help         Show this help\n\
+           -V, --version      Show version",
+        version = env!("CARGO_PKG_VERSION"),
+        sam = DEFAULT_SAM_ENDPOINT,
+        drops = DEFAULT_DROP_COUNT,
+        max = MAX_DROP_COUNT,
+    );
+}
+
 #[derive(Clone)]
 struct ServerState {
     drop_semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
@@ -50,11 +181,11 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(drop_count: usize) -> Self {
         let mut drop_semaphores = HashMap::new();
         let mut drop_put_times = HashMap::new();
 
-        for i in 0..NUM_DROPS {
+        for i in 0..drop_count {
             let drop_name = format!("drop_{}", i);
             drop_semaphores.insert(
                 drop_name.clone(),
@@ -147,11 +278,11 @@ fn drop_storage_dir(drop_name: &str) -> PathBuf {
     storage_dir().join(drop_name)
 }
 
-async fn ensure_dirs() -> io::Result<()> {
+async fn ensure_dirs(drop_count: usize) -> io::Result<()> {
     fs::create_dir_all(identity_dir()).await?;
     fs::create_dir_all(storage_dir()).await?;
 
-    for i in 0..NUM_DROPS {
+    for i in 0..drop_count {
         let drop_name = format!("drop_{}", i);
         fs::create_dir_all(drop_storage_dir(&drop_name)).await?;
     }
@@ -271,11 +402,11 @@ async fn flush_with_timeout(writer: &mut OwnedWriteHalf) -> io::Result<()> {
     Ok(())
 }
 
-async fn gc_loop(shutdown: Shutdown) {
+async fn gc_loop(drop_count: usize, shutdown: Shutdown) {
     while !shutdown.is_set() {
         let mut deleted = 0usize;
 
-        for i in 0..NUM_DROPS {
+        for i in 0..drop_count {
             let drop_name = format!("drop_{}", i);
             let root = drop_storage_dir(&drop_name);
 
@@ -577,8 +708,12 @@ async fn handle_client_limited(
     handle_client(&drop_name, state, reader, writer).await;
 }
 
-async fn create_session(name: &str, keyfile: &Path) -> io::Result<TcpStream> {
-    let mut stream = TcpStream::connect((SAM_HOST, SAM_PORT)).await?;
+async fn create_session(
+    name: &str,
+    keyfile: &Path,
+    sam_endpoint: &str,
+) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(sam_endpoint).await?;
 
     // HELLO
     stream.write_all(b"HELLO VERSION MIN=3.0 MAX=3.2\n").await?;
@@ -662,10 +797,15 @@ fn extract_destination(resp: &str) -> Option<&str> {
     None
 }
 
-async fn accept_loop(name: String, state: ServerState, shutdown: Shutdown) {
+async fn accept_loop(
+    name: String,
+    state: ServerState,
+    shutdown: Shutdown,
+    sam_endpoint: String,
+) {
     while !shutdown.is_set() {
         let res: io::Result<()> = async {
-            let stream = TcpStream::connect((SAM_HOST, SAM_PORT)).await?;
+            let stream = TcpStream::connect(sam_endpoint.as_str()).await?;
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
 
@@ -771,10 +911,19 @@ async fn signal_task(shutdown: Shutdown) {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    ensure_dirs().await?;
+    let config = match Config::from_args() {
+        Ok(Some(config)) => config,
+        Ok(None) => return Ok(()),
+        Err(message) => {
+            eprintln!("error: {message}\n\nUse --help to list available options.");
+            std::process::exit(2);
+        }
+    };
+
+    ensure_dirs(config.drop_count).await?;
 
     let shutdown = Shutdown::new();
-    let state = ServerState::new();
+    let state = ServerState::new(config.drop_count);
 
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -784,29 +933,32 @@ async fn main() -> io::Result<()> {
     let mut tasks = Vec::new();
     let mut session_conns = Vec::new();
 
-    for i in 0..NUM_DROPS {
+    for i in 0..config.drop_count {
         let name = format!("drop_{}", i);
         let keyfile = identity_dir().join(format!("{}.dat", name));
 
-        let session_stream = create_session(&name, &keyfile).await?;
+        let session_stream = create_session(&name, &keyfile, &config.sam_endpoint).await?;
         session_conns.push(session_stream);
 
         let s = shutdown.clone();
         let loop_state = state.clone();
+        let sam_endpoint = config.sam_endpoint.clone();
         let task = tokio::spawn(async move {
-            accept_loop(name, loop_state, s).await;
+            accept_loop(name, loop_state, s, sam_endpoint).await;
         });
         tasks.push(task);
     }
 
     {
         let s = shutdown.clone();
+        let drop_count = config.drop_count;
         tasks.push(tokio::spawn(async move {
-            gc_loop(s).await;
+            gc_loop(drop_count, s).await;
         }));
     }
 
-    println!("[INFO] Started {} drop identities", NUM_DROPS);
+    println!("[INFO] SAM endpoint: {}", config.sam_endpoint);
+    println!("[INFO] Started {} drop identities", config.drop_count);
 
     shutdown.wait().await;
 
