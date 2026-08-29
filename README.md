@@ -10,6 +10,7 @@ This project is the Rust/Iced desktop implementation of the CommTools-I2P protoc
 
 ![IcedComm-I2P](Screenshot_1.png)
 ![IcedComm-I2P](Screenshot_2.png)
+![IcedComm-I2P](Screenshot_3.png)
 
 ## Status
 
