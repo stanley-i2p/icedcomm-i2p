@@ -16819,9 +16819,26 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
 
         BubbleContent::Image(data) => {
             let (display_width, display_height) = image_display_size(data.width, data.height);
+            let show_author = should_show_bubble_author(bubble);
+            let body_width = if show_author {
+                let author_width = bubble.author.chars().count() as f32 * 7.0 + 4.0;
+                display_width.max(author_width.min(TEXT_BUBBLE_MAX_WIDTH - 24.0))
+            } else {
+                display_width
+            };
+            let author_label: Element<'a, Message> = if show_author {
+                text(&bubble.author)
+                    .size(10)
+                    .color(Color::from_rgb8(155, 155, 164))
+                    .width(Length::Fill)
+                    .into()
+            } else {
+                Space::new().height(0).into()
+            };
 
             (
                 column![
+                    author_label,
                     image(data.handle.clone())
                         .width(display_width)
                         .height(display_height)
@@ -16829,9 +16846,9 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
                     bubble_timestamp_row(bubble),
                 ]
                 .spacing(6)
-                .width(display_width)
+                .width(body_width)
                 .into(),
-                display_width + 24.0,
+                body_width + 24.0,
             )
         }
 
