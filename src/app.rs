@@ -19,8 +19,8 @@ use iced::border;
 use iced::widget::Id as ScrollableId;
 use iced::widget::operation;
 use iced::widget::{
-    Space, button, checkbox, column, container, image, opaque, progress_bar, row, scrollable, slider,
-    stack, text, text_editor, text_input, tooltip,
+    Space, button, checkbox, column, container, image, opaque, progress_bar, row, scrollable,
+    slider, stack, text, text_editor, text_input, tooltip,
 };
 use iced::{
     Alignment, Background, Color, ContentFit, Element, Font, Length, Subscription, Task, exit,
@@ -158,6 +158,7 @@ const OFFLINE_SECRET_REQUEST_SIGNAL: &str = "__SIGNAL__:OFFLINE_SECRET_REQUEST";
 const TEXT_BUBBLE_MAX_WIDTH: f32 = 460.0;
 const TEXT_BUBBLE_MIN_BODY_WIDTH: f32 = 92.0;
 const FILE_BUBBLE_WIDTH: f32 = 340.0;
+const FILE_OFFER_TIMEOUT_MS: u64 = 60_000;
 const IMAGE_BUBBLE_MAX_WIDTH: f32 = 420.0;
 const IMAGE_BUBBLE_MAX_HEIGHT: f32 = 360.0;
 const SYSTEM_BUBBLE_MAX_WIDTH: f32 = 700.0;
@@ -167,6 +168,12 @@ const REPLY_END_MARKER: &str = "[/COMMTOOLS-I2P-REPLY]";
 const IMAGE_TRANSFER_MAX_DIMENSION: u32 = 1280;
 const IMAGE_TRANSFER_JPEG_QUALITY: u8 = 82;
 const GROUP_IMAGE_TRANSFER_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ORIGINAL_IMAGE_MAX_BYTES: usize = MAX_FILE_SIZE;
+const ORIGINAL_IMAGE_MAX_PIXELS: u64 = 40_000_000;
+const ORIGINAL_IMAGE_CACHE_MAX_ITEMS: usize = 8;
+const ORIGINAL_IMAGE_CACHE_MAX_BYTES: usize = 100 * 1024 * 1024;
+const ORIGINAL_IMAGE_PENDING_REQUEST_MAX_ITEMS: usize = 32;
+const ORIGINAL_IMAGE_CONTROL_PREFIX: &str = "__COMMTOOLS_IMAGE_V1__:";
 const GROUP_INVITE_STRING_PREFIX: &str = "COMMTOOLS-I2P-GROUP-INVITE-v1:";
 const GROUP_CONTROL_JOIN_PROOF: &str = "join_proof";
 const GROUP_CONTROL_RENAME_REQUEST: &str = "rename_request";
@@ -260,6 +267,8 @@ pub struct OpenedTab {
     pub offline_index_sync_sent: bool,
 
     pub incoming_file: Option<StdFile>,
+    pub incoming_file_transfer_id: u64,
+    pub incoming_file_offer_started_ms: u64,
     pub incoming_filename: Option<String>,
     pub incoming_expected: u64,
     pub incoming_received: u64,
@@ -271,9 +280,17 @@ pub struct OpenedTab {
     pub incoming_image_received: u64,
     pub incoming_image_msg_id: u64,
     pub incoming_image_bytes: Vec<u8>,
+    pub incoming_image_kind: IncomingImageKind,
+    pub incoming_image_media_id: Option<u64>,
+    pub incoming_image_sha256: Option<String>,
+    pub incoming_image_original_size: u64,
+    pub incoming_image_bubble_index: Option<usize>,
+    pub cancelled_incoming_image_transfers: Vec<u64>,
 
     pub outgoing_bubble_index: Option<usize>,
     pub outgoing_file: Option<StdFile>,
+    pub outgoing_file_transfer_id: u64,
+    pub outgoing_file_offer_started_ms: u64,
     pub outgoing_filename: Option<String>,
     pub outgoing_total: u64,
     pub outgoing_sent: u64,
@@ -287,6 +304,12 @@ pub struct OpenedTab {
     pub outgoing_image_msg_id: u64,
     pub outgoing_image_phase: OutgoingImagePhase,
     pub outgoing_image_send_in_flight: bool,
+    pub original_image_send_in_flight: bool,
+    pub original_image_send_media_id: Option<u64>,
+    pub original_image_send_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub shared_original_images: HashMap<u64, SharedOriginalImage>,
+    pub received_original_images: HashMap<(u64, String), SharedOriginalImage>,
+    pub pending_original_image_requests: HashMap<u64, Option<String>>,
     pub group: Option<GroupRuntime>,
 }
 
@@ -324,6 +347,15 @@ pub struct GroupPeerRuntime {
     pub incoming_image_received: u64,
     pub incoming_image_msg_id: u64,
     pub incoming_image_bytes: Vec<u8>,
+    pub incoming_image_kind: IncomingImageKind,
+    pub incoming_image_media_id: Option<u64>,
+    pub incoming_image_sha256: Option<String>,
+    pub incoming_image_original_size: u64,
+    pub incoming_image_bubble_index: Option<usize>,
+    pub cancelled_incoming_image_transfers: Vec<u64>,
+    pub image_send_lock: std::sync::Arc<TokioMutex<()>>,
+    pub original_image_send_media_id: Option<u64>,
+    pub original_image_send_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 pub struct GroupRuntime {
@@ -426,6 +458,12 @@ pub struct ImageBubbleData {
     pub handle: iced::widget::image::Handle,
     pub width: u32,
     pub height: u32,
+    pub filename: String,
+    pub original_media_id: Option<u64>,
+    pub original_size: u64,
+    pub original_sender_b32: Option<String>,
+    pub original_state: OriginalImageBubbleState,
+    pub original_received: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -433,10 +471,70 @@ pub struct PendingImageDraft {
     pub filename: String,
     pub mime: String,
     pub image: ImageBubbleData,
+    pub original_mime: String,
+    pub original_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingImageKind {
+    Preview,
+    Original,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginalImageBubbleState {
+    Idle,
+    Requesting,
+    Receiving,
+    Validating,
+    Failed,
+    Unavailable,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedOriginalImage {
+    pub filename: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub added_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OriginalImageViewer {
+    pub source_tab_id: u64,
+    pub filename: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub handle: iced::widget::image::Handle,
+    pub width: u32,
+    pub height: u32,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedImageHeader {
+    filename: String,
+    mime: String,
+    total_bytes: u64,
+    kind: IncomingImageKind,
+    media_id: Option<u64>,
+    original_size: Option<u64>,
+    original_mime: Option<String>,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginalImageControl {
+    Request(u64),
+    Unavailable(u64),
+    Cancel(u64),
 }
 
 #[derive(Debug, Clone)]
 pub struct FileBubbleData {
+    pub transfer_id: u64,
     pub filename: String,
     pub saved_path: Option<String>,
     pub total_bytes: u64,
@@ -444,15 +542,28 @@ pub struct FileBubbleData {
     pub outgoing: bool,
     pub complete: bool,
     pub failed: bool,
+    pub can_accept: bool,
+    pub can_decline: bool,
+    pub can_cancel: bool,
     pub status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutgoingFilePhase {
     Idle,
-    Header,
+    Offer,
+    AwaitingAcceptance,
     Chunks,
     End,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum FileTransferControl {
+    Offer { filename: String, total_bytes: u64 },
+    Accept,
+    Decline,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -894,6 +1005,7 @@ pub struct IcedCommApp {
     pub window_id: Option<window::Id>,
     pub window_focused: bool,
     pub unread_attention_active: bool,
+    pub original_image_viewer: Option<OriginalImageViewer>,
 
     pub startup_gate: StartupGate,
     pub unlock_input: String,
@@ -1114,12 +1226,25 @@ pub enum Message {
 
     FileChosen(Option<PathBuf>),
     ImageChosen(Option<PathBuf>),
-    OutgoingFileHeaderSent(u64, Result<(), String>),
-    OutgoingFileChunkSent(u64, Result<usize, String>),
-    OutgoingFileEndSent(u64, Result<(), String>),
+    AcceptIncomingFilePressed(u64, u64),
+    DeclineIncomingFilePressed(u64, u64),
+    CancelFileTransferPressed(u64, u64),
+    IncomingFileAcceptSent(u64, u64, Result<(), String>),
+    OutgoingFileOfferSent(u64, u64, Result<(), String>),
+    OutgoingFileChunkSent(u64, u64, Result<usize, String>),
+    OutgoingFileEndSent(u64, u64, Result<(), String>),
     OutgoingImageHeaderSent(u64, Result<(), String>),
     OutgoingImageChunkSent(u64, Result<usize, String>),
     OutgoingImageEndSent(u64, Result<(), String>),
+    RequestOriginalImagePressed(u64, usize),
+    CancelOriginalImagePressed(u64, usize),
+    OriginalImageRequestSent(u64, usize, u64, Result<(), String>),
+    OriginalImageReceived(u64, u64, Option<String>, String, String, Vec<u8>),
+    OriginalImageSendFinished(u64, Option<String>, u64, Result<(), String>),
+    CloseOriginalImageViewerPressed,
+    SaveOriginalImagePressed,
+    OriginalImageSavePathChosen(Option<PathBuf>),
+    OriginalImageSaveFinished(Result<PathBuf, String>),
 
     WindowCloseRequested(window::Id),
     WindowOpened(window::Id),
@@ -1146,10 +1271,9 @@ impl Default for IcedCommApp {
             contact_details_offline_key_ready: false,
             contact_details_rename_mode: false,
             contact_details_rename_input: String::new(),
-            contact_details_tunnel_hops_input:
-                storage::DEFAULT_CONTACT_TUNNEL_HOPS.to_string(),
-            contact_details_tunnel_quantity_input:
-                storage::DEFAULT_CONTACT_TUNNEL_QUANTITY.to_string(),
+            contact_details_tunnel_hops_input: storage::DEFAULT_CONTACT_TUNNEL_HOPS.to_string(),
+            contact_details_tunnel_quantity_input: storage::DEFAULT_CONTACT_TUNNEL_QUANTITY
+                .to_string(),
             contact_details_clear_history_confirm: false,
             contact_details_status: String::new(),
             app_lock: None,
@@ -1157,6 +1281,7 @@ impl Default for IcedCommApp {
             window_id: None,
             window_focused: true,
             unread_attention_active: false,
+            original_image_viewer: None,
 
             startup_gate: StartupGate::Locked,
             unlock_input: String::new(),
@@ -1399,9 +1524,7 @@ impl IcedCommApp {
         match self.clipboard.as_mut() {
             Some(clipboard) => match clipboard.set_text(value) {
                 Ok(()) => self.contact_details_status = format!("Copied {label}."),
-                Err(err) => {
-                    self.contact_details_status = format!("Clipboard copy failed: {err}")
-                }
+                Err(err) => self.contact_details_status = format!("Clipboard copy failed: {err}"),
             },
             None => self.contact_details_status = "Clipboard is not available.".into(),
         }
@@ -1484,6 +1607,8 @@ impl IcedCommApp {
             offline_index_sync_sent: false,
 
             incoming_file: None,
+            incoming_file_transfer_id: 0,
+            incoming_file_offer_started_ms: 0,
             incoming_filename: None,
             incoming_expected: 0,
             incoming_received: 0,
@@ -1495,9 +1620,17 @@ impl IcedCommApp {
             incoming_image_received: 0,
             incoming_image_msg_id: 0,
             incoming_image_bytes: Vec::new(),
+            incoming_image_kind: IncomingImageKind::Preview,
+            incoming_image_media_id: None,
+            incoming_image_sha256: None,
+            incoming_image_original_size: 0,
+            incoming_image_bubble_index: None,
+            cancelled_incoming_image_transfers: Vec::new(),
 
             outgoing_bubble_index: None,
             outgoing_file: None,
+            outgoing_file_transfer_id: 0,
+            outgoing_file_offer_started_ms: 0,
             outgoing_filename: None,
             outgoing_total: 0,
             outgoing_sent: 0,
@@ -1511,6 +1644,12 @@ impl IcedCommApp {
             outgoing_image_msg_id: 0,
             outgoing_image_phase: OutgoingImagePhase::Idle,
             outgoing_image_send_in_flight: false,
+            original_image_send_in_flight: false,
+            original_image_send_media_id: None,
+            original_image_send_cancel: None,
+            shared_original_images: HashMap::new(),
+            received_original_images: HashMap::new(),
+            pending_original_image_requests: HashMap::new(),
             group: None,
 
             session,
@@ -1537,10 +1676,7 @@ impl IcedCommApp {
         }
 
         if tab.session.history_enabled {
-            Self::load_history_into_tab(
-                &mut tab,
-                HistoryScope::Contact(profile_name.to_string()),
-            );
+            Self::load_history_into_tab(&mut tab, HistoryScope::Contact(profile_name.to_string()));
         }
 
         tab
@@ -1615,6 +1751,15 @@ impl IcedCommApp {
             incoming_image_received: 0,
             incoming_image_msg_id: 0,
             incoming_image_bytes: Vec::new(),
+            incoming_image_kind: IncomingImageKind::Preview,
+            incoming_image_media_id: None,
+            incoming_image_sha256: None,
+            incoming_image_original_size: 0,
+            incoming_image_bubble_index: None,
+            cancelled_incoming_image_transfers: Vec::new(),
+            image_send_lock: std::sync::Arc::new(TokioMutex::new(())),
+            original_image_send_media_id: None,
+            original_image_send_cancel: None,
         }
     }
 
@@ -1824,6 +1969,7 @@ impl IcedCommApp {
                 tab.deaddrop_put_in_flight = false;
             }
 
+            Self::interrupt_file_transfers(tab, "Cancelled: chat closing");
             tab.live_conn = None;
             tab.pending_conn = None;
             tab.connect_in_flight = false;
@@ -1884,11 +2030,7 @@ impl IcedCommApp {
     }
 
     fn group_accept_task(&self, tab_id: u64) -> Task<Message> {
-        let Some(tab) = self
-            .opened_tabs
-            .iter()
-            .find(|t| t.id == tab_id)
-        else {
+        let Some(tab) = self.opened_tabs.iter().find(|t| t.id == tab_id) else {
             return Task::none();
         };
 
@@ -2174,10 +2316,8 @@ impl IcedCommApp {
         let group_generated_invite_string = self.session.group_generated_invite_string.clone();
         let group_private_request_string = self.session.group_private_request_string.clone();
         let group_private_request_input = self.session.group_private_request_input.clone();
-        let group_generated_private_invite_string = self
-            .session
-            .group_generated_private_invite_string
-            .clone();
+        let group_generated_private_invite_string =
+            self.session.group_generated_private_invite_string.clone();
         let group_status = self.session.group_status.clone();
         let tabs = self.session.tabs.clone();
         let active_idx = self.session.active_tab_idx;
@@ -2221,8 +2361,7 @@ impl IcedCommApp {
         self.session.group_generated_invite_string = group_generated_invite_string;
         self.session.group_private_request_string = group_private_request_string;
         self.session.group_private_request_input = group_private_request_input;
-        self.session.group_generated_private_invite_string =
-            group_generated_private_invite_string;
+        self.session.group_generated_private_invite_string = group_generated_private_invite_string;
         self.session.group_status = group_status;
         self.session.tabs = tabs;
         self.session.active_tab_idx = active_idx;
@@ -2243,10 +2382,8 @@ impl IcedCommApp {
         let group_generated_invite_string = self.session.group_generated_invite_string.clone();
         let group_private_request_string = self.session.group_private_request_string.clone();
         let group_private_request_input = self.session.group_private_request_input.clone();
-        let group_generated_private_invite_string = self
-            .session
-            .group_generated_private_invite_string
-            .clone();
+        let group_generated_private_invite_string =
+            self.session.group_generated_private_invite_string.clone();
         let group_status = self.session.group_status.clone();
         let tabs = self.session.tabs.clone();
         let active_idx = self.session.active_tab_idx;
@@ -2312,10 +2449,8 @@ impl IcedCommApp {
         let group_generated_invite_string = self.session.group_generated_invite_string.clone();
         let group_private_request_string = self.session.group_private_request_string.clone();
         let group_private_request_input = self.session.group_private_request_input.clone();
-        let group_generated_private_invite_string = self
-            .session
-            .group_generated_private_invite_string
-            .clone();
+        let group_generated_private_invite_string =
+            self.session.group_generated_private_invite_string.clone();
         let group_status = self.session.group_status.clone();
 
         self.session.tabs = std::iter::once(Self::new_app_home_tab())
@@ -2433,8 +2568,7 @@ impl IcedCommApp {
             saved_dest_b64,
             tunnel_hops,
             tunnel_quantity,
-        ) =
-            if let Some(tab) = self.opened_tabs.get(tab_idx) {
+        ) = if let Some(tab) = self.opened_tabs.get(tab_idx) {
                 (
                     tab.id,
                     tab.meta.kind,
@@ -2497,11 +2631,7 @@ impl IcedCommApp {
                         .await
                         .map_err(|e| e.to_string())?
                 } else {
-                    sam.initialize_transient_with_tunnels(
-                        session_id,
-                        tunnel_hops,
-                        tunnel_quantity,
-                    )
+                    sam.initialize_transient_with_tunnels(session_id, tunnel_hops, tunnel_quantity)
                         .await
                         .map_err(|e| e.to_string())?
                 };
@@ -2697,8 +2827,7 @@ impl IcedCommApp {
             }
 
             Message::ProfileSelected(idx) => {
-                if state.contact_details_rename_mode
-                    || state.contact_details_clear_history_confirm
+                if state.contact_details_rename_mode || state.contact_details_clear_history_confirm
                 {
                     return Task::none();
                 }
@@ -2716,8 +2845,7 @@ impl IcedCommApp {
             }
 
             Message::ToggleContactDetailsPressed => {
-                if state.contact_details_rename_mode
-                    || state.contact_details_clear_history_confirm
+                if state.contact_details_rename_mode || state.contact_details_clear_history_confirm
                 {
                     return Task::none();
                 }
@@ -2740,8 +2868,7 @@ impl IcedCommApp {
                     return Task::none();
                 };
                 if state.is_profile_open_in_any_tab(&name) {
-                    state.contact_details_status =
-                        "Close the contact before renaming it.".into();
+                    state.contact_details_status = "Close the contact before renaming it.".into();
                     return Task::none();
                 }
                 state.contact_details_open = true;
@@ -2763,8 +2890,7 @@ impl IcedCommApp {
                     return Task::none();
                 };
                 if state.is_profile_open_in_any_tab(&old_name) {
-                    state.contact_details_status =
-                        "Close the contact before renaming it.".into();
+                    state.contact_details_status = "Close the contact before renaming it.".into();
                     return Task::none();
                 }
                 let new_name = state.contact_details_rename_input.trim().to_string();
@@ -2797,8 +2923,7 @@ impl IcedCommApp {
                         state.contact_details_meta = Some(meta);
                         state.contact_details_rename_mode = false;
                         state.contact_details_rename_input = new_name.clone();
-                        state.contact_details_status =
-                            format!("Renamed contact to {new_name}.");
+                        state.contact_details_status = format!("Renamed contact to {new_name}.");
                     }
                     Err(err) => {
                         state.contact_details_status = format!("Rename contact failed: {err}");
@@ -2809,9 +2934,8 @@ impl IcedCommApp {
 
             Message::CancelContactRenamePressed => {
                 state.contact_details_rename_mode = false;
-                state.contact_details_rename_input = state
-                    .selected_persistent_contact_name()
-                    .unwrap_or_default();
+                state.contact_details_rename_input =
+                    state.selected_persistent_contact_name().unwrap_or_default();
                 state.contact_details_status.clear();
                 return Task::none();
             }
@@ -2827,8 +2951,7 @@ impl IcedCommApp {
                         }
                     }
                     Err(err) => {
-                        state.contact_details_status =
-                            format!("Save history setting failed: {err}")
+                        state.contact_details_status = format!("Save history setting failed: {err}")
                     }
                 }
                 return Task::none();
@@ -2913,8 +3036,7 @@ impl IcedCommApp {
                         }
                     }
                     _ => {
-                        state.contact_details_status =
-                            "Enter valid numeric tunnel settings.".into()
+                        state.contact_details_status = "Enter valid numeric tunnel settings.".into()
                     }
                 }
                 return Task::none();
@@ -2952,8 +3074,7 @@ impl IcedCommApp {
             }
 
             Message::OpenSelectedProfilePressed => {
-                if state.contact_details_rename_mode
-                    || state.contact_details_clear_history_confirm
+                if state.contact_details_rename_mode || state.contact_details_clear_history_confirm
                 {
                     return Task::none();
                 }
@@ -3091,9 +3212,8 @@ impl IcedCommApp {
                         let mut pending = match storage::load_pending_private_group_invites() {
                             Ok(pending) => pending,
                             Err(err) => {
-                                state.session.group_status = format!(
-                                    "Load pending private group requests failed: {err}"
-                                );
+                                state.session.group_status =
+                                    format!("Load pending private group requests failed: {err}");
                                 return Task::none();
                             }
                         };
@@ -3107,9 +3227,8 @@ impl IcedCommApp {
                                     "Generated a private group invite request.".into();
                             }
                             Err(err) => {
-                                state.session.group_status = format!(
-                                    "Save pending private group request failed: {err}"
-                                );
+                                state.session.group_status =
+                                    format!("Save pending private group request failed: {err}");
                             }
                         }
                     }
@@ -3123,8 +3242,7 @@ impl IcedCommApp {
 
             Message::CopyPrivateGroupRequestPressed => {
                 if state.session.group_private_request_string.trim().is_empty() {
-                    state.session.group_status =
-                        "Generate a private group request first.".into();
+                    state.session.group_status = "Generate a private group request first.".into();
                     return Task::none();
                 }
                 state.copy_text_to_clipboard(
@@ -3442,8 +3560,7 @@ impl IcedCommApp {
 
                 let request = state.session.group_private_request_input.trim().to_string();
                 if request.is_empty() {
-                    state.session.group_status =
-                        "Paste a private group request first.".into();
+                    state.session.group_status = "Paste a private group request first.".into();
                     return Task::none();
                 }
 
@@ -3475,8 +3592,7 @@ impl IcedCommApp {
                     .trim()
                     .is_empty()
                 {
-                    state.session.group_status =
-                        "Generate a private group invite first.".into();
+                    state.session.group_status = "Generate a private group invite first.".into();
                     return Task::none();
                 }
                 state.copy_text_to_clipboard(
@@ -3545,10 +3661,8 @@ impl IcedCommApp {
                     return Task::none();
                 }
 
-                let import_result = match group_invite::input_kind(
-                    &invite_string,
-                    GROUP_INVITE_STRING_PREFIX,
-                ) {
+                let import_result =
+                    match group_invite::input_kind(&invite_string, GROUP_INVITE_STRING_PREFIX) {
                     group_invite::InputKind::Shareable => {
                         Self::import_group_invite_string(&invite_string)
                     }
@@ -3823,6 +3937,13 @@ impl IcedCommApp {
 
                     let mut tasks = state.close_tab_runtime_tasks(idx);
                     let tab_id = state.opened_tabs[idx].id;
+                    if state
+                        .original_image_viewer
+                        .as_ref()
+                        .is_some_and(|viewer| viewer.source_tab_id == tab_id)
+                    {
+                        state.original_image_viewer = None;
+                    }
 
                     if let Some(tab) = state.opened_tabs.get_mut(idx) {
                         tab.live_conn = None;
@@ -3847,6 +3968,7 @@ impl IcedCommApp {
                         tab.meta.initialized = false;
                         tab.meta.initializing = false;
 
+                        Self::interrupt_file_transfers(tab, "Cancelled: chat closing");
                         tab.e2e = E2E::new(tab.session.pq_enabled);
 
                         if let Some(group) = tab.group.as_mut() {
@@ -3998,8 +4120,7 @@ impl IcedCommApp {
             }
 
             Message::CreateProfilePressed => {
-                if state.contact_details_rename_mode
-                    || state.contact_details_clear_history_confirm
+                if state.contact_details_rename_mode || state.contact_details_clear_history_confirm
                 {
                     return Task::none();
                 }
@@ -4056,8 +4177,7 @@ impl IcedCommApp {
             }
 
             Message::DeleteProfilePressed => {
-                if state.contact_details_rename_mode
-                    || state.contact_details_clear_history_confirm
+                if state.contact_details_rename_mode || state.contact_details_clear_history_confirm
                 {
                     return Task::none();
                 }
@@ -4085,8 +4205,7 @@ impl IcedCommApp {
             }
 
             Message::ResetProfilePressed => {
-                if state.contact_details_rename_mode
-                    || state.contact_details_clear_history_confirm
+                if state.contact_details_rename_mode || state.contact_details_clear_history_confirm
                 {
                     return Task::none();
                 }
@@ -4295,6 +4414,8 @@ impl IcedCommApp {
                             draft.filename,
                             draft.mime,
                             draft.image.bytes,
+                            draft.original_mime,
+                            draft.original_bytes,
                         );
                         return match send_task {
                             Ok(task) => {
@@ -4573,16 +4694,13 @@ impl IcedCommApp {
 
             Message::ActionPressed(action) => match action {
                 GuiAction::Connect => {
-                    if state.session.profile == "default"
-                        && state.session.show_rendezvous_panel
-                    {
+                    if state.session.profile == "default" && state.session.show_rendezvous_panel {
                         return Task::none();
                     }
 
                     if state.session.profile != "default" {
                         if let Some(peer) = state.session.stored_peer.clone() {
-                            let Some(connect_task) =
-                                state.start_one_to_one_connect(peer.clone())
+                            let Some(connect_task) = state.start_one_to_one_connect(peer.clone())
                             else {
                                 return Task::none();
                             };
@@ -5124,9 +5242,10 @@ impl IcedCommApp {
 
                         if let Some(group) = updated_group {
                             if let Err(err) = storage::save_group_meta(&group) {
-                                state.session.log_lines.push(format!(
-                                    "Save group history setting failed: {err}"
-                                ));
+                                state
+                                    .session
+                                    .log_lines
+                                    .push(format!("Save group history setting failed: {err}"));
                             } else if let Some(stored) = state
                                 .session
                                 .groups
@@ -5143,12 +5262,16 @@ impl IcedCommApp {
             }
 
             Message::ClearHistoryPressed => {
-                state.session.history_clear_confirm = match state.active_tab().map(|tab| tab.meta.kind) {
+                state.session.history_clear_confirm =
+                    match state.active_tab().map(|tab| tab.meta.kind) {
                     Some(TabKind::Chat)
                         if state
                             .active_tab()
                             .map(Self::is_persistent_contact_tab)
-                            .unwrap_or(false) => Some(HistoryClearConfirm::Contact),
+                                .unwrap_or(false) =>
+                        {
+                            Some(HistoryClearConfirm::Contact)
+                        }
                     Some(TabKind::Group) => Some(HistoryClearConfirm::Group),
                     _ => None,
                 };
@@ -5195,8 +5318,7 @@ impl IcedCommApp {
                     && !state.has_active_connection_attempt()
                     && state.session.pending_action != Some(GuiAction::Connect)
                 {
-                    state.session.show_rendezvous_panel =
-                        !state.session.show_rendezvous_panel;
+                    state.session.show_rendezvous_panel = !state.session.show_rendezvous_panel;
                     state.store_active_runtime();
                 }
                 return Task::none();
@@ -5238,8 +5360,7 @@ impl IcedCommApp {
                     return Task::none();
                 }
                 let Some(my_b32) = state.session.my_b32.clone() else {
-                    state.session.rendezvous_status =
-                        "Transient address is not ready yet.".into();
+                    state.session.rendezvous_status = "Transient address is not ready yet.".into();
                     state.store_active_runtime();
                     return Task::none();
                 };
@@ -5278,8 +5399,7 @@ impl IcedCommApp {
                         state.session.rendezvous_outgoing = Some(access);
                         let Some(task) = state.start_one_to_one_connect(peer.clone()) else {
                             state.session.rendezvous_status =
-                                "Close the current call before using a rendezvous response."
-                                    .into();
+                                "Close the current call before using a rendezvous response.".into();
                             state.store_active_runtime();
                             return Task::none();
                         };
@@ -5764,8 +5884,7 @@ impl IcedCommApp {
                             };
 
                             let my_b32 = group.meta.my_b32.as_deref();
-                            let prefer_outbound =
-                                Self::local_prefers_outbound(my_b32, &member_b32);
+                            let prefer_outbound = Self::local_prefers_outbound(my_b32, &member_b32);
 
                             let Some(peer) = group
                                 .peers
@@ -5809,10 +5928,7 @@ impl IcedCommApp {
                                 tab.sam_runtime.register_stream(&conn);
                                 let old_conn = peer.conn.replace(conn.clone());
                                 peer.pending_conn = None;
-                                Self::start_group_peer_handshake(
-                                    peer,
-                                    Self::now_epoch_millis(),
-                                );
+                                Self::start_group_peer_handshake(peer, Self::now_epoch_millis());
 
                                 if let Some(old_conn) = old_conn {
                                     close_task = Some(Task::perform(
@@ -5955,7 +6071,9 @@ impl IcedCommApp {
                                         .session
                                         .pending_peer_addr
                                         .as_deref()
-                                        .map(|pending_peer| pending_peer.eq_ignore_ascii_case(&peer))
+                                        .map(|pending_peer| {
+                                            pending_peer.eq_ignore_ascii_case(&peer)
+                                        })
                                         .unwrap_or(false);
                                     let prefer_outbound = same_peer
                                         && Self::local_prefers_outbound(
@@ -5999,7 +6117,10 @@ impl IcedCommApp {
                                         let conn_to_close = conn.clone();
                                         tasks.push(Task::perform(
                                             async move {
-                                                conn_to_close.close().await.map_err(|e| e.to_string())
+                                                conn_to_close
+                                                    .close()
+                                                    .await
+                                                    .map_err(|e| e.to_string())
                                             },
                                             move |result| Message::CloseFinished(tab_id, result),
                                         ));
@@ -6023,8 +6144,7 @@ impl IcedCommApp {
                                     tab.e2e = E2E::new(tab.session.pq_enabled);
                                     tab.sam_runtime.register_stream(&conn);
                                     tab.live_conn = Some(conn.clone());
-                                    tab.connection_direction =
-                                        Some(ConnectionDirection::Outbound);
+                                    tab.connection_direction = Some(ConnectionDirection::Outbound);
                                     tab.session.current_peer_addr = Some(peer.clone());
                                     tab.session.current_peer_dest_b64 = None;
                                     tab.session.peer_b32 = Some(peer.clone());
@@ -6035,9 +6155,7 @@ impl IcedCommApp {
                                         "Handshake sent to {peer}. Establishing secure session..."
                                     ));
 
-                                    if let Some(my_dest_b64) =
-                                        tab.session.my_pub_dest_b64.clone()
-                                    {
+                                    if let Some(my_dest_b64) = tab.session.my_pub_dest_b64.clone() {
                                         let auth_frame_result = if let Some(access) =
                                             tab.session.rendezvous_outgoing.take()
                                         {
@@ -6067,11 +6185,13 @@ impl IcedCommApp {
                                                     )
                                                 });
 
-                                            auth_result.map(|signal| Some(Frame {
+                                            auth_result.map(|signal| {
+                                                Some(Frame {
                                                     msg_type: MsgType::S,
                                                     msg_id: msg_id_auth,
                                                     payload: signal.into_bytes(),
-                                                }))
+                                                })
+                                            })
                                         } else {
                                             Ok(None)
                                         };
@@ -6104,8 +6224,7 @@ impl IcedCommApp {
                                                     tab.connection_direction = None;
                                                     tab.session.current_peer_addr = None;
                                                     tab.session.peer_b32 = None;
-                                                    tab.session.network_status =
-                                                        NetworkStatus::LocalOk;
+                                                tab.session.network_status = NetworkStatus::LocalOk;
                                                     let conn_to_close = conn.clone();
                                                     tasks.push(Task::perform(
                                                         async move {
@@ -6121,9 +6240,7 @@ impl IcedCommApp {
                                             }
                                             }
                                     }
-                                } else if tab.pending_conn.is_none()
-                                    && tab.live_conn.is_none()
-                                {
+                                } else if tab.pending_conn.is_none() && tab.live_conn.is_none() {
                                     tab.connection_direction = None;
                                     tab.session.network_status = NetworkStatus::LocalOk;
                                 }
@@ -6141,17 +6258,13 @@ impl IcedCommApp {
                         if let Some((line, auth_frame, frame_s, frame_k)) = handshake {
                             tasks.push(Task::perform(
                                 async move {
-                                    conn.send_raw_line(&line)
-                                        .await
-                                        .map_err(|e| e.to_string())?;
+                                    conn.send_raw_line(&line).await.map_err(|e| e.to_string())?;
                                     if let Some(auth_frame) = auth_frame {
                                         conn.send_frame(&auth_frame)
                                             .await
                                             .map_err(|e| e.to_string())?;
                                     }
-                                    conn.send_frame(&frame_s)
-                                        .await
-                                        .map_err(|e| e.to_string())?;
+                                    conn.send_frame(&frame_s).await.map_err(|e| e.to_string())?;
                                     conn.send_frame(&frame_k).await.map_err(|e| e.to_string())
                                 },
                                 move |result| Message::SendFinished(tab_id, result),
@@ -6304,10 +6417,7 @@ impl IcedCommApp {
                             tab.sam_runtime.register_stream(&incoming.conn);
                             let old_conn = peer.conn.replace(incoming.conn.clone());
                             peer.pending_conn = None;
-                            Self::start_group_peer_handshake(
-                                peer,
-                                Self::now_epoch_millis(),
-                            );
+                            Self::start_group_peer_handshake(peer, Self::now_epoch_millis());
 
                             if let Some(old_conn) = old_conn {
                                 close_tasks.push(Task::perform(
@@ -6401,9 +6511,7 @@ impl IcedCommApp {
                         {
                             let conn_to_close = incoming.conn.clone();
                             return Task::perform(
-                                async move {
-                                    conn_to_close.close().await.map_err(|e| e.to_string())
-                                },
+                                async move { conn_to_close.close().await.map_err(|e| e.to_string()) },
                                 move |result| Message::CloseFinished(tab_id, result),
                             );
                         }
@@ -6420,8 +6528,8 @@ impl IcedCommApp {
                                 || (tab.live_conn.is_some()
                                     && tab.connection_direction
                                         == Some(ConnectionDirection::Outbound));
-                            let keep_established = tab.session.live_ready
-                                && tab.live_conn.is_some();
+                            let keep_established =
+                                tab.session.live_ready && tab.live_conn.is_some();
                             let keep_existing_pending = tab.pending_conn.is_some();
                             let prefer_outbound = same_outbound_peer
                                 && Self::local_prefers_outbound(
@@ -6772,6 +6880,23 @@ impl IcedCommApp {
                     return Task::none();
                 };
 
+                if let Some(tab) = state.active_tab() {
+                    if tab.outgoing_phase != OutgoingFilePhase::Idle
+                        || tab.outgoing_image_phase != OutgoingImagePhase::Idle
+                    {
+                        state.post_system("Another transfer is already in progress.");
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+
+                    if tab.live_conn.is_none() || !tab.session.live_ready || !tab.e2e.ready() {
+                        state.post_system("File send requires a live secure chat.");
+                        return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                    }
+                } else {
+                    state.post_system("Open a chat tab before sending a file.");
+                    return operation::snap_to_end(state.session.logs_scroll_id.clone());
+                }
+
                 let filename = match path.file_name().and_then(|s| s.to_str()) {
                     Some(v) => v.to_string(),
                     None => {
@@ -6809,14 +6934,17 @@ impl IcedCommApp {
                     }
                 };
 
-                state.push_outgoing_file_bubble(filename.clone(), total_bytes);
+                let transfer_id = state.generate_msg_id();
+                state.push_outgoing_file_bubble(transfer_id, filename.clone(), total_bytes);
 
                 if let Some(tab) = state.active_tab_mut() {
                     tab.outgoing_file = Some(file);
+                    tab.outgoing_file_transfer_id = transfer_id;
+                    tab.outgoing_file_offer_started_ms = Self::now_epoch_millis();
                     tab.outgoing_filename = Some(filename);
                     tab.outgoing_total = total_bytes;
                     tab.outgoing_sent = 0;
-                    tab.outgoing_phase = OutgoingFilePhase::Header;
+                    tab.outgoing_phase = OutgoingFilePhase::Offer;
                     tab.outgoing_send_in_flight = false;
                 }
 
@@ -6862,7 +6990,8 @@ impl IcedCommApp {
                     return operation::snap_to_end(state.session.logs_scroll_id.clone());
                 }
 
-                let (bytes, mime) = match Self::prepare_image_preview_bytes(&path) {
+                let (bytes, mime, original_bytes, original_mime) =
+                    match Self::prepare_image_preview_bytes(&path) {
                     Ok(v) => v,
                     Err(err) => {
                         state.post_system(err);
@@ -6870,7 +6999,13 @@ impl IcedCommApp {
                     }
                 };
 
-                return match state.send_prepared_image(filename, mime, bytes) {
+                return match state.send_prepared_image(
+                    filename,
+                    mime,
+                    bytes,
+                    original_mime,
+                    original_bytes,
+                ) {
                     Ok(task) => task,
                     Err(err) => {
                         state.post_system(err);
@@ -6879,19 +7014,655 @@ impl IcedCommApp {
                 };
             }
 
-            Message::OutgoingFileHeaderSent(tab_id, result) => {
+            Message::RequestOriginalImagePressed(tab_id, bubble_idx) => {
+                let Some(tab) = state.tab_by_id_mut(tab_id) else {
+                    return Task::none();
+                };
+                let Some(BubbleContent::Image(image)) = tab
+                    .session
+                    .bubbles
+                    .get(bubble_idx)
+                    .map(|bubble| &bubble.content)
+                else {
+                    return Task::none();
+                };
+                let Some(media_id) = image.original_media_id else {
+                    return Task::none();
+                };
+                let sender_b32 = image.original_sender_b32.clone();
+                let cache_key = Self::received_original_image_cache_key(
+                    media_id,
+                    sender_b32.as_deref(),
+                );
+                if let Some(cached) = tab.received_original_images.get_mut(&cache_key) {
+                    cached.added_ms = Self::now_epoch_millis();
+                    let cached = cached.clone();
+                    tab.session
+                        .log_lines
+                        .push("Opened original image from memory cache.".into());
+                    return Task::done(Message::OriginalImageReceived(
+                        tab_id,
+                        media_id,
+                        sender_b32,
+                        cached.filename,
+                        cached.mime,
+                        cached.bytes,
+                    ));
+                }
+                let control = Self::original_image_request_payload(media_id);
+
+                let (conn, e2e) = if tab.meta.kind == TabKind::Group {
+                    let Some(sender_b32) = sender_b32.as_deref() else {
+                        tab.session
+                            .log_lines
+                            .push("Original image sender is unavailable.".into());
+                        return Task::none();
+                    };
+                    let Some(peer) = tab.group.as_ref().and_then(|group| {
+                        group.peers.iter().find(|peer| {
+                            peer.ready
+                                && peer.authorized
+                                && peer.member.b32.eq_ignore_ascii_case(sender_b32)
+                        })
+                    }) else {
+                        tab.session
+                            .log_lines
+                            .push("Original image sender is not currently connected.".into());
+                        return Task::none();
+                    };
+                    let Some(conn) = peer.conn.clone() else {
+                        tab.session
+                            .log_lines
+                            .push("Original image sender is not currently connected.".into());
+                        return Task::none();
+                    };
+                    (conn, peer.e2e.clone())
+                } else {
+                    let Some(conn) = tab.live_conn.clone().filter(|_| tab.session.live_ready) else {
+                        tab.session
+                            .log_lines
+                            .push("Original image sender is not currently connected.".into());
+                        return Task::none();
+                    };
+                    (conn, tab.e2e.clone())
+                };
+
+                let payload = match e2e.encrypt_strict(&control) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        tab.session.log_lines.push(format!(
+                            "Original image request encryption failed: {err}"
+                        ));
+                        return Task::none();
+                    }
+                };
+                let frame = Frame {
+                    msg_type: MsgType::J,
+                    msg_id: Self::generate_msg_id_value(),
+                    payload,
+                };
+                tab.session
+                    .log_lines
+                    .push("Requested original image from sender.".into());
+                if tab.pending_original_image_requests.len()
+                    >= ORIGINAL_IMAGE_PENDING_REQUEST_MAX_ITEMS
+                    && !tab.pending_original_image_requests.contains_key(&media_id)
+                {
+                    if let Some(stale_id) =
+                        tab.pending_original_image_requests.keys().next().copied()
+                    {
+                        tab.pending_original_image_requests.remove(&stale_id);
+                    }
+                }
+                tab.pending_original_image_requests
+                    .insert(media_id, sender_b32.map(|value| value.to_ascii_lowercase()));
+                Self::set_original_image_bubble_state(
+                    &mut tab.session.bubbles,
+                    bubble_idx,
+                    OriginalImageBubbleState::Requesting,
+                    0,
+                );
+                let task = Task::perform(
+                    async move { conn.send_frame(&frame).await.map_err(|err| err.to_string()) },
+                    move |result| {
+                        Message::OriginalImageRequestSent(tab_id, bubble_idx, media_id, result)
+                    },
+                );
+                let task = tab.sam_runtime.track_send_task(task);
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return task;
+            }
+
+            Message::CancelOriginalImagePressed(tab_id, bubble_idx) => {
+                let Some(tab) = state.tab_by_id_mut(tab_id) else {
+                    return Task::none();
+                };
+                let (media_id, sender_b32, can_cancel) = match tab
+                    .session
+                    .bubbles
+                    .get(bubble_idx)
+                    .map(|bubble| &bubble.content)
+                {
+                    Some(BubbleContent::Image(image)) => (
+                        image.original_media_id,
+                        image.original_sender_b32.clone(),
+                        matches!(
+                            image.original_state,
+                            OriginalImageBubbleState::Requesting
+                                | OriginalImageBubbleState::Receiving
+                        ),
+                    ),
+                    _ => return Task::none(),
+                };
+                let Some(media_id) = media_id else {
+                    return Task::none();
+                };
+                if !can_cancel {
+                    return Task::none();
+                }
+
+                tab.pending_original_image_requests.remove(&media_id);
+                Self::set_original_image_bubble_state(
+                    &mut tab.session.bubbles,
+                    bubble_idx,
+                    OriginalImageBubbleState::Cancelled,
+                    0,
+                );
+
+                let connection = if tab.meta.kind == TabKind::Group {
+                    let sender = sender_b32.as_deref();
+                    tab.group.as_mut().and_then(|group| {
+                        group
+                            .peers
+                            .iter_mut()
+                            .find(|peer| {
+                                sender.is_some_and(|sender| {
+                                    peer.member.b32.eq_ignore_ascii_case(sender)
+                                })
+                            })
+                            .and_then(|peer| {
+                                if peer.incoming_image_kind == IncomingImageKind::Original
+                                    && peer.incoming_image_media_id == Some(media_id)
+                                {
+                                    Self::remember_cancelled_image_transfer(
+                                        &mut peer.cancelled_incoming_image_transfers,
+                                        peer.incoming_image_msg_id,
+                                    );
+                                    Self::clear_group_peer_incoming_image_state(peer);
+                                }
+                                peer.conn.clone().filter(|_| peer.ready && peer.authorized).map(
+                                    |conn| (conn, peer.e2e.clone()),
+                                )
+                            })
+                    })
+                } else {
+                    if tab.incoming_image_kind == IncomingImageKind::Original
+                        && tab.incoming_image_media_id == Some(media_id)
+                    {
+                        Self::remember_cancelled_image_transfer(
+                            &mut tab.cancelled_incoming_image_transfers,
+                            tab.incoming_image_msg_id,
+                        );
+                        Self::clear_incoming_image_state(tab);
+                    }
+                    tab.live_conn
+                        .clone()
+                        .filter(|_| tab.session.live_ready)
+                        .map(|conn| (conn, tab.e2e.clone()))
+                };
+
+                tab.session
+                    .log_lines
+                    .push("Original image download cancelled.".into());
+                let Some((conn, e2e)) = connection else {
+                    if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                        state.load_active_runtime();
+                    }
+                    return Task::none();
+                };
+                let payload = match e2e
+                    .encrypt_strict(&Self::original_image_cancel_payload(media_id))
+                {
+                    Ok(payload) => payload,
+                    Err(_) => return Task::none(),
+                };
+                let frame = Frame {
+                    msg_type: MsgType::J,
+                    msg_id: Self::generate_msg_id_value(),
+                    payload,
+                };
+                let task = Task::perform(
+                    async move { conn.send_frame(&frame).await.map_err(|err| err.to_string()) },
+                    move |result| Message::SendFinished(tab_id, result),
+                );
+                let task = tab.sam_runtime.track_send_task(task);
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return task;
+            }
+
+            Message::OriginalImageRequestSent(tab_id, bubble_idx, media_id, result) => {
+                if let Err(err) = result {
+                    if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                        tab.pending_original_image_requests.remove(&media_id);
+                        Self::set_original_image_bubble_state(
+                            &mut tab.session.bubbles,
+                            bubble_idx,
+                            OriginalImageBubbleState::Failed,
+                            0,
+                        );
+                        tab.session
+                            .log_lines
+                            .push(format!("Original image request failed: {err}"));
+                    }
+                }
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return Task::none();
+            }
+
+            Message::OriginalImageReceived(
+                tab_id,
+                media_id,
+                sender_b32,
+                filename,
+                mime,
+                bytes,
+            ) => {
+                if !state
+                    .opened_tabs
+                    .iter()
+                    .any(|tab| tab.id == tab_id && !tab.meta.closing)
+                {
+                    return Task::none();
+                }
+                let (width, height) = match Self::validate_original_image(&bytes, &mime) {
+                    Ok(dimensions) => dimensions,
+                    Err(err) => {
+                        if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                            if let Some(bubble_idx) = Self::find_original_image_bubble(
+                                &tab.session.bubbles,
+                                media_id,
+                                sender_b32.as_deref(),
+                            ) {
+                                Self::set_original_image_bubble_state(
+                                    &mut tab.session.bubbles,
+                                    bubble_idx,
+                                    OriginalImageBubbleState::Failed,
+                                    0,
+                                );
+                            }
+                            tab.session
+                                .log_lines
+                                .push(format!("Original image rejected: {err}"));
+                        }
+                        return Task::none();
+                    }
+                };
+                let handle = iced::widget::image::Handle::from_bytes(bytes.clone());
                 if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                    let cache_key = Self::received_original_image_cache_key(
+                        media_id,
+                        sender_b32.as_deref(),
+                    );
+                    if let Some(cached) = tab.received_original_images.get_mut(&cache_key) {
+                        cached.added_ms = Self::now_epoch_millis();
+                    } else {
+                        Self::cache_received_original_image(
+                            tab,
+                            media_id,
+                            sender_b32.as_deref(),
+                            filename.clone(),
+                            mime.clone(),
+                            bytes.clone(),
+                        );
+                    }
+                    if let Some(bubble_idx) = Self::find_original_image_bubble(
+                        &tab.session.bubbles,
+                        media_id,
+                        sender_b32.as_deref(),
+                    ) {
+                        Self::set_original_image_bubble_state(
+                            &mut tab.session.bubbles,
+                            bubble_idx,
+                            OriginalImageBubbleState::Idle,
+                            0,
+                        );
+                    }
+                }
+                state.original_image_viewer = Some(OriginalImageViewer {
+                    source_tab_id: tab_id,
+                    filename,
+                    mime,
+                    bytes,
+                    handle,
+                    width,
+                    height,
+                    status: String::new(),
+                });
+                return Task::none();
+            }
+
+            Message::OriginalImageSendFinished(tab_id, peer_b32, media_id, result) => {
+                if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                    if let Some(peer_b32) = peer_b32.as_deref() {
+                        if let Some(peer) = tab.group.as_mut().and_then(|group| {
+                            group.peers.iter_mut().find(|peer| {
+                                peer.member.b32.eq_ignore_ascii_case(peer_b32)
+                            })
+                        }) {
+                            if peer.original_image_send_media_id == Some(media_id) {
+                                peer.original_image_send_media_id = None;
+                                peer.original_image_send_cancel = None;
+                            }
+                        }
+                    } else if tab.original_image_send_media_id == Some(media_id) {
+                        tab.original_image_send_in_flight = false;
+                        tab.original_image_send_media_id = None;
+                        tab.original_image_send_cancel = None;
+                    }
+                    match result {
+                        Ok(()) => tab
+                            .session
+                            .log_lines
+                            .push("Requested original image sent.".into()),
+                        Err(err) if err == "original image send cancelled" => tab
+                            .session
+                            .log_lines
+                            .push("Original image send cancelled by peer.".into()),
+                        Err(err) => tab
+                            .session
+                            .log_lines
+                            .push(format!("Original image send failed: {err}")),
+                    }
+                }
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return Task::none();
+            }
+
+            Message::CloseOriginalImageViewerPressed => {
+                state.original_image_viewer = None;
+                return Task::none();
+            }
+
+            Message::SaveOriginalImagePressed => {
+                let Some(viewer) = state.original_image_viewer.as_ref() else {
+                    return Task::none();
+                };
+                let filename = viewer.filename.clone();
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_file_name(filename)
+                            .save_file()
+                            .await
+                            .map(|file| file.path().to_path_buf())
+                    },
+                    Message::OriginalImageSavePathChosen,
+                );
+            }
+
+            Message::OriginalImageSavePathChosen(path) => {
+                let Some(path) = path else {
+                    return Task::none();
+                };
+                let Some(viewer) = state.original_image_viewer.as_mut() else {
+                    return Task::none();
+                };
+                viewer.status = "Saving...".into();
+                let bytes = viewer.bytes.clone();
+                return Task::perform(
+                    async move {
+                        let mut file = storage::create_file_secure(&path)
+                            .map_err(|err| format!("Image save failed: {err}"))?;
+                        file.write_all(&bytes)
+                            .map_err(|err| format!("Image save failed: {err}"))?;
+                        file.flush()
+                            .map_err(|err| format!("Image save failed: {err}"))?;
+                        Ok(path)
+                    },
+                    Message::OriginalImageSaveFinished,
+                );
+            }
+
+            Message::OriginalImageSaveFinished(result) => {
+                if let Some(viewer) = state.original_image_viewer.as_mut() {
+                    viewer.status = match result {
+                        Ok(path) => format!("Saved to {}", path.display()),
+                        Err(err) => err,
+                    };
+                }
+                return Task::none();
+            }
+
+            Message::AcceptIncomingFilePressed(tab_id, transfer_id) => {
+                let Some(tab) = state.tab_by_id_mut(tab_id) else {
+                    return Task::none();
+                };
+                if tab.incoming_file_transfer_id != transfer_id || tab.incoming_file.is_some() {
+                    return Task::none();
+                }
+
+                let Some(filename) = tab.incoming_filename.clone() else {
+                    return Task::none();
+                };
+                let save_path = match Self::ensure_files_dir() {
+                    Ok(dir) => dir.join(format!("recv_{transfer_id}_{filename}")),
+                    Err(err) => {
+                        Self::update_incoming_file_bubble(
+                            tab,
+                            "Accept failed",
+                            false,
+                            true,
+                            false,
+                            false,
+                            false,
+                            None,
+                        );
+                        Self::clear_incoming_file_state(tab, true);
+                        tab.session
+                            .log_lines
+                            .push(format!("Failed to create file dir: {err}"));
+                        return Task::none();
+                    }
+                };
+                let file = match storage::create_file_secure(&save_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        Self::update_incoming_file_bubble(
+                            tab,
+                            "Accept failed",
+                            false,
+                            true,
+                            false,
+                            false,
+                            false,
+                            None,
+                        );
+                        Self::clear_incoming_file_state(tab, true);
+                        tab.session
+                            .log_lines
+                            .push(format!("Failed to open incoming file: {err}"));
+                        return Task::none();
+                    }
+                };
+
+                tab.incoming_file = Some(file);
+                tab.incoming_file_offer_started_ms = 0;
+                tab.incoming_save_path = Some(save_path.clone());
+                Self::update_incoming_file_bubble(
+                    tab,
+                    "Receiving...",
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    Some(save_path.display().to_string()),
+                );
+
+                let task = match Self::incoming_file_accept_task(
+                    tab_id,
+                    tab.live_conn.clone(),
+                    &tab.e2e,
+                    transfer_id,
+                    FileTransferControl::Accept,
+                ) {
+                    Ok(task) => task,
+                    Err(err) => {
+                        Self::update_incoming_file_bubble(
+                            tab,
+                            "Accept failed",
+                            false,
+                            true,
+                            false,
+                            false,
+                            false,
+                            None,
+                        );
+                        Self::clear_incoming_file_state(tab, true);
+                        tab.session.log_lines.push(err);
+                        Task::none()
+                    }
+                };
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return task;
+            }
+
+            Message::IncomingFileAcceptSent(tab_id, transfer_id, result) => {
+                if let Err(err) = result {
+                    if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                        if tab.incoming_file_transfer_id == transfer_id {
+                            Self::update_incoming_file_bubble(
+                                tab,
+                                "Accept failed",
+                                false,
+                                true,
+                                false,
+                                false,
+                                false,
+                                None,
+                            );
+                            Self::clear_incoming_file_state(tab, true);
+                        }
+                        tab.session
+                            .log_lines
+                            .push(format!("File acceptance send failed: {err}"));
+                    }
+                }
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return Task::none();
+            }
+
+            Message::DeclineIncomingFilePressed(tab_id, transfer_id) => {
+                let Some(tab) = state.tab_by_id_mut(tab_id) else {
+                    return Task::none();
+                };
+                if tab.incoming_file_transfer_id != transfer_id || tab.incoming_file.is_some() {
+                    return Task::none();
+                }
+
+                let task = Self::file_control_task(
+                    tab_id,
+                    tab.live_conn.clone(),
+                    &tab.e2e,
+                    transfer_id,
+                    FileTransferControl::Decline,
+                )
+                .unwrap_or_else(|err| {
+                    tab.session.log_lines.push(err);
+                    Task::none()
+                });
+                Self::update_incoming_file_bubble(
+                    tab, "Declined", false, false, false, false, false, None,
+                );
+                Self::clear_incoming_file_state(tab, true);
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return task;
+            }
+
+            Message::CancelFileTransferPressed(tab_id, transfer_id) => {
+                let Some(tab) = state.tab_by_id_mut(tab_id) else {
+                    return Task::none();
+                };
+                let outgoing = tab.outgoing_file_transfer_id == transfer_id
+                    && tab.outgoing_phase != OutgoingFilePhase::Idle;
+                let incoming = tab.incoming_file_transfer_id == transfer_id;
+                if !outgoing && !incoming {
+                    return Task::none();
+                }
+
+                let task = Self::file_control_task(
+                    tab_id,
+                    tab.live_conn.clone(),
+                    &tab.e2e,
+                    transfer_id,
+                    FileTransferControl::Cancel,
+                )
+                .unwrap_or_else(|err| {
+                    tab.session.log_lines.push(err);
+                    Task::none()
+                });
+
+                if outgoing {
+                    Self::update_outgoing_file_bubble(
+                        tab,
+                        tab.outgoing_sent,
+                        "Cancelled".into(),
+                        false,
+                        false,
+                        false,
+                    );
+                    Self::clear_outgoing_file_state(tab);
+                }
+                if incoming {
+                    Self::update_incoming_file_bubble(
+                        tab,
+                        "Cancelled",
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        None,
+                    );
+                    Self::clear_incoming_file_state(tab, true);
+                }
+                if state.active_tab().map(|tab| tab.id) == Some(tab_id) {
+                    state.load_active_runtime();
+                }
+                return task;
+            }
+
+            Message::OutgoingFileOfferSent(tab_id, transfer_id, result) => {
+                if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                    if tab.outgoing_file_transfer_id != transfer_id {
+                        return Task::none();
+                    }
                     tab.outgoing_send_in_flight = false;
 
                     match result {
                         Ok(()) => {
-                            tab.outgoing_phase = OutgoingFilePhase::Chunks;
+                            tab.outgoing_phase = OutgoingFilePhase::AwaitingAcceptance;
                             Self::update_outgoing_file_bubble(
                                 tab,
                                 tab.outgoing_sent,
-                                "Sending...".into(),
+                                "Waiting for peer...".into(),
                                 false,
                                 false,
+                                true,
                             );
                         }
                         Err(err) => {
@@ -6901,6 +7672,7 @@ impl IcedCommApp {
                                 format!("Send failed: {err}"),
                                 false,
                                 true,
+                                false,
                             );
                             Self::clear_outgoing_file_state(tab);
                         }
@@ -6915,8 +7687,11 @@ impl IcedCommApp {
                 return Task::none();
             }
 
-            Message::OutgoingFileChunkSent(tab_id, result) => {
+            Message::OutgoingFileChunkSent(tab_id, transfer_id, result) => {
                 if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                    if tab.outgoing_file_transfer_id != transfer_id {
+                        return Task::none();
+                    }
                     tab.outgoing_send_in_flight = false;
 
                     match result {
@@ -6935,6 +7710,7 @@ impl IcedCommApp {
                                 format!("Sending... {}/{}", tab.outgoing_sent, tab.outgoing_total),
                                 false,
                                 false,
+                                true,
                             );
                         }
                         Err(err) => {
@@ -6944,6 +7720,7 @@ impl IcedCommApp {
                                 format!("Send failed: {err}"),
                                 false,
                                 true,
+                                false,
                             );
                             Self::clear_outgoing_file_state(tab);
                         }
@@ -6958,8 +7735,11 @@ impl IcedCommApp {
                 return Task::none();
             }
 
-            Message::OutgoingFileEndSent(tab_id, result) => {
+            Message::OutgoingFileEndSent(tab_id, transfer_id, result) => {
                 if let Some(tab) = state.tab_by_id_mut(tab_id) {
+                    if tab.outgoing_file_transfer_id != transfer_id {
+                        return Task::none();
+                    }
                     tab.outgoing_send_in_flight = false;
 
                     match result {
@@ -6970,13 +7750,9 @@ impl IcedCommApp {
                                 "Sent".into(),
                                 true,
                                 false,
+                                false,
                             );
-                            tab.outgoing_file = None;
-                            tab.outgoing_filename = None;
-                            tab.outgoing_total = 0;
-                            tab.outgoing_sent = 0;
-                            tab.outgoing_phase = OutgoingFilePhase::Idle;
-                            tab.outgoing_send_in_flight = false;
+                            Self::clear_outgoing_file_state(tab);
                         }
                         Err(err) => {
                             Self::update_outgoing_file_bubble(
@@ -6985,6 +7761,7 @@ impl IcedCommApp {
                                 format!("Send failed: {err}"),
                                 false,
                                 true,
+                                false,
                             );
                             Self::clear_outgoing_file_state(tab);
                         }
@@ -8112,8 +8889,8 @@ impl IcedCommApp {
                 blobs,
                 stats,
             ) => {
-                let mark_unread = !state.window_focused
-                    || state.active_tab().map(|tab| tab.id) != Some(tab_id);
+                let mark_unread =
+                    !state.window_focused || state.active_tab().map(|tab| tab.id) != Some(tab_id);
                 if let Some(tab) = state.tab_by_id_mut(tab_id) {
                     Self::record_deaddrop_stats_for_tab(tab, &stats);
                     Self::flush_deaddrop_stats_for_tab(tab, false);
@@ -8273,8 +9050,7 @@ impl IcedCommApp {
         );
         let contact_details_operation_active =
             state.contact_details_rename_mode || state.contact_details_clear_history_confirm;
-        let profile_buttons_allowed =
-            !profile_confirm_active && !contact_details_operation_active;
+        let profile_buttons_allowed = !profile_confirm_active && !contact_details_operation_active;
         let profile_ops_allowed = delete_allowed && profile_buttons_allowed;
         let selected_contact_open = selected_profile
             .filter(|profile| profile.persistent)
@@ -8473,11 +9249,9 @@ impl IcedCommApp {
         .spacing(6)
         .width(Length::Fill);
 
-        let contact_details_panel: Element<'_, Message> =
-            if state.contact_details_open {
+        let contact_details_panel: Element<'_, Message> = if state.contact_details_open {
                 if let Some(meta) = state.contact_details_meta.as_ref() {
-                    let locked =
-                        meta.locked_peer.is_some() && meta.locked_peer_dest_b64.is_some();
+                let locked = meta.locked_peer.is_some() && meta.locked_peer_dest_b64.is_some();
                     let my_b32 = meta.my_b32.as_deref();
                     let peer_b32 = meta.locked_peer.as_deref();
                     let history_controls_enabled = !profile_confirm_active
@@ -8492,8 +9266,7 @@ impl IcedCommApp {
                         .parse::<u8>()
                         .ok()
                         .filter(|value| {
-                            (storage::MIN_CONTACT_TUNNEL_HOPS
-                                ..=storage::MAX_CONTACT_TUNNEL_HOPS)
+                        (storage::MIN_CONTACT_TUNNEL_HOPS..=storage::MAX_CONTACT_TUNNEL_HOPS)
                                 .contains(value)
                         })
                         .unwrap_or(meta.tunnel_hops);
@@ -8544,13 +9317,9 @@ impl IcedCommApp {
                             .then_some(Message::CopyContactPeerB32Pressed),
                     );
 
-                    let rename_controls: Element<'_, Message> =
-                        if state.contact_details_rename_mode {
+                let rename_controls: Element<'_, Message> = if state.contact_details_rename_mode {
                             column![
-                                text_input(
-                                    "New contact name...",
-                                    &state.contact_details_rename_input,
-                                )
+                        text_input("New contact name...", &state.contact_details_rename_input,)
                                 .on_input(Message::ContactRenameInputChanged)
                                 .on_submit(Message::SaveContactRenamePressed)
                                 .padding(6)
@@ -8609,7 +9378,11 @@ impl IcedCommApp {
                             text(if locked { "Locked" } else { "Unlocked" })
                                 .size(11)
                                 .color(if locked { PY_GREEN } else { PY_GREY62 }),
-                            text(if selected_contact_open { "Open" } else { "Closed" })
+                        text(if selected_contact_open {
+                            "Open"
+                        } else {
+                            "Closed"
+                        })
                                 .size(11)
                                 .color(if selected_contact_open {
                                     PY_CYAN
@@ -8669,8 +9442,7 @@ impl IcedCommApp {
                             .color(Color::from_rgb8(155, 155, 164)),
                         text(format!("Length: {tunnel_length}")).size(11),
                         slider(
-                            storage::MIN_CONTACT_TUNNEL_HOPS
-                                ..=storage::MAX_CONTACT_TUNNEL_HOPS,
+                        storage::MIN_CONTACT_TUNNEL_HOPS..=storage::MAX_CONTACT_TUNNEL_HOPS,
                             tunnel_length,
                             |value| Message::ContactTunnelHopsChanged(value.to_string()),
                         )
@@ -8678,8 +9450,7 @@ impl IcedCommApp {
                         .width(Length::Fill),
                         text(format!("Quantity: {tunnel_quantity}")).size(11),
                         slider(
-                            storage::MIN_CONTACT_TUNNEL_QUANTITY
-                                ..=storage::MAX_CONTACT_TUNNEL_QUANTITY,
+                        storage::MIN_CONTACT_TUNNEL_QUANTITY..=storage::MAX_CONTACT_TUNNEL_QUANTITY,
                             tunnel_quantity,
                             |value| Message::ContactTunnelQuantityChanged(value.to_string()),
                         )
@@ -8790,12 +9561,14 @@ impl IcedCommApp {
                 .spacing(6)
                 .width(Length::Fill),
                 row![
-                    button(text(if state.contact_details_open {
+                    button(
+                        text(if state.contact_details_open {
                         "Hide Details"
                     } else {
                         "Details"
                     })
-                    .size(12))
+                        .size(12)
+                    )
                     .padding([4, 8])
                     .width(Length::Fill)
                     .style(app_button_style)
@@ -9138,19 +9911,10 @@ impl IcedCommApp {
         .style(|_| status_address_container_style());
 
         let right_status = container(if active_group_counts.is_some() {
-            row![
-                my_b32_control,
-                text(" : ").size(13),
-                group_active_indicator,
-            ]
+            row![my_b32_control, text(" : ").size(13), group_active_indicator,]
             .align_y(Alignment::Center)
         } else {
-            row![
-                my_b32_control,
-                text(" : ").size(13),
-                peer_b32_control,
-            ]
-            .align_y(Alignment::Center)
+            row![my_b32_control, text(" : ").size(13), peer_b32_control,].align_y(Alignment::Center)
         });
 
         let status_inner = container(
@@ -9184,9 +9948,10 @@ impl IcedCommApp {
             || show_group_panel
             || show_profile_panel;
 
+        let active_tab_id = state.active_tab().map(|tab| tab.id).unwrap_or(0);
         let messages = state.session.bubbles.iter().enumerate().fold(
             column!().spacing(12).padding([8, 4]).width(Length::Fill),
-            |col, (idx, bubble)| col.push(message_row(idx, bubble)),
+            |col, (idx, bubble)| col.push(message_row(active_tab_id, idx, bubble)),
         );
 
         let chat_panel = container(
@@ -9521,7 +10286,8 @@ impl IcedCommApp {
                         .align_y(Alignment::Center)
                         .width(Length::Fill);
 
-                        let member_record: Element<'_, Message> = match &state.session.sidebar_confirm {
+                        let member_record: Element<'_, Message> =
+                            match &state.session.sidebar_confirm {
                             Some(SidebarConfirm::DeleteGroupMember {
                                 group_key: confirm_group_key,
                                 member_b32,
@@ -9691,8 +10457,7 @@ impl IcedCommApp {
                         .padding([4, 7])
                         .style(app_button_style)
                         .on_press_maybe(
-                            group_history_controls_enabled
-                                .then_some(Message::ClearHistoryPressed)
+                            group_history_controls_enabled.then_some(Message::ClearHistoryPressed)
                         ),
                 ]
                 .spacing(6)
@@ -9776,8 +10541,7 @@ impl IcedCommApp {
                         &state.session.group_private_request_input,
                     )
                     .on_input_maybe(
-                        selected_group_is_admin
-                            .then_some(Message::PrivateGroupRequestInputChanged)
+                        selected_group_is_admin.then_some(Message::PrivateGroupRequestInputChanged)
                     )
                     .on_submit_maybe(
                         selected_group_is_admin
@@ -10159,8 +10923,7 @@ impl IcedCommApp {
         {
             let has_input = !state.session.rendezvous_input.trim().is_empty();
             let has_output = !state.session.rendezvous_output.trim().is_empty();
-            let rendezvous_input_kind =
-                rendezvous::input_kind(&state.session.rendezvous_input);
+            let rendezvous_input_kind = rendezvous::input_kind(&state.session.rendezvous_input);
             let can_answer_request = has_input
                 && rendezvous_input_kind == rendezvous::InputKind::Request
                 && state.session.my_b32.is_some();
@@ -10286,6 +11049,100 @@ impl IcedCommApp {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+
+        let app_content: Element<'_, Message> = if let Some(viewer) = &state.original_image_viewer {
+            let viewer_status: Element<'_, Message> = if viewer.status.is_empty() {
+                Space::new().height(0).into()
+            } else {
+                text(&viewer.status)
+                    .size(11)
+                    .color(PY_GREY62)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into()
+            };
+            let viewer_card = container(
+                column![
+                    row![
+                        column![
+                            text(&viewer.filename)
+                                .size(15)
+                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                            text(format!(
+                                "{}x{} | {} | {} bytes",
+                                viewer.width,
+                                viewer.height,
+                                viewer.mime,
+                                viewer.bytes.len()
+                            ))
+                            .size(11)
+                            .color(PY_GREY62),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(container(text("Save").size(12)).center_y(Length::Fill))
+                            .height(28)
+                            .padding([0, 12])
+                            .style(app_button_style)
+                            .on_press(Message::SaveOriginalImagePressed),
+                        button(
+                            text("\u{e5cd}")
+                                .font(Font {
+                                    family: font::Family::Name(APP_ICON_FONT_FAMILY),
+                                    ..Font::default()
+                                })
+                                .size(16),
+                        )
+                        .width(28)
+                        .height(28)
+                        .padding(5)
+                        .style(app_button_style)
+                        .on_press(Message::CloseOriginalImageViewerPressed),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    container(
+                        image(viewer.handle.clone())
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .content_fit(ContentFit::Contain),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
+                    viewer_status,
+                ]
+                .spacing(10),
+            )
+            .padding(14)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(24, 24, 29))),
+                border: border::Border {
+                    color: PY_GREY_SYS,
+                    width: 1.0,
+                    radius: border::Radius::from(6.0),
+                },
+                ..Default::default()
+            });
+            let viewer_overlay = opaque(
+                container(viewer_card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(18)
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(Color::from_rgba8(0, 0, 0, 0.86))),
+                        ..Default::default()
+                    }),
+            );
+            stack![app_content, viewer_overlay]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            app_content
+        };
 
         let Some(deadline_ms) = state.sam_shutdown_deadline_ms else {
             return app_content;
@@ -10506,9 +11363,7 @@ impl IcedCommApp {
             return;
         };
         if let Some(issued) = tab.session.rendezvous_issued.as_mut() {
-            if issued.request_id == request_id
-                && issued.state == RendezvousIssuedState::Reserved
-            {
+            if issued.request_id == request_id && issued.state == RendezvousIssuedState::Reserved {
                 issued.state = if issued.expires_ms > Self::now_epoch_millis() {
                     RendezvousIssuedState::Available
                 } else {
@@ -10535,6 +11390,27 @@ impl IcedCommApp {
             Self::release_pending_rendezvous(tab);
             Self::invalidate_one_to_one_connect(tab, true);
             tab.connection_direction = None;
+            for bubble in &mut tab.session.bubbles {
+                if let BubbleContent::Image(image) = &mut bubble.content {
+                    if matches!(
+                        image.original_state,
+                        OriginalImageBubbleState::Requesting
+                            | OriginalImageBubbleState::Receiving
+                            | OriginalImageBubbleState::Validating
+                    ) {
+                        image.original_state = OriginalImageBubbleState::Failed;
+                        image.original_received = 0;
+                    }
+                }
+            }
+            tab.pending_original_image_requests.clear();
+            if let Some(cancel) = tab.original_image_send_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            tab.original_image_send_in_flight = false;
+            tab.original_image_send_media_id = None;
+            tab.cancelled_incoming_image_transfers.clear();
+            Self::clear_incoming_image_state(tab);
         }
         self.set_active_live_conn(None);
         self.set_active_pending_conn(None);
@@ -10689,8 +11565,7 @@ impl IcedCommApp {
                 .unwrap_or(true)
         });
         Self::sign_group_roster_if_admin(&mut updated_group)?;
-        let invite =
-            Self::group_invite_from_meta_with_token(&updated_group, Some(token.clone()))?;
+        let invite = Self::group_invite_from_meta_with_token(&updated_group, Some(token.clone()))?;
         let invite_json = serde_json::to_vec(&invite).map_err(|err| err.to_string())?;
         let (binding, encoded) = group_invite::seal_invite(request, &invite_json, now_ms)?;
 
@@ -10731,8 +11606,8 @@ impl IcedCommApp {
 
     fn import_private_group_invite_string(value: &str) -> Result<String, String> {
         let request_id = group_invite::response_request_id(value)?;
-        let mut pending = storage::load_pending_private_group_invites()
-            .map_err(|err| err.to_string())?;
+        let mut pending =
+            storage::load_pending_private_group_invites().map_err(|err| err.to_string())?;
         let Some(request_idx) = pending
             .iter()
             .position(|request| request.request_id == request_id)
@@ -10749,10 +11624,7 @@ impl IcedCommApp {
             return Err("private group invite is missing its join token".into());
         }
 
-        let group_key = Self::merge_group_invite_with_private_credential(
-            invite,
-            Some(credential),
-        )?;
+        let group_key = Self::merge_group_invite_with_private_credential(invite, Some(credential))?;
         pending.remove(request_idx);
         storage::save_pending_private_group_invites(&pending)
             .map_err(|err| format!("group imported but private request cleanup failed: {err}"))?;
@@ -11356,14 +12228,7 @@ impl IcedCommApp {
             return Err("group owner address is missing".into());
         };
 
-        group_invite::verify_join_proof(
-            &binding,
-            owner_b32,
-            token,
-            &member.b32,
-            proof,
-            now_ms,
-        )?;
+        group_invite::verify_join_proof(&binding, owner_b32, token, &member.b32, proof, now_ms)?;
 
         Self::merge_group_member(group, member);
         group.issued_invites.remove(invite_idx);
@@ -11688,8 +12553,7 @@ impl IcedCommApp {
     }
 
     fn is_persistent_contact_tab(tab: &OpenedTab) -> bool {
-        tab.meta.kind == TabKind::Chat
-            && !Self::is_transient_profile_name(&tab.session.profile)
+        tab.meta.kind == TabKind::Chat && !Self::is_transient_profile_name(&tab.session.profile)
     }
 
     fn history_scope_for_tab(tab: &OpenedTab) -> Option<HistoryScope> {
@@ -11697,9 +12561,10 @@ impl IcedCommApp {
             TabKind::Chat if Self::is_persistent_contact_tab(tab) => {
                 Some(HistoryScope::Contact(tab.session.profile.clone()))
             }
-            TabKind::Group => tab.group.as_ref().map(|group| {
-                HistoryScope::Group(storage::group_storage_key(&group.meta))
-            }),
+            TabKind::Group => tab
+                .group
+                .as_ref()
+                .map(|group| HistoryScope::Group(storage::group_storage_key(&group.meta))),
             TabKind::AppHome | TabKind::Chat => None,
         }
     }
@@ -11840,9 +12705,7 @@ impl IcedCommApp {
         let maybe_meta = self
             .opened_tabs
             .iter()
-            .find(|tab| {
-                tab.session.profile == profile_name && Self::is_persistent_contact_tab(tab)
-            })
+            .find(|tab| tab.session.profile == profile_name && Self::is_persistent_contact_tab(tab))
             .map(|tab| ContactMeta {
                 name: profile_name.to_string(),
                 my_dest_b64: tab.session.my_dest_b64.clone(),
@@ -11863,13 +12726,9 @@ impl IcedCommApp {
                     .push(format!("Save contact metadata failed: {err}"));
             }
 
-            if let Some(tab) = self
-                .opened_tabs
-                .iter()
-                .find(|tab| {
+            if let Some(tab) = self.opened_tabs.iter().find(|tab| {
                     tab.session.profile == profile_name && Self::is_persistent_contact_tab(tab)
-                })
-            {
+            }) {
                 if let Err(err) =
                     storage::save_deaddrop_stats(profile_name, &tab.session.deaddrop_stats)
                 {
@@ -12501,87 +13360,172 @@ impl IcedCommApp {
                     tab.session.heartbeat_last_rx_ms = now_ms;
                     match frame.msg_type {
                         MsgType::F => {
-                            let plain = tab.e2e.decrypt(&frame.payload);
-
-                            match String::from_utf8(plain) {
-                                Ok(body) => {
-                                    let mut parts = body.split('|');
-                                    let Some(filename_raw) = parts.next() else {
-                                        push_log(tab, "Invalid file header.".to_string());
+                            let plain = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("File control authentication failed: {err}"),
+                                    );
                                         continue;
+                                }
                                     };
-                                    let Some(size_raw) = parts.next() else {
-                                        push_log(tab, "Invalid file header.".to_string());
-                                        continue;
-                                    };
-
-                                    let filename = PathBuf::from(filename_raw)
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("file.bin")
-                                        .to_string();
-
-                                    let total_bytes: u64 = match size_raw.parse() {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            push_log(tab, "Invalid file size.".to_string());
-                                            continue;
-                                        }
-                                    };
-
-                                    if total_bytes == 0 || total_bytes > MAX_FILE_SIZE as u64 {
-                                        push_log(
-                                            tab,
-                                            format!("Rejected file size: {total_bytes} bytes."),
-                                        );
+                            let control =
+                                match serde_json::from_slice::<FileTransferControl>(&plain) {
+                                    Ok(control) => control,
+                                    Err(err) => {
+                                        push_log(tab, format!("Invalid file control: {err}"));
                                         continue;
                                     }
-
-                                    let dir = match Self::ensure_files_dir() {
-                                        Ok(v) => v,
-                                        Err(err) => {
-                                            push_log(
-                                                tab,
-                                                format!("Failed to create file dir: {err}"),
-                                            );
-                                            continue;
-                                        }
                                     };
 
-                                    let save_path =
-                                        dir.join(format!("recv_{}_{}", frame.msg_id, filename));
+                            match control {
+                                FileTransferControl::Offer {
+                                    filename,
+                                    total_bytes,
+                                } => {
+                                    let filename = PathBuf::from(filename)
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("file.bin")
+                                        .to_string();
+                                    if frame.msg_id == 0
+                                        || total_bytes == 0
+                                        || total_bytes > MAX_FILE_SIZE as u64
+                                    {
+                                        push_log(
+                                            tab,
+                                            format!("Rejected file offer: {total_bytes} bytes."),
+                                        );
+                                        if let Ok(task) = Self::file_control_task(
+                                            tab_id,
+                                            Some(conn.clone()),
+                                            &tab.e2e,
+                                            frame.msg_id,
+                                            FileTransferControl::Decline,
+                                        ) {
+                                            tasks.push(task);
+                                        }
+                                        continue;
+                                    }
+                                    if tab.incoming_file_transfer_id != 0 {
+                                            push_log(
+                                                tab,
+                                            format!("Declined concurrent file offer: {filename}"),
+                                            );
+                                        if let Ok(task) = Self::file_control_task(
+                                            tab_id,
+                                            Some(conn.clone()),
+                                            &tab.e2e,
+                                            frame.msg_id,
+                                            FileTransferControl::Decline,
+                                        ) {
+                                            tasks.push(task);
+                                        }
+                                            continue;
+                                        }
 
-                                    match storage::create_file_secure(&save_path) {
-                                        Ok(file) => {
-                                            tab.incoming_file = Some(file);
+                                    tab.incoming_file_transfer_id = frame.msg_id;
+                                    tab.incoming_file_offer_started_ms = now_ms;
                                             tab.incoming_filename = Some(filename.clone());
                                             tab.incoming_expected = total_bytes;
                                             tab.incoming_received = 0;
-                                            tab.incoming_save_path = Some(save_path.clone());
-
                                             Self::push_incoming_file_bubble(
                                                 tab,
-                                                filename,
-                                                save_path.display().to_string(),
+                                        frame.msg_id,
+                                        filename.clone(),
                                                 total_bytes,
                                             );
-                                        }
-                                        Err(err) => {
                                             push_log(
                                                 tab,
-                                                format!("Failed to open incoming file: {err}"),
+                                        format!(
+                                            "Incoming file offer: {filename} ({total_bytes} bytes)"
+                                        ),
                                             );
                                         }
+                                FileTransferControl::Accept => {
+                                    if tab.outgoing_file_transfer_id == frame.msg_id
+                                        && tab.outgoing_phase
+                                            == OutgoingFilePhase::AwaitingAcceptance
+                                    {
+                                        tab.outgoing_phase = OutgoingFilePhase::Chunks;
+                                        tab.outgoing_file_offer_started_ms = 0;
+                                        Self::update_outgoing_file_bubble(
+                                            tab,
+                                            tab.outgoing_sent,
+                                            "Sending...".into(),
+                                            false,
+                                            false,
+                                            true,
+                                        );
+                                        push_log(tab, "File offer accepted.".to_string());
+                                    } else {
+                                        push_log(tab, "Ignored stale file acceptance.".to_string());
                                     }
                                 }
-                                Err(_) => {
-                                    push_log(tab, "Invalid UTF-8 file header.".to_string());
+                                FileTransferControl::Decline => {
+                                    if tab.outgoing_file_transfer_id == frame.msg_id
+                                        && tab.outgoing_phase != OutgoingFilePhase::Idle
+                                    {
+                                        Self::update_outgoing_file_bubble(
+                                            tab,
+                                            tab.outgoing_sent,
+                                            "Declined by peer".into(),
+                                            false,
+                                            false,
+                                            false,
+                                        );
+                                        Self::clear_outgoing_file_state(tab);
+                                        push_log(tab, "File offer declined by peer.".to_string());
+                                    }
+                                }
+                                FileTransferControl::Cancel => {
+                                    if tab.outgoing_file_transfer_id == frame.msg_id
+                                        && tab.outgoing_phase != OutgoingFilePhase::Idle
+                                    {
+                                        Self::update_outgoing_file_bubble(
+                                            tab,
+                                            tab.outgoing_sent,
+                                            "Cancelled by peer".into(),
+                                            false,
+                                            false,
+                                            false,
+                                        );
+                                        Self::clear_outgoing_file_state(tab);
+                                    }
+                                    if tab.incoming_file_transfer_id == frame.msg_id {
+                                        Self::update_incoming_file_bubble(
+                                            tab,
+                                            "Cancelled by peer",
+                                            false,
+                                            false,
+                                            false,
+                                            false,
+                                            false,
+                                            None,
+                                        );
+                                        Self::clear_incoming_file_state(tab, true);
+                                    }
+                                    push_log(tab, "File transfer cancelled by peer.".to_string());
                                 }
                             }
                         }
 
                         MsgType::C => {
-                            let plain = tab.e2e.decrypt(&frame.payload);
+                            if frame.msg_id != tab.incoming_file_transfer_id {
+                                push_log(tab, "Ignored stale file chunk.".to_string());
+                                continue;
+                            }
+                            let plain = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("File chunk authentication failed: {err}"),
+                                    );
+                                    continue;
+                                }
+                            };
 
                             if let Some(file) = tab.incoming_file.as_mut() {
                                 match general_purpose::STANDARD.decode(&plain) {
@@ -12593,12 +13537,17 @@ impl IcedCommApp {
                                                 tab,
                                                 "File transfer overflow detected.".to_string(),
                                             );
-                                            tab.incoming_file = None;
-                                            tab.incoming_filename = None;
-                                            tab.incoming_expected = 0;
-                                            tab.incoming_received = 0;
-                                            tab.incoming_save_path = None;
-                                            tab.incoming_bubble_index = None;
+                                            Self::update_incoming_file_bubble(
+                                                tab,
+                                                "Receive failed",
+                                                false,
+                                                true,
+                                                false,
+                                                false,
+                                                false,
+                                                None,
+                                            );
+                                            Self::clear_incoming_file_state(tab, true);
                                             continue;
                                         }
 
@@ -12607,7 +13556,17 @@ impl IcedCommApp {
                                                 tab,
                                                 format!("File chunk write failed: {err}"),
                                             );
-                                            tab.incoming_file = None;
+                                            Self::update_incoming_file_bubble(
+                                                tab,
+                                                "Receive failed",
+                                                false,
+                                                true,
+                                                false,
+                                                false,
+                                                false,
+                                                None,
+                                            );
+                                            Self::clear_incoming_file_state(tab, true);
                                             continue;
                                         }
 
@@ -12630,21 +13589,47 @@ impl IcedCommApp {
                         }
 
                         MsgType::E => {
-                            if let Some(mut file) = tab.incoming_file.take() {
-                                let _ = file.flush();
-
-                                if let Some(idx) = tab.incoming_bubble_index.take() {
-                                    if let Some(bubble) = tab.session.bubbles.get_mut(idx) {
-                                        if let BubbleContent::File(file_bubble) =
-                                            &mut bubble.content
-                                        {
-                                            file_bubble.done_bytes = tab.incoming_received;
-                                            file_bubble.complete = true;
-                                            file_bubble.failed = false;
-                                            file_bubble.status = "Received".into();
+                            if frame.msg_id != tab.incoming_file_transfer_id {
+                                push_log(tab, "Ignored stale file completion.".to_string());
+                                continue;
                                         }
+                            if let Some(mut file) = tab.incoming_file.take() {
+                                if tab.incoming_received != tab.incoming_expected {
+                                    Self::update_incoming_file_bubble(
+                                        tab,
+                                        "Receive failed: incomplete file",
+                                        false,
+                                        true,
+                                        false,
+                                        false,
+                                        false,
+                                        None,
+                                    );
+                                    drop(file);
+                                    Self::clear_incoming_file_state(tab, true);
+                                    push_log(tab, "Rejected incomplete file transfer.".to_string());
+                                    continue;
                                     }
+                                if let Err(err) = file.flush() {
+                                    Self::update_incoming_file_bubble(
+                                        tab,
+                                        "Receive failed",
+                                        false,
+                                        true,
+                                        false,
+                                        false,
+                                        false,
+                                        None,
+                                    );
+                                    drop(file);
+                                    Self::clear_incoming_file_state(tab, true);
+                                    push_log(tab, format!("File flush failed: {err}"));
+                                    continue;
                                 }
+
+                                Self::update_incoming_file_bubble(
+                                    tab, "Received", true, false, false, false, false, None,
+                                );
 
                                 push_log(
                                     tab,
@@ -12656,73 +13641,218 @@ impl IcedCommApp {
                                         tab.incoming_received
                                     ),
                                 );
-
-                                tab.incoming_filename = None;
-                                tab.incoming_expected = 0;
-                                tab.incoming_received = 0;
-                                tab.incoming_save_path = None;
+                                Self::clear_incoming_file_state(tab, false);
                             }
                         }
 
                         MsgType::J => {
-                            let plain = tab.e2e.decrypt(&frame.payload);
+                            let strict_plain = tab.e2e.decrypt_strict(&frame.payload).ok();
+                            if let Some(control) = strict_plain
+                                .as_deref()
+                                .and_then(Self::parse_original_image_control)
+                            {
+                                let control = match control {
+                                    Ok(control) => control,
+                                    Err(err) => {
+                                        push_log(tab, format!("Invalid original image control: {err}"));
+                                        continue;
+                                    }
+                                };
+                                let media_id = match control {
+                                    OriginalImageControl::Unavailable(media_id) => {
+                                        if let Some(expected_sender) =
+                                            tab.pending_original_image_requests.remove(&media_id)
+                                        {
+                                            if let Some(bubble_idx) = Self::find_original_image_bubble(
+                                                &tab.session.bubbles,
+                                                media_id,
+                                                expected_sender.as_deref(),
+                                            ) {
+                                                Self::set_original_image_bubble_state(
+                                                    &mut tab.session.bubbles,
+                                                    bubble_idx,
+                                                    OriginalImageBubbleState::Unavailable,
+                                                    0,
+                                                );
+                                            }
+                                            push_log(tab, "Original image is no longer available from sender.".to_string());
+                                        }
+                                        continue;
+                                    }
+                                    OriginalImageControl::Cancel(media_id) => {
+                                        if tab.original_image_send_media_id == Some(media_id) {
+                                            if let Some(cancel) =
+                                                tab.original_image_send_cancel.as_ref()
+                                            {
+                                                cancel.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            push_log(
+                                                tab,
+                                                "Peer cancelled original image download."
+                                                    .to_string(),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    OriginalImageControl::Request(media_id) => media_id,
+                                };
+                                let Some(image) = tab.shared_original_images.get(&media_id).cloned()
+                                else {
+                                    push_log(tab, "Requested original image is no longer available.".to_string());
+                                    let payload = match tab
+                                        .e2e
+                                        .encrypt_strict(&Self::original_image_unavailable_payload(media_id))
+                                    {
+                                        Ok(payload) => payload,
+                                        Err(_) => continue,
+                                    };
+                                    let unavailable = Frame {
+                                        msg_type: MsgType::J,
+                                        msg_id: Self::generate_msg_id_value(),
+                                        payload,
+                                    };
+                                    let conn_for_unavailable = conn.clone();
+                                    let task = Task::perform(
+                                        async move {
+                                            conn_for_unavailable
+                                                .send_frame(&unavailable)
+                                                .await
+                                                .map_err(|err| err.to_string())
+                                        },
+                                        move |result| Message::SendFinished(tab_id, result),
+                                    );
+                                    tasks.push(tab.sam_runtime.track_send_task(task));
+                                    continue;
+                                };
+                                if tab.outgoing_image_phase != OutgoingImagePhase::Idle
+                                    || tab.original_image_send_in_flight
+                                {
+                                    push_log(tab, "Original image request deferred: another image is being sent.".to_string());
+                                    continue;
+                                }
+                                let transfer_id = Self::generate_msg_id_value();
+                                let conn_for_original = conn.clone();
+                                let e2e = tab.e2e.clone();
+                                let cancel = std::sync::Arc::new(
+                                    std::sync::atomic::AtomicBool::new(false),
+                                );
+                                tab.original_image_send_in_flight = true;
+                                tab.original_image_send_media_id = Some(media_id);
+                                tab.original_image_send_cancel = Some(cancel.clone());
+                                let task = Task::perform(
+                                    async move {
+                                        Self::send_original_image_sequence(
+                                            conn_for_original,
+                                            e2e,
+                                            image,
+                                            transfer_id,
+                                            media_id,
+                                            cancel,
+                                        )
+                                        .await
+                                    },
+                                    move |result| {
+                                        Message::OriginalImageSendFinished(
+                                            tab_id,
+                                            None,
+                                            media_id,
+                                            result,
+                                        )
+                                    },
+                                );
+                                tasks.push(tab.sam_runtime.track_send_task(task));
+                                push_log(tab, "Sending requested original image.".to_string());
+                                continue;
+                            }
+
+                            let plain = strict_plain
+                                .unwrap_or_else(|| tab.e2e.decrypt(&frame.payload));
 
                             match String::from_utf8(plain) {
-                                Ok(body) => {
-                                    let mut parts = body.split('|');
-                                    let Some(filename_raw) = parts.next() else {
-                                        push_log(tab, "Invalid image header.".to_string());
-                                        continue;
-                                    };
-                                    let Some(mime_raw) = parts.next() else {
-                                        push_log(tab, "Invalid image header.".to_string());
-                                        continue;
-                                    };
-                                    let Some(size_raw) = parts.next() else {
-                                        push_log(tab, "Invalid image header.".to_string());
-                                        continue;
-                                    };
-
-                                    let filename = PathBuf::from(filename_raw)
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("image")
-                                        .to_string();
-
-                                    let total_bytes: u64 = match size_raw.parse() {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            push_log(tab, "Invalid image size.".to_string());
+                                Ok(body) => match Self::parse_image_header(&body) {
+                                    Ok(header) => {
+                                    if header.kind == IncomingImageKind::Original {
+                                        let Some(media_id) = header.media_id else {
+                                            push_log(tab, "Rejected original image without media id.".to_string());
+                                            continue;
+                                        };
+                                        if !tab.pending_original_image_requests.contains_key(&media_id) {
+                                            push_log(tab, "Rejected unsolicited original image.".to_string());
                                             continue;
                                         }
+                                    }
+                                    let max_bytes = match header.kind {
+                                        IncomingImageKind::Preview => MAX_FILE_SIZE,
+                                        IncomingImageKind::Original => ORIGINAL_IMAGE_MAX_BYTES,
+                                    } as u64;
+                                    if header.total_bytes == 0 || header.total_bytes > max_bytes {
+                                        push_log(
+                                            tab,
+                                            format!("Rejected image size: {} bytes.", header.total_bytes),
+                                        );
+                                        continue;
+                                    }
+
+                                    if !Self::is_supported_image_mime(&header.mime) {
+                                        push_log(
+                                            tab,
+                                            format!("Unsupported incoming image type: {}", header.mime),
+                                        );
+                                        continue;
+                                    }
+
+                                    let original_bubble_idx = if header.kind
+                                        == IncomingImageKind::Original
+                                    {
+                                        let sender_b32 = tab.session.current_peer_addr.as_deref();
+                                        header.media_id.and_then(|media_id| {
+                                            Self::find_original_image_bubble(
+                                                &tab.session.bubbles,
+                                                media_id,
+                                                sender_b32,
+                                            )
+                                        })
+                                    } else {
+                                        None
                                     };
-
-                                    if total_bytes == 0 || total_bytes > MAX_FILE_SIZE as u64 {
-                                        push_log(
-                                            tab,
-                                            format!("Rejected image size: {total_bytes} bytes."),
-                                        );
-                                        continue;
-                                    }
-
-                                    if !Self::is_supported_image_mime(mime_raw) {
-                                        push_log(
-                                            tab,
-                                            format!("Unsupported incoming image type: {mime_raw}"),
-                                        );
-                                        continue;
-                                    }
-
                                     Self::clear_incoming_image_state(tab);
-                                    tab.incoming_image_name = Some(filename);
-                                    tab.incoming_image_mime = Some(mime_raw.to_string());
-                                    tab.incoming_image_expected = total_bytes;
+                                    tab.incoming_image_name = Some(header.filename);
+                                    tab.incoming_image_mime = Some(header.mime);
+                                    tab.incoming_image_expected = header.total_bytes;
                                     tab.incoming_image_received = 0;
                                     tab.incoming_image_msg_id = frame.msg_id;
+                                    tab.incoming_image_kind = header.kind;
+                                    tab.incoming_image_media_id = match header.kind {
+                                        IncomingImageKind::Original => header.media_id,
+                                        IncomingImageKind::Preview
+                                            if header.original_size.is_some_and(|size| {
+                                                size <= ORIGINAL_IMAGE_MAX_BYTES as u64
+                                            })
+                                                && header.original_mime.is_some()
+                                                && header.sha256.is_some() => header.media_id,
+                                        IncomingImageKind::Preview => None,
+                                    };
+                                    tab.incoming_image_sha256 = header.sha256;
+                                    tab.incoming_image_original_size =
+                                        header.original_size.unwrap_or(0);
+                                    tab.incoming_image_bubble_index = original_bubble_idx;
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Receiving,
+                                            0,
+                                        );
+                                    }
                                     tab.incoming_image_bytes = Vec::with_capacity(
-                                        total_bytes.min(MAX_FILE_SIZE as u64) as usize,
+                                        header.total_bytes.min(max_bytes) as usize,
                                     );
-                                }
+                                    }
+                                    Err(err) => push_log(tab, format!("Invalid image header: {err}.")),
+                                },
                                 Err(_) => {
                                     push_log(tab, "Invalid UTF-8 image header.".to_string());
                                 }
@@ -12730,6 +13860,9 @@ impl IcedCommApp {
                         }
 
                         MsgType::G => {
+                            if tab.cancelled_incoming_image_transfers.contains(&frame.msg_id) {
+                                continue;
+                            }
                             if tab.incoming_image_name.is_none() {
                                 push_log(
                                     tab,
@@ -12755,21 +13888,36 @@ impl IcedCommApp {
                                             tab,
                                             "Image transfer overflow detected.".to_string(),
                                         );
-                                        Self::clear_incoming_image_state(tab);
+                                        Self::fail_incoming_original_image(tab);
                                         continue;
                                     }
 
                                     tab.incoming_image_bytes.extend_from_slice(&chunk);
                                     tab.incoming_image_received = next_total;
+                                    if tab.incoming_image_kind == IncomingImageKind::Original {
+                                        if let Some(bubble_idx) = tab.incoming_image_bubble_index {
+                                            Self::set_original_image_bubble_state(
+                                                &mut tab.session.bubbles,
+                                                bubble_idx,
+                                                OriginalImageBubbleState::Receiving,
+                                                next_total,
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(err) => {
                                     push_log(tab, format!("Image chunk decode failed: {err}"));
-                                    Self::clear_incoming_image_state(tab);
+                                    Self::fail_incoming_original_image(tab);
                                 }
                             }
                         }
 
                         MsgType::Z => {
+                            if tab.cancelled_incoming_image_transfers.contains(&frame.msg_id) {
+                                tab.cancelled_incoming_image_transfers
+                                    .retain(|transfer_id| *transfer_id != frame.msg_id);
+                                continue;
+                            }
                             if tab.incoming_image_name.is_none() {
                                 push_log(
                                     tab,
@@ -12791,7 +13939,7 @@ impl IcedCommApp {
                                         tab.incoming_image_received, tab.incoming_image_expected
                                     ),
                                 );
-                                Self::clear_incoming_image_state(tab);
+                                Self::fail_incoming_original_image(tab);
                                 continue;
                             }
 
@@ -12799,24 +13947,114 @@ impl IcedCommApp {
                                 .incoming_image_name
                                 .clone()
                                 .unwrap_or_else(|| "image".into());
+                            let image_mime = tab
+                                .incoming_image_mime
+                                .clone()
+                                .unwrap_or_else(|| "application/octet-stream".into());
+                            let image_kind = tab.incoming_image_kind;
+                            let media_id = tab.incoming_image_media_id;
+                            let expected_sha256 = tab.incoming_image_sha256.clone();
+                            let original_bubble_idx = tab.incoming_image_bubble_index;
                             let image_bytes = std::mem::take(&mut tab.incoming_image_bytes);
 
-                            tab.session.bubbles.push(Bubble {
-                                author: "Peer".into(),
-                                content: BubbleContent::Image(Self::image_bubble_data(image_bytes)),
-                                mine: false,
-                                offline: false,
-                                timestamp_utc: Self::now_utc_hms(),
-                                msg_id: None,
-                                delivered: false,
-                                group_expected_acks: Vec::new(),
-                                group_received_acks: Vec::new(),
-                            });
+                            if image_kind == IncomingImageKind::Original {
+                                if let Some(bubble_idx) = original_bubble_idx {
+                                    let expected = tab.incoming_image_expected;
+                                    Self::set_original_image_bubble_state(
+                                        &mut tab.session.bubbles,
+                                        bubble_idx,
+                                        OriginalImageBubbleState::Validating,
+                                        expected,
+                                    );
+                                }
+                                let Some(expected) = expected_sha256.as_deref() else {
+                                    push_log(
+                                        tab,
+                                        "Rejected original image without a digest.".to_string(),
+                                    );
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Failed,
+                                            0,
+                                        );
+                                    }
+                                    Self::clear_incoming_image_state(tab);
+                                    continue;
+                                };
+                                if !Self::sha256_hex(&image_bytes).eq_ignore_ascii_case(expected) {
+                                    push_log(
+                                        tab,
+                                        "Rejected original image with mismatched digest."
+                                            .to_string(),
+                                    );
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Failed,
+                                            0,
+                                        );
+                                    }
+                                    Self::clear_incoming_image_state(tab);
+                                    continue;
+                                }
+                                if let Err(err) = Self::validate_original_image(&image_bytes, &image_mime) {
+                                    push_log(tab, format!("Rejected original image: {err}"));
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Failed,
+                                            0,
+                                        );
+                                    }
+                                    Self::clear_incoming_image_state(tab);
+                                    continue;
+                                }
+                                if let Some(media_id) = media_id {
+                                    tab.pending_original_image_requests.remove(&media_id);
+                                }
+                                tasks.push(Task::done(Message::OriginalImageReceived(
+                                    tab_id,
+                                    media_id.unwrap_or(0),
+                                    tab.session.current_peer_addr.clone(),
+                                    image_name.clone(),
+                                    image_mime,
+                                    image_bytes,
+                                )));
+                            } else {
+                                tab.session.bubbles.push(Bubble {
+                                    author: "Peer".into(),
+                                    content: BubbleContent::Image(
+                                        Self::image_bubble_data_with_original(
+                                            image_bytes,
+                                            image_name.clone(),
+                                            media_id,
+                                            tab.incoming_image_original_size,
+                                            tab.session.current_peer_addr.clone(),
+                                        ),
+                                    ),
+                                    mine: false,
+                                    offline: false,
+                                    timestamp_utc: Self::now_utc_hms(),
+                                    msg_id: None,
+                                    delivered: false,
+                                    group_expected_acks: Vec::new(),
+                                    group_received_acks: Vec::new(),
+                                });
+                            }
 
                             push_log(
                                 tab,
                                 format!(
-                                    "Image received: {image_name} ({} bytes)",
+                                    "{} received: {image_name} ({} bytes)",
+                                    if image_kind == IncomingImageKind::Original {
+                                        "Original image"
+                                    } else {
+                                        "Image"
+                                    },
                                     tab.incoming_image_received
                                 ),
                             );
@@ -12980,10 +14218,7 @@ impl IcedCommApp {
                                         let close_conn = conn.clone();
                                         tasks.push(Task::perform(
                                             async move {
-                                                close_conn
-                                                    .close()
-                                                    .await
-                                                    .map_err(|e| e.to_string())
+                                                close_conn.close().await.map_err(|e| e.to_string())
                                             },
                                             move |result| Message::CloseFinished(tab_id, result),
                                         ));
@@ -13006,15 +14241,17 @@ impl IcedCommApp {
                                     tab.session.heartbeat_last_rx_ms = 0;
                                     tab.session.heartbeat_last_ping_ms = 0;
                                     tab.e2e = E2E::new(tab.session.pq_enabled);
+                                    Self::interrupt_file_transfers(
+                                        tab,
+                                        "Cancelled: peer disconnected",
+                                    );
                                     Self::clear_outgoing_image_state(tab);
                                     Self::clear_incoming_image_state(tab);
                                     push_log(tab, "Peer disconnected.".to_string());
                                     tab.session.accept_armed = true;
                                     push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                                    if let Some((sam, cancelled)) =
-                                        tab.sam_runtime.accept_parts()
-                                    {
+                                    if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
                                         tasks.push(Self::incoming_accept_task_from_parts(
                                             tab_id, sam, cancelled,
                                         ));
@@ -13084,6 +14321,10 @@ impl IcedCommApp {
                                             tab.session.network_status = NetworkStatus::LocalOk;
                                             tab.session.heartbeat_last_rx_ms = 0;
                                             tab.session.heartbeat_last_ping_ms = 0;
+                                            Self::interrupt_file_transfers(
+                                                tab,
+                                                "Cancelled: connection replaced",
+                                            );
                                             Self::clear_outgoing_image_state(tab);
                                             Self::clear_incoming_image_state(tab);
                                         }
@@ -13332,10 +14573,8 @@ impl IcedCommApp {
                             let old_known_remote = tab.session.known_remote_next_send;
                             tab.session.drop_send_index =
                                 tab.session.drop_send_index.max(remote_receive_base);
-                            tab.session.known_remote_next_send = tab
-                                .session
-                                .known_remote_next_send
-                                .max(remote_next_send);
+                            tab.session.known_remote_next_send =
+                                tab.session.known_remote_next_send.max(remote_next_send);
                             Self::save_offline_state_for_tab(
                                 tab,
                                 "Failed to save offline index synchronization",
@@ -13382,6 +14621,7 @@ impl IcedCommApp {
                         tab.session.heartbeat_last_rx_ms = 0;
                         tab.session.heartbeat_last_ping_ms = 0;
                         tab.e2e = E2E::new(tab.session.pq_enabled);
+                        Self::interrupt_file_transfers(tab, "Cancelled: peer timed out");
                         Self::clear_outgoing_image_state(tab);
                         Self::clear_incoming_image_state(tab);
                         push_log(tab, "Peer heartbeat timed out.".to_string());
@@ -13423,6 +14663,7 @@ impl IcedCommApp {
                     tab.session.heartbeat_last_rx_ms = 0;
                     tab.session.heartbeat_last_ping_ms = 0;
                     tab.e2e = E2E::new(tab.session.pq_enabled);
+                    Self::interrupt_file_transfers(tab, "Cancelled: connection closed");
                     Self::clear_outgoing_image_state(tab);
                     Self::clear_incoming_image_state(tab);
                     push_log(tab, "Live connection closed.".to_string());
@@ -13498,10 +14739,7 @@ impl IcedCommApp {
                                         let close_conn = conn.clone();
                                         tasks.push(Task::perform(
                                             async move {
-                                                close_conn
-                                                    .close()
-                                                    .await
-                                                    .map_err(|e| e.to_string())
+                                                close_conn.close().await.map_err(|e| e.to_string())
                                             },
                                             move |result| Message::CloseFinished(tab_id, result),
                                         ));
@@ -13543,9 +14781,7 @@ impl IcedCommApp {
                                     tab.session.accept_armed = true;
                                     push_log(tab, "Incoming accept loop re-armed.".to_string());
 
-                                    if let Some((sam, cancelled)) =
-                                        tab.sam_runtime.accept_parts()
-                                    {
+                                    if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
                                         tasks.push(Self::incoming_accept_task_from_parts(
                                             tab_id, sam, cancelled,
                                         ));
@@ -13624,8 +14860,69 @@ impl IcedCommApp {
                 push_log(tab, "Incoming accept loop re-armed.".to_string());
 
                 if let Some((sam, cancelled)) = tab.sam_runtime.accept_parts() {
-                    tasks.push(Self::incoming_accept_task_from_parts(tab_id, sam, cancelled));
+                    tasks.push(Self::incoming_accept_task_from_parts(
+                        tab_id, sam, cancelled,
+                    ));
                 }
+            }
+
+            let file_timeout_now_ms = Self::now_epoch_millis();
+
+            if tab.outgoing_phase == OutgoingFilePhase::AwaitingAcceptance
+                && tab.outgoing_file_offer_started_ms != 0
+                && file_timeout_now_ms.saturating_sub(tab.outgoing_file_offer_started_ms)
+                    >= FILE_OFFER_TIMEOUT_MS
+            {
+                let transfer_id = tab.outgoing_file_transfer_id;
+                Self::update_outgoing_file_bubble(
+                    tab,
+                    tab.outgoing_sent,
+                    "Offer expired".into(),
+                    false,
+                    false,
+                    false,
+                );
+                Self::clear_outgoing_file_state(tab);
+                if let Ok(task) = Self::file_control_task(
+                    tab_id,
+                    tab.live_conn.clone(),
+                    &tab.e2e,
+                    transfer_id,
+                    FileTransferControl::Cancel,
+                ) {
+                    tasks.push(task);
+                }
+                push_log(tab, "File offer expired.".to_string());
+            }
+
+            if tab.incoming_file_transfer_id != 0
+                && tab.incoming_file.is_none()
+                && tab.incoming_file_offer_started_ms != 0
+                && file_timeout_now_ms.saturating_sub(tab.incoming_file_offer_started_ms)
+                    >= FILE_OFFER_TIMEOUT_MS
+            {
+                let transfer_id = tab.incoming_file_transfer_id;
+                Self::update_incoming_file_bubble(
+                    tab,
+                    "Offer expired",
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    None,
+                );
+                Self::clear_incoming_file_state(tab, true);
+                if let Ok(task) = Self::file_control_task(
+                    tab_id,
+                    tab.live_conn.clone(),
+                    &tab.e2e,
+                    transfer_id,
+                    FileTransferControl::Decline,
+                ) {
+                    tasks.push(task);
+                }
+                push_log(tab, "Incoming file offer expired.".to_string());
             }
 
             if tab.live_conn.is_some()
@@ -13639,6 +14936,7 @@ impl IcedCommApp {
                         "Send failed: no live connection".into(),
                         false,
                         true,
+                        false,
                     );
                     Self::clear_outgoing_file_state(tab);
                     tab.meta.connected = tab.session.live_ready;
@@ -13649,29 +14947,67 @@ impl IcedCommApp {
                 match tab.outgoing_phase {
                     OutgoingFilePhase::Idle => {}
 
-                    OutgoingFilePhase::Header => {
+                    OutgoingFilePhase::Offer => {
                         let filename = tab
                             .outgoing_filename
                             .clone()
                             .unwrap_or_else(|| "file.bin".into());
                         let total = tab.outgoing_total;
-                        let e2e = tab.e2e.clone();
+                        let transfer_id = tab.outgoing_file_transfer_id;
+                        let control = match serde_json::to_vec(&FileTransferControl::Offer {
+                            filename,
+                            total_bytes: total,
+                        }) {
+                            Ok(control) => control,
+                            Err(err) => {
+                                Self::update_outgoing_file_bubble(
+                                    tab,
+                                    tab.outgoing_sent,
+                                    format!("Send failed: {err}"),
+                                    false,
+                                    true,
+                                    false,
+                                );
+                                Self::clear_outgoing_file_state(tab);
+                                return tasks;
+                            }
+                        };
+                        let payload = match tab.e2e.encrypt_strict(&control) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                Self::update_outgoing_file_bubble(
+                                    tab,
+                                    tab.outgoing_sent,
+                                    format!("Send failed: {err}"),
+                                    false,
+                                    true,
+                                    false,
+                                );
+                                Self::clear_outgoing_file_state(tab);
+                                return tasks;
+                            }
+                        };
 
                         let frame_f = Frame {
                             msg_type: MsgType::F,
-                            msg_id: 0,
-                            payload: e2e.encrypt(format!("{filename}|{total}").as_bytes()),
+                            msg_id: transfer_id,
+                            payload,
                         };
 
                         tab.outgoing_send_in_flight = true;
 
                         tasks.push(Task::perform(
                             async move { conn.send_frame(&frame_f).await.map_err(|e| e.to_string()) },
-                            move |result| Message::OutgoingFileHeaderSent(tab_id, result),
+                            move |result| {
+                                Message::OutgoingFileOfferSent(tab_id, transfer_id, result)
+                            },
                         ));
                     }
 
+                    OutgoingFilePhase::AwaitingAcceptance => {}
+
                     OutgoingFilePhase::Chunks => {
+                        let transfer_id = tab.outgoing_file_transfer_id;
                         let mut buf = [0u8; 4096];
 
                         let read_n = match tab.outgoing_file.as_mut() {
@@ -13684,6 +15020,7 @@ impl IcedCommApp {
                                         format!("Send failed: {err}"),
                                         false,
                                         true,
+                                        false,
                                     );
                                     Self::clear_outgoing_file_state(tab);
                                     0
@@ -13698,7 +15035,7 @@ impl IcedCommApp {
 
                             let frame_c = Frame {
                                 msg_type: MsgType::C,
-                                msg_id: 0,
+                                msg_id: transfer_id,
                                 payload: e2e.encrypt(encoded.as_bytes()),
                             };
 
@@ -13709,7 +15046,9 @@ impl IcedCommApp {
                                     conn.send_frame(&frame_c).await.map_err(|e| e.to_string())?;
                                     Ok(read_n)
                                 },
-                                move |result| Message::OutgoingFileChunkSent(tab_id, result),
+                                move |result| {
+                                    Message::OutgoingFileChunkSent(tab_id, transfer_id, result)
+                                },
                             ));
                         } else if tab.outgoing_file.is_some() {
                             tab.outgoing_phase = OutgoingFilePhase::End;
@@ -13717,9 +15056,10 @@ impl IcedCommApp {
                     }
 
                     OutgoingFilePhase::End => {
+                        let transfer_id = tab.outgoing_file_transfer_id;
                         let frame_e = Frame {
                             msg_type: MsgType::E,
-                            msg_id: 0,
+                            msg_id: transfer_id,
                             payload: Vec::new(),
                         };
 
@@ -13727,7 +15067,9 @@ impl IcedCommApp {
 
                         tasks.push(Task::perform(
                             async move { conn.send_frame(&frame_e).await.map_err(|e| e.to_string()) },
-                            move |result| Message::OutgoingFileEndSent(tab_id, result),
+                            move |result| {
+                                Message::OutgoingFileEndSent(tab_id, transfer_id, result)
+                            },
                         ));
                     }
                 }
@@ -13762,11 +15104,26 @@ impl IcedCommApp {
                         let total = tab.outgoing_image_total;
                         let msg_id = tab.outgoing_image_msg_id;
                         let e2e = tab.e2e.clone();
+                        let original = tab.shared_original_images.get(&msg_id).map(|image| {
+                            (
+                                image.bytes.len() as u64,
+                                image.mime.clone(),
+                                image.sha256.clone(),
+                            )
+                        });
+                        let header = Self::image_header(
+                            &filename,
+                            &mime,
+                            total,
+                            IncomingImageKind::Preview,
+                            msg_id,
+                            original,
+                        );
 
                         let frame_j = Frame {
                             msg_type: MsgType::J,
                             msg_id,
-                            payload: e2e.encrypt(format!("{filename}|{mime}|{total}").as_bytes()),
+                            payload: e2e.encrypt(header.as_bytes()),
                         };
 
                         tab.outgoing_image_send_in_flight = true;
@@ -13885,9 +15242,10 @@ impl IcedCommApp {
 
             tab_id = tab.id;
             let sam_runtime = tab.sam_runtime.clone();
-            let group_history_scope = tab.group.as_ref().map(|group| {
-                HistoryScope::Group(storage::group_storage_key(&group.meta))
-            });
+            let group_history_scope = tab
+                .group
+                .as_ref()
+                .map(|group| HistoryScope::Group(storage::group_storage_key(&group.meta)));
             let Some(group) = tab.group.as_mut() else {
                 return tasks;
             };
@@ -13906,6 +15264,10 @@ impl IcedCommApp {
                         MsgType::S => match String::from_utf8(frame.payload) {
                             Ok(body) => {
                                 if body == "__SIGNAL__:QUIT" {
+                                    Self::fail_group_peer_incoming_original_image(
+                                        peer,
+                                        &mut tab.session.bubbles,
+                                    );
                                     Self::reset_group_peer_transport_state(peer);
                                     tab.session.log_lines.push(format!(
                                         "Group member disconnected: {}",
@@ -13998,10 +15360,9 @@ impl IcedCommApp {
                             if peer.e2e.ready() {
                                 peer.handshake_key_received = true;
                             } else {
-                                tab.session.log_lines.push(format!(
-                                    "Invalid group key from {}.",
-                                    peer.member.name
-                                ));
+                                tab.session
+                                    .log_lines
+                                    .push(format!("Invalid group key from {}.", peer.member.name));
                             }
                         }
                         MsgType::L => {
@@ -14082,9 +15443,10 @@ impl IcedCommApp {
                                                     now_ms,
                                                 )
                                             }
-                                            _ => Err(
-                                                "private invite proof is incomplete".to_string()
-                                            ),
+                                            _ => {
+                                                Err("private invite proof is incomplete"
+                                                    .to_string())
+                                            }
                                         }
                                     } else {
                                         Self::redeem_group_invite_token(
@@ -14133,7 +15495,9 @@ impl IcedCommApp {
                                                         .await
                                                         .map_err(|e| e.to_string())
                                                 },
-                                                move |result| Message::CloseFinished(tab_id, result),
+                                                move |result| {
+                                                    Message::CloseFinished(tab_id, result)
+                                                },
                                             ));
                                         }
                                     }
@@ -14260,76 +15624,246 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = peer.e2e.decrypt(&frame.payload);
-                            match String::from_utf8(plain) {
-                                Ok(body) => {
-                                    let mut parts = body.split('|');
-                                    let Some(filename_raw) = parts.next() else {
+                            let strict_plain = peer.e2e.decrypt_strict(&frame.payload).ok();
+                            if let Some(control) = strict_plain
+                                .as_deref()
+                                .and_then(Self::parse_original_image_control)
+                            {
+                                let control = match control {
+                                    Ok(control) => control,
+                                    Err(err) => {
                                         tab.session.log_lines.push(format!(
-                                            "Invalid group image header from {}.",
+                                            "Invalid original image control from {}: {err}",
                                             peer.member.name
                                         ));
                                         continue;
-                                    };
-                                    let Some(mime_raw) = parts.next() else {
-                                        tab.session.log_lines.push(format!(
-                                            "Invalid group image header from {}.",
-                                            peer.member.name
-                                        ));
-                                        continue;
-                                    };
-                                    let Some(size_raw) = parts.next() else {
-                                        tab.session.log_lines.push(format!(
-                                            "Invalid group image header from {}.",
-                                            peer.member.name
-                                        ));
-                                        continue;
-                                    };
-
-                                    let filename = PathBuf::from(filename_raw)
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("image")
-                                        .to_string();
-
-                                    let total_bytes: u64 = match size_raw.parse() {
-                                        Ok(v) => v,
-                                        Err(_) => {
+                                    }
+                                };
+                                let media_id = match control {
+                                    OriginalImageControl::Unavailable(media_id) => {
+                                        let expected_sender = tab
+                                            .pending_original_image_requests
+                                            .get(&media_id)
+                                            .and_then(|sender| sender.as_deref());
+                                        if expected_sender.is_some_and(|sender| {
+                                            sender.eq_ignore_ascii_case(&peer.member.b32)
+                                        }) {
+                                            tab.pending_original_image_requests.remove(&media_id);
+                                            if let Some(bubble_idx) =
+                                                Self::find_original_image_bubble(
+                                                    &tab.session.bubbles,
+                                                    media_id,
+                                                    Some(&peer.member.b32),
+                                                )
+                                            {
+                                                Self::set_original_image_bubble_state(
+                                                    &mut tab.session.bubbles,
+                                                    bubble_idx,
+                                                    OriginalImageBubbleState::Unavailable,
+                                                    0,
+                                                );
+                                            }
                                             tab.session.log_lines.push(format!(
-                                                "Invalid group image size from {}.",
+                                                "Original image is no longer available from {}.",
+                                                peer.member.name
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    OriginalImageControl::Cancel(media_id) => {
+                                        if peer.original_image_send_media_id == Some(media_id) {
+                                            if let Some(cancel) =
+                                                peer.original_image_send_cancel.as_ref()
+                                            {
+                                                cancel.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
+                                            tab.session.log_lines.push(format!(
+                                                "{} cancelled original image download.",
+                                                peer.member.name
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    OriginalImageControl::Request(media_id) => media_id,
+                                };
+                                let Some(image) = tab.shared_original_images.get(&media_id).cloned()
+                                else {
+                                    tab.session.log_lines.push(format!(
+                                        "Requested original image is unavailable for {}.",
+                                        peer.member.name
+                                    ));
+                                    let payload = match peer
+                                        .e2e
+                                        .encrypt_strict(&Self::original_image_unavailable_payload(media_id))
+                                    {
+                                        Ok(payload) => payload,
+                                        Err(_) => continue,
+                                    };
+                                    let unavailable = Frame {
+                                        msg_type: MsgType::J,
+                                        msg_id: Self::generate_msg_id_value(),
+                                        payload,
+                                    };
+                                    let conn_for_unavailable = conn.clone();
+                                    let task = Task::perform(
+                                        async move {
+                                            conn_for_unavailable
+                                                .send_frame(&unavailable)
+                                                .await
+                                                .map_err(|err| err.to_string())
+                                        },
+                                        move |result| Message::SendFinished(tab_id, result),
+                                    );
+                                    tasks.push(sam_runtime.track_send_task(task));
+                                    continue;
+                                };
+                                let transfer_id = Self::generate_msg_id_value();
+                                if peer.original_image_send_media_id.is_some() {
+                                    tab.session.log_lines.push(format!(
+                                        "Original image request from {} deferred: another original is being sent.",
+                                        peer.member.name
+                                    ));
+                                    continue;
+                                }
+                                let conn_for_original = conn.clone();
+                                let e2e = peer.e2e.clone();
+                                let image_send_lock = std::sync::Arc::clone(&peer.image_send_lock);
+                                let cancel = std::sync::Arc::new(
+                                    std::sync::atomic::AtomicBool::new(false),
+                                );
+                                peer.original_image_send_media_id = Some(media_id);
+                                peer.original_image_send_cancel = Some(cancel.clone());
+                                let peer_b32 = peer.member.b32.clone();
+                                let task = Task::perform(
+                                    async move {
+                                        let _guard = image_send_lock.lock().await;
+                                        Self::send_original_image_sequence(
+                                            conn_for_original,
+                                            e2e,
+                                            image,
+                                            transfer_id,
+                                            media_id,
+                                            cancel,
+                                        )
+                                        .await
+                                    },
+                                    move |result| {
+                                        Message::OriginalImageSendFinished(
+                                            tab_id,
+                                            Some(peer_b32.clone()),
+                                            media_id,
+                                            result,
+                                        )
+                                    },
+                                );
+                                tasks.push(sam_runtime.track_send_task(task));
+                                tab.session.log_lines.push(format!(
+                                    "Sending requested original image to {}.",
+                                    peer.member.name
+                                ));
+                                continue;
+                            }
+
+                            let plain = strict_plain
+                                .unwrap_or_else(|| peer.e2e.decrypt(&frame.payload));
+                            match String::from_utf8(plain) {
+                                Ok(body) => match Self::parse_image_header(&body) {
+                                    Ok(header) => {
+                                    if header.kind == IncomingImageKind::Original {
+                                        let Some(media_id) = header.media_id else {
+                                            tab.session.log_lines.push(format!(
+                                                "Rejected original image without media id from {}.",
+                                                peer.member.name
+                                            ));
+                                            continue;
+                                        };
+                                        let expected_sender = tab
+                                            .pending_original_image_requests
+                                            .get(&media_id)
+                                            .and_then(|sender| sender.as_deref());
+                                        if !expected_sender.is_some_and(|sender| {
+                                            sender.eq_ignore_ascii_case(&peer.member.b32)
+                                        }) {
+                                            tab.session.log_lines.push(format!(
+                                                "Rejected unsolicited original image from {}.",
                                                 peer.member.name
                                             ));
                                             continue;
                                         }
-                                    };
-
-                                    if total_bytes == 0
-                                        || total_bytes > GROUP_IMAGE_TRANSFER_MAX_BYTES as u64
-                                    {
+                                    }
+                                    let max_bytes = match header.kind {
+                                        IncomingImageKind::Preview => GROUP_IMAGE_TRANSFER_MAX_BYTES,
+                                        IncomingImageKind::Original => ORIGINAL_IMAGE_MAX_BYTES,
+                                    } as u64;
+                                    if header.total_bytes == 0 || header.total_bytes > max_bytes {
                                         tab.session.log_lines.push(format!(
                                             "Rejected group image size from {}: {} bytes.",
-                                            peer.member.name, total_bytes
+                                            peer.member.name, header.total_bytes
                                         ));
                                         continue;
                                     }
 
-                                    if !Self::is_supported_image_mime(mime_raw) {
+                                    if !Self::is_supported_image_mime(&header.mime) {
                                         tab.session.log_lines.push(format!(
-                                            "Unsupported group image type from {}: {mime_raw}",
-                                            peer.member.name
+                                            "Unsupported group image type from {}: {}",
+                                            peer.member.name, header.mime
                                         ));
                                         continue;
                                     }
 
+                                    let original_bubble_idx = if header.kind
+                                        == IncomingImageKind::Original
+                                    {
+                                        header.media_id.and_then(|media_id| {
+                                            Self::find_original_image_bubble(
+                                                &tab.session.bubbles,
+                                                media_id,
+                                                Some(&peer.member.b32),
+                                            )
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     Self::clear_group_peer_incoming_image_state(peer);
-                                    peer.incoming_image_name = Some(filename);
-                                    peer.incoming_image_mime = Some(mime_raw.to_string());
-                                    peer.incoming_image_expected = total_bytes;
+                                    peer.incoming_image_name = Some(header.filename);
+                                    peer.incoming_image_mime = Some(header.mime);
+                                    peer.incoming_image_expected = header.total_bytes;
                                     peer.incoming_image_received = 0;
                                     peer.incoming_image_msg_id = frame.msg_id;
+                                    peer.incoming_image_kind = header.kind;
+                                    peer.incoming_image_media_id = match header.kind {
+                                        IncomingImageKind::Original => header.media_id,
+                                        IncomingImageKind::Preview
+                                            if header.original_size.is_some_and(|size| {
+                                                size <= ORIGINAL_IMAGE_MAX_BYTES as u64
+                                            })
+                                                && header.original_mime.is_some()
+                                                && header.sha256.is_some() => header.media_id,
+                                        IncomingImageKind::Preview => None,
+                                    };
+                                    peer.incoming_image_sha256 = header.sha256;
+                                    peer.incoming_image_original_size =
+                                        header.original_size.unwrap_or(0);
+                                    peer.incoming_image_bubble_index = original_bubble_idx;
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Receiving,
+                                            0,
+                                        );
+                                    }
                                     peer.incoming_image_bytes =
-                                        Vec::with_capacity(total_bytes as usize);
-                                }
+                                        Vec::with_capacity(header.total_bytes as usize);
+                                    }
+                                    Err(err) => tab.session.log_lines.push(format!(
+                                        "Invalid group image header from {}: {err}.",
+                                        peer.member.name
+                                    )),
+                                },
                                 Err(_) => {
                                     tab.session.log_lines.push(format!(
                                         "Invalid UTF-8 group image header from {}.",
@@ -14340,6 +15874,10 @@ impl IcedCommApp {
                         }
                         MsgType::G => {
                             if !peer.ready || !peer.authorized {
+                                continue;
+                            }
+
+                            if peer.cancelled_incoming_image_transfers.contains(&frame.msg_id) {
                                 continue;
                             }
 
@@ -14364,32 +15902,60 @@ impl IcedCommApp {
                                 Ok(chunk) => {
                                     let next_total =
                                         peer.incoming_image_received + chunk.len() as u64;
+                                    let max_bytes = match peer.incoming_image_kind {
+                                        IncomingImageKind::Preview => {
+                                            GROUP_IMAGE_TRANSFER_MAX_BYTES
+                                        }
+                                        IncomingImageKind::Original => ORIGINAL_IMAGE_MAX_BYTES,
+                                    } as u64;
 
                                     if next_total > peer.incoming_image_expected
-                                        || next_total > GROUP_IMAGE_TRANSFER_MAX_BYTES as u64
+                                        || next_total > max_bytes
                                     {
                                         tab.session.log_lines.push(format!(
                                             "Group image transfer overflow from {}.",
                                             peer.member.name
                                         ));
-                                        Self::clear_group_peer_incoming_image_state(peer);
+                                        Self::fail_group_peer_incoming_original_image(
+                                            peer,
+                                            &mut tab.session.bubbles,
+                                        );
                                         continue;
                                     }
 
                                     peer.incoming_image_bytes.extend_from_slice(&chunk);
                                     peer.incoming_image_received = next_total;
+                                    if peer.incoming_image_kind == IncomingImageKind::Original {
+                                        if let Some(bubble_idx) = peer.incoming_image_bubble_index {
+                                            Self::set_original_image_bubble_state(
+                                                &mut tab.session.bubbles,
+                                                bubble_idx,
+                                                OriginalImageBubbleState::Receiving,
+                                                next_total,
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(err) => {
                                     tab.session.log_lines.push(format!(
                                         "Group image chunk decode failed from {}: {err}",
                                         peer.member.name
                                     ));
-                                    Self::clear_group_peer_incoming_image_state(peer);
+                                    Self::fail_group_peer_incoming_original_image(
+                                        peer,
+                                        &mut tab.session.bubbles,
+                                    );
                                 }
                             }
                         }
                         MsgType::Z => {
                             if !peer.ready || !peer.authorized {
+                                continue;
+                            }
+
+                            if peer.cancelled_incoming_image_transfers.contains(&frame.msg_id) {
+                                peer.cancelled_incoming_image_transfers
+                                    .retain(|transfer_id| *transfer_id != frame.msg_id);
                                 continue;
                             }
 
@@ -14416,7 +15982,10 @@ impl IcedCommApp {
                                     peer.incoming_image_received,
                                     peer.incoming_image_expected
                                 ));
-                                Self::clear_group_peer_incoming_image_state(peer);
+                                Self::fail_group_peer_incoming_original_image(
+                                    peer,
+                                    &mut tab.session.bubbles,
+                                );
                                 continue;
                             }
 
@@ -14424,27 +15993,120 @@ impl IcedCommApp {
                                 .incoming_image_name
                                 .clone()
                                 .unwrap_or_else(|| "image".into());
+                            let image_mime = peer
+                                .incoming_image_mime
+                                .clone()
+                                .unwrap_or_else(|| "application/octet-stream".into());
+                            let image_kind = peer.incoming_image_kind;
+                            let media_id = peer.incoming_image_media_id;
+                            let expected_sha256 = peer.incoming_image_sha256.clone();
+                            let original_bubble_idx = peer.incoming_image_bubble_index;
                             let image_bytes = std::mem::take(&mut peer.incoming_image_bytes);
 
-                            tab.session.bubbles.push(Bubble {
-                                author: peer.member.name.clone(),
-                                content: BubbleContent::Image(Self::image_bubble_data(image_bytes)),
-                                mine: false,
-                                offline: false,
-                                timestamp_utc: Self::now_utc_hms(),
-                                msg_id: Some(frame.msg_id),
-                                delivered: false,
-                                group_expected_acks: Vec::new(),
-                                group_received_acks: Vec::new(),
-                            });
+                            if image_kind == IncomingImageKind::Original {
+                                if let Some(bubble_idx) = original_bubble_idx {
+                                    let expected = peer.incoming_image_expected;
+                                    Self::set_original_image_bubble_state(
+                                        &mut tab.session.bubbles,
+                                        bubble_idx,
+                                        OriginalImageBubbleState::Validating,
+                                        expected,
+                                    );
+                                }
+                                let Some(expected) = expected_sha256.as_deref() else {
+                                    tab.session.log_lines.push(format!(
+                                        "Rejected original image without a digest from {}.",
+                                        peer.member.name
+                                    ));
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Failed,
+                                            0,
+                                        );
+                                    }
+                                    Self::clear_group_peer_incoming_image_state(peer);
+                                    continue;
+                                };
+                                if !Self::sha256_hex(&image_bytes).eq_ignore_ascii_case(expected) {
+                                    tab.session.log_lines.push(format!(
+                                        "Rejected original image with mismatched digest from {}.",
+                                        peer.member.name
+                                    ));
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Failed,
+                                            0,
+                                        );
+                                    }
+                                    Self::clear_group_peer_incoming_image_state(peer);
+                                    continue;
+                                }
+                                if let Err(err) = Self::validate_original_image(&image_bytes, &image_mime) {
+                                    tab.session.log_lines.push(format!(
+                                        "Rejected original image from {}: {err}",
+                                        peer.member.name
+                                    ));
+                                    if let Some(bubble_idx) = original_bubble_idx {
+                                        Self::set_original_image_bubble_state(
+                                            &mut tab.session.bubbles,
+                                            bubble_idx,
+                                            OriginalImageBubbleState::Failed,
+                                            0,
+                                        );
+                                    }
+                                    Self::clear_group_peer_incoming_image_state(peer);
+                                    continue;
+                                }
+                                if let Some(media_id) = media_id {
+                                    tab.pending_original_image_requests.remove(&media_id);
+                                }
+                                tasks.push(Task::done(Message::OriginalImageReceived(
+                                    tab_id,
+                                    media_id.unwrap_or(0),
+                                    Some(peer.member.b32.clone()),
+                                    image_name.clone(),
+                                    image_mime,
+                                    image_bytes,
+                                )));
+                            } else {
+                                tab.session.bubbles.push(Bubble {
+                                    author: peer.member.name.clone(),
+                                    content: BubbleContent::Image(
+                                        Self::image_bubble_data_with_original(
+                                            image_bytes,
+                                            image_name.clone(),
+                                            media_id,
+                                            peer.incoming_image_original_size,
+                                            Some(peer.member.b32.clone()),
+                                        ),
+                                    ),
+                                    mine: false,
+                                    offline: false,
+                                    timestamp_utc: Self::now_utc_hms(),
+                                    msg_id: Some(frame.msg_id),
+                                    delivered: false,
+                                    group_expected_acks: Vec::new(),
+                                    group_received_acks: Vec::new(),
+                                });
+                            }
 
                             if !is_active || !window_focused {
                                 tab.meta.has_unread = true;
                             }
 
                             tab.session.log_lines.push(format!(
-                                "Group image received from {}: {image_name} ({} bytes)",
-                                peer.member.name, peer.incoming_image_received
+                                "Group {} received from {}: {image_name} ({} bytes)",
+                                if image_kind == IncomingImageKind::Original {
+                                    "original image"
+                                } else {
+                                    "image"
+                                },
+                                peer.member.name,
+                                peer.incoming_image_received
                             ));
 
                             Self::clear_group_peer_incoming_image_state(peer);
@@ -14571,10 +16233,9 @@ impl IcedCommApp {
                         if is_group_admin {
                             roster_sync_needed = true;
                         }
-                        tab.session.log_lines.push(format!(
-                            "Group secure session ready: {}",
-                            peer.member.name
-                        ));
+                        tab.session
+                            .log_lines
+                            .push(format!("Group secure session ready: {}", peer.member.name));
 
                         if let (Some(my_b32), Some(owner_b32)) =
                             (group.meta.my_b32.clone(), group.meta.owner_b32.clone())
@@ -14585,11 +16246,7 @@ impl IcedCommApp {
                                         group.meta.private_join_credential.as_ref()
                                     {
                                         match group_invite::sign_join_proof(
-                                            credential,
-                                            &owner_b32,
-                                            &token,
-                                            &my_b32,
-                                            now_ms,
+                                            credential, &owner_b32, &token, &my_b32, now_ms,
                                         ) {
                                             Ok(proof) => Some(GroupControlMessage {
                                                 kind: GROUP_CONTROL_JOIN_PROOF.into(),
@@ -14618,9 +16275,7 @@ impl IcedCommApp {
                                             private_proof_signature: None,
                                         })
                                     }
-                                } else if !is_group_admin
-                                    && !group.meta.my_name.trim().is_empty()
-                                {
+                                } else if !is_group_admin && !group.meta.my_name.trim().is_empty() {
                                     Some(GroupControlMessage {
                                         kind: GROUP_CONTROL_RENAME_REQUEST.into(),
                                         token: String::new(),
@@ -14678,6 +16333,10 @@ impl IcedCommApp {
 
                 if conn.is_closed() && !conn.has_pending_frames() {
                     let was_ready = peer.ready;
+                    Self::fail_group_peer_incoming_original_image(
+                        peer,
+                        &mut tab.session.bubbles,
+                    );
                     Self::reset_group_peer_transport_state(peer);
 
                     if was_ready {
@@ -14697,6 +16356,10 @@ impl IcedCommApp {
                     let identity_received = peer.handshake_identity_received;
                     let key_received = peer.handshake_key_received;
                     let stalled_conn = peer.conn.take();
+                    Self::fail_group_peer_incoming_original_image(
+                        peer,
+                        &mut tab.session.bubbles,
+                    );
                     Self::reset_group_peer_transport_state(peer);
                     tab.session.log_lines.push(format!(
                         "Group handshake timed out for {} (identity={}, key={}).",
@@ -14718,6 +16381,10 @@ impl IcedCommApp {
                     }
 
                     if now_ms.saturating_sub(peer.heartbeat_last_rx_ms) >= HEARTBEAT_TIMEOUT_MS {
+                        Self::fail_group_peer_incoming_original_image(
+                            peer,
+                            &mut tab.session.bubbles,
+                        );
                         Self::reset_group_peer_transport_state(peer);
                         tab.session.log_lines.push(format!(
                             "Group member heartbeat timed out: {}",
@@ -14810,10 +16477,11 @@ impl IcedCommApp {
         }
     }
 
-    fn push_outgoing_file_bubble(&mut self, filename: String, total_bytes: u64) {
+    fn push_outgoing_file_bubble(&mut self, transfer_id: u64, filename: String, total_bytes: u64) {
         let bubble = Bubble {
             author: "Me".into(),
             content: BubbleContent::File(FileBubbleData {
+                transfer_id,
                 filename,
                 saved_path: None,
                 total_bytes,
@@ -14821,7 +16489,10 @@ impl IcedCommApp {
                 outgoing: true,
                 complete: false,
                 failed: false,
-                status: "Sending...".into(),
+                can_accept: false,
+                can_decline: false,
+                can_cancel: true,
+                status: "Offering...".into(),
             }),
             mine: true,
             offline: false,
@@ -14846,6 +16517,7 @@ impl IcedCommApp {
         status: String,
         complete: bool,
         failed: bool,
+        can_cancel: bool,
     ) {
         if let Some(idx) = tab.outgoing_bubble_index {
             if let Some(bubble) = tab.session.bubbles.get_mut(idx) {
@@ -14854,6 +16526,9 @@ impl IcedCommApp {
                     file.status = status;
                     file.complete = complete;
                     file.failed = failed;
+                    file.can_accept = false;
+                    file.can_decline = false;
+                    file.can_cancel = can_cancel;
                 }
             }
         }
@@ -14861,12 +16536,131 @@ impl IcedCommApp {
 
     fn clear_outgoing_file_state(tab: &mut OpenedTab) {
         tab.outgoing_file = None;
+        tab.outgoing_file_transfer_id = 0;
+        tab.outgoing_file_offer_started_ms = 0;
         tab.outgoing_filename = None;
         tab.outgoing_total = 0;
         tab.outgoing_sent = 0;
         tab.outgoing_phase = OutgoingFilePhase::Idle;
         tab.outgoing_send_in_flight = false;
         tab.outgoing_bubble_index = None;
+    }
+
+    fn update_incoming_file_bubble(
+        tab: &mut OpenedTab,
+        status: &str,
+        complete: bool,
+        failed: bool,
+        can_accept: bool,
+        can_decline: bool,
+        can_cancel: bool,
+        saved_path: Option<String>,
+    ) {
+        if let Some(idx) = tab.incoming_bubble_index {
+            if let Some(bubble) = tab.session.bubbles.get_mut(idx) {
+                if let BubbleContent::File(file) = &mut bubble.content {
+                    file.done_bytes = tab.incoming_received;
+                    file.status = status.into();
+                    file.complete = complete;
+                    file.failed = failed;
+                    file.can_accept = can_accept;
+                    file.can_decline = can_decline;
+                    file.can_cancel = can_cancel;
+                    if let Some(saved_path) = saved_path {
+                        file.saved_path = Some(saved_path);
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_incoming_file_state(tab: &mut OpenedTab, remove_partial: bool) {
+        tab.incoming_file = None;
+        if remove_partial {
+            if let Some(idx) = tab.incoming_bubble_index {
+                if let Some(bubble) = tab.session.bubbles.get_mut(idx) {
+                    if let BubbleContent::File(file) = &mut bubble.content {
+                        file.saved_path = None;
+                    }
+                }
+            }
+        }
+        if let Some(path) = tab.incoming_save_path.take() {
+            if remove_partial {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        tab.incoming_file_transfer_id = 0;
+        tab.incoming_file_offer_started_ms = 0;
+        tab.incoming_filename = None;
+        tab.incoming_expected = 0;
+        tab.incoming_received = 0;
+        tab.incoming_bubble_index = None;
+    }
+
+    fn interrupt_file_transfers(tab: &mut OpenedTab, status: &str) {
+        if tab.outgoing_phase != OutgoingFilePhase::Idle {
+            Self::update_outgoing_file_bubble(
+                tab,
+                tab.outgoing_sent,
+                status.into(),
+                false,
+                true,
+                false,
+            );
+            Self::clear_outgoing_file_state(tab);
+        }
+        if tab.incoming_file_transfer_id != 0 {
+            Self::update_incoming_file_bubble(tab, status, false, true, false, false, false, None);
+            Self::clear_incoming_file_state(tab, true);
+        }
+    }
+
+    fn file_control_task(
+        tab_id: u64,
+        conn: Option<LiveConnection>,
+        e2e: &E2E,
+        transfer_id: u64,
+        control: FileTransferControl,
+    ) -> Result<Task<Message>, String> {
+        let conn = conn.ok_or_else(|| "File transfer has no live connection.".to_string())?;
+        let frame = Self::file_control_frame(e2e, transfer_id, control)?;
+        Ok(Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|err| err.to_string()) },
+            move |result| Message::SendFinished(tab_id, result),
+        ))
+    }
+
+    fn incoming_file_accept_task(
+        tab_id: u64,
+        conn: Option<LiveConnection>,
+        e2e: &E2E,
+        transfer_id: u64,
+        control: FileTransferControl,
+    ) -> Result<Task<Message>, String> {
+        let conn = conn.ok_or_else(|| "File transfer has no live connection.".to_string())?;
+        let frame = Self::file_control_frame(e2e, transfer_id, control)?;
+        Ok(Task::perform(
+            async move { conn.send_frame(&frame).await.map_err(|err| err.to_string()) },
+            move |result| Message::IncomingFileAcceptSent(tab_id, transfer_id, result),
+        ))
+    }
+
+    fn file_control_frame(
+        e2e: &E2E,
+        transfer_id: u64,
+        control: FileTransferControl,
+    ) -> Result<Frame, String> {
+        let control = serde_json::to_vec(&control)
+            .map_err(|err| format!("File control encoding failed: {err}"))?;
+        let payload = e2e
+            .encrypt_strict(&control)
+            .map_err(|err| format!("File control encryption failed: {err}"))?;
+        Ok(Frame {
+            msg_type: MsgType::F,
+            msg_id: transfer_id,
+            payload,
+        })
     }
 
     fn clear_outgoing_image_state(tab: &mut OpenedTab) {
@@ -14887,6 +16681,25 @@ impl IcedCommApp {
         tab.incoming_image_received = 0;
         tab.incoming_image_msg_id = 0;
         tab.incoming_image_bytes.clear();
+        tab.incoming_image_kind = IncomingImageKind::Preview;
+        tab.incoming_image_media_id = None;
+        tab.incoming_image_sha256 = None;
+        tab.incoming_image_original_size = 0;
+        tab.incoming_image_bubble_index = None;
+    }
+
+    fn fail_incoming_original_image(tab: &mut OpenedTab) {
+        if tab.incoming_image_kind == IncomingImageKind::Original {
+            if let Some(bubble_idx) = tab.incoming_image_bubble_index {
+                Self::set_original_image_bubble_state(
+                    &mut tab.session.bubbles,
+                    bubble_idx,
+                    OriginalImageBubbleState::Failed,
+                    0,
+                );
+            }
+        }
+        Self::clear_incoming_image_state(tab);
     }
 
     fn clear_group_peer_incoming_image_state(peer: &mut GroupPeerRuntime) {
@@ -14896,6 +16709,34 @@ impl IcedCommApp {
         peer.incoming_image_received = 0;
         peer.incoming_image_msg_id = 0;
         peer.incoming_image_bytes.clear();
+        peer.incoming_image_kind = IncomingImageKind::Preview;
+        peer.incoming_image_media_id = None;
+        peer.incoming_image_sha256 = None;
+        peer.incoming_image_original_size = 0;
+        peer.incoming_image_bubble_index = None;
+    }
+
+    fn fail_group_peer_incoming_original_image(
+        peer: &mut GroupPeerRuntime,
+        bubbles: &mut [Bubble],
+    ) {
+        for bubble in bubbles {
+            let BubbleContent::Image(image) = &mut bubble.content else {
+                continue;
+            };
+            if image.original_sender_b32.as_deref().is_some_and(|sender| {
+                sender.eq_ignore_ascii_case(&peer.member.b32)
+            }) && matches!(
+                image.original_state,
+                OriginalImageBubbleState::Requesting
+                    | OriginalImageBubbleState::Receiving
+                    | OriginalImageBubbleState::Validating
+            ) {
+                image.original_state = OriginalImageBubbleState::Failed;
+                image.original_received = 0;
+            }
+        }
+        Self::clear_group_peer_incoming_image_state(peer);
     }
 
     fn start_group_peer_handshake(peer: &mut GroupPeerRuntime, now_ms: u64) {
@@ -14911,6 +16752,9 @@ impl IcedCommApp {
     }
 
     fn reset_group_peer_transport_state(peer: &mut GroupPeerRuntime) {
+        if let Some(cancel) = peer.original_image_send_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         peer.conn = None;
         peer.pending_conn = None;
         peer.e2e = E2E::new(false);
@@ -14921,6 +16765,8 @@ impl IcedCommApp {
         peer.handshake_key_received = false;
         peer.heartbeat_last_rx_ms = 0;
         peer.heartbeat_last_ping_ms = 0;
+        peer.original_image_send_media_id = None;
+        peer.cancelled_incoming_image_transfers.clear();
         Self::clear_group_peer_incoming_image_state(peer);
     }
 
@@ -14929,12 +16775,15 @@ impl IcedCommApp {
         filename: String,
         mime: String,
         bytes: Vec<u8>,
+        original_mime: String,
+        original_bytes: Vec<u8>,
     ) -> Result<Task<Message>, String> {
         let Some(tab) = self.active_tab() else {
             return Err("Open a chat tab before sending an image.".into());
         };
         if tab.outgoing_phase != OutgoingFilePhase::Idle
             || tab.outgoing_image_phase != OutgoingImagePhase::Idle
+            || (tab.meta.kind != TabKind::Group && tab.original_image_send_in_flight)
         {
             return Err("Another transfer is already in progress.".into());
         }
@@ -14947,8 +16796,11 @@ impl IcedCommApp {
         if bytes.len() > MAX_FILE_SIZE {
             return Err(format!("Image preview too large ({} bytes).", bytes.len()));
         }
+        Self::validate_original_image(&original_bytes, &original_mime)?;
 
         let msg_id = self.generate_msg_id();
+        let original_sha256 = Self::sha256_hex(&original_bytes);
+        let original_size = original_bytes.len() as u64;
 
         if self.active_tab_is_group() {
             if bytes.len() > GROUP_IMAGE_TRANSFER_MAX_BYTES {
@@ -14983,13 +16835,27 @@ impl IcedCommApp {
 
                     expected_acks.push(peer.member.b32.to_ascii_lowercase());
                     let e2e = peer.e2e.clone();
+                    let image_send_lock = std::sync::Arc::clone(&peer.image_send_lock);
                     let filename = filename.clone();
                     let mime = mime.clone();
                     let bytes = bytes.clone();
+                    let original_mime_for_header = original_mime.clone();
+                    let original_sha256_for_header = original_sha256.clone();
                     let task = Task::perform(
                         async move {
+                            let _guard = image_send_lock.lock().await;
                             Self::send_group_image_sequence(
-                                conn, e2e, filename, mime, bytes, msg_id,
+                                conn,
+                                e2e,
+                                filename,
+                                mime,
+                                bytes,
+                                msg_id,
+                                Some((
+                                    original_size,
+                                    original_mime_for_header,
+                                    original_sha256_for_header,
+                                )),
                             )
                             .await
                         },
@@ -15015,6 +16881,17 @@ impl IcedCommApp {
                 group_received_acks: Vec::new(),
             });
 
+            if let Some(tab) = self.active_tab_mut() {
+                Self::cache_original_image(
+                    tab,
+                    msg_id,
+                    filename,
+                    original_mime,
+                    original_bytes,
+                    original_sha256,
+                );
+            }
+
             self.store_active_runtime();
             tasks.push(operation::snap_to_end(
                 self.session.messages_scroll_id.clone(),
@@ -15035,6 +16912,14 @@ impl IcedCommApp {
         });
 
         if let Some(tab) = self.active_tab_mut() {
+            Self::cache_original_image(
+                tab,
+                msg_id,
+                filename.clone(),
+                original_mime.clone(),
+                original_bytes,
+                original_sha256.clone(),
+            );
             tab.outgoing_image_name = Some(filename);
             tab.outgoing_image_mime = Some(mime);
             tab.outgoing_image_total = bytes.len() as u64;
@@ -15058,12 +16943,21 @@ impl IcedCommApp {
         mime: String,
         bytes: Vec<u8>,
         msg_id: u64,
+        original: Option<(u64, String, String)>,
     ) -> Result<(), String> {
         let total = bytes.len() as u64;
+        let header = Self::image_header(
+            &filename,
+            &mime,
+            total,
+            IncomingImageKind::Preview,
+            msg_id,
+            original,
+        );
         let frame_j = Frame {
             msg_type: MsgType::J,
             msg_id,
-            payload: e2e.encrypt(format!("{filename}|{mime}|{total}").as_bytes()),
+            payload: e2e.encrypt(header.as_bytes()),
         };
         conn.send_frame(&frame_j).await.map_err(|e| e.to_string())?;
 
@@ -15084,6 +16978,58 @@ impl IcedCommApp {
         };
         conn.send_frame(&frame_z).await.map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    async fn send_original_image_sequence(
+        conn: LiveConnection,
+        e2e: E2E,
+        image: SharedOriginalImage,
+        transfer_id: u64,
+        media_id: u64,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        let cancelled = || cancel.load(std::sync::atomic::Ordering::SeqCst);
+        if cancelled() {
+            return Err("original image send cancelled".into());
+        }
+        let total = image.bytes.len() as u64;
+        let header = Self::image_header(
+            &image.filename,
+            &image.mime,
+            total,
+            IncomingImageKind::Original,
+            media_id,
+            Some((total, image.mime.clone(), image.sha256)),
+        );
+        let frame_j = Frame {
+            msg_type: MsgType::J,
+            msg_id: transfer_id,
+            payload: e2e.encrypt(header.as_bytes()),
+        };
+        conn.send_frame(&frame_j).await.map_err(|err| err.to_string())?;
+
+        for chunk in image.bytes.chunks(4096) {
+            if cancelled() {
+                return Err("original image send cancelled".into());
+            }
+            let encoded = general_purpose::STANDARD.encode(chunk);
+            let frame_g = Frame {
+                msg_type: MsgType::G,
+                msg_id: transfer_id,
+                payload: e2e.encrypt(encoded.as_bytes()),
+            };
+            conn.send_frame(&frame_g).await.map_err(|err| err.to_string())?;
+        }
+
+        if cancelled() {
+            return Err("original image send cancelled".into());
+        }
+        let frame_z = Frame {
+            msg_type: MsgType::Z,
+            msg_id: transfer_id,
+            payload: Vec::new(),
+        };
+        conn.send_frame(&frame_z).await.map_err(|err| err.to_string())
     }
 
     fn image_mime_for_path(path: &Path) -> Option<&'static str> {
@@ -15109,7 +17055,283 @@ impl IcedCommApp {
         )
     }
 
-    fn prepare_image_preview_bytes(path: &Path) -> Result<(Vec<u8>, String), String> {
+    fn image_header(
+        filename: &str,
+        mime: &str,
+        total_bytes: u64,
+        kind: IncomingImageKind,
+        media_id: u64,
+        original: Option<(u64, String, String)>,
+    ) -> String {
+        let kind = match kind {
+            IncomingImageKind::Preview => "preview",
+            IncomingImageKind::Original => "original",
+        };
+        let (original_size, original_mime, sha256) =
+            original.unwrap_or((0, String::new(), String::new()));
+        format!(
+            "{filename}|{mime}|{total_bytes}|{kind}|{media_id}|{original_size}|{original_mime}|{sha256}"
+        )
+    }
+
+    fn parse_image_header(body: &str) -> Result<ParsedImageHeader, String> {
+        let mut parts = body.split('|');
+        let filename_raw = parts.next().ok_or_else(|| "missing filename".to_string())?;
+        let mime = parts.next().ok_or_else(|| "missing MIME type".to_string())?;
+        let size_raw = parts.next().ok_or_else(|| "missing size".to_string())?;
+        let filename = PathBuf::from(filename_raw)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image")
+            .to_string();
+        let total_bytes = size_raw
+            .parse::<u64>()
+            .map_err(|_| "invalid size".to_string())?;
+
+        let kind_raw = parts.next();
+        let kind = match kind_raw {
+            Some("original") => IncomingImageKind::Original,
+            _ => IncomingImageKind::Preview,
+        };
+        let media_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+        let original_size = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0);
+        let original_mime = parts
+            .next()
+            .filter(|value| Self::is_supported_image_mime(value))
+            .map(str::to_string);
+        let sha256 = parts
+            .next()
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(|value| value.to_ascii_lowercase());
+
+        Ok(ParsedImageHeader {
+            filename,
+            mime: mime.to_string(),
+            total_bytes,
+            kind,
+            media_id,
+            original_size,
+            original_mime,
+            sha256,
+        })
+    }
+
+    fn original_image_request_payload(media_id: u64) -> Vec<u8> {
+        format!("{ORIGINAL_IMAGE_CONTROL_PREFIX}REQUEST|{media_id}").into_bytes()
+    }
+
+    fn original_image_unavailable_payload(media_id: u64) -> Vec<u8> {
+        format!("{ORIGINAL_IMAGE_CONTROL_PREFIX}UNAVAILABLE|{media_id}").into_bytes()
+    }
+
+    fn original_image_cancel_payload(media_id: u64) -> Vec<u8> {
+        format!("{ORIGINAL_IMAGE_CONTROL_PREFIX}CANCEL|{media_id}").into_bytes()
+    }
+
+    fn parse_original_image_control(
+        payload: &[u8],
+    ) -> Option<Result<OriginalImageControl, String>> {
+        let body = std::str::from_utf8(payload).ok()?;
+        let control = body.strip_prefix(ORIGINAL_IMAGE_CONTROL_PREFIX)?;
+        let Some((action, value)) = control.split_once('|') else {
+            return Some(Err("malformed original-image control".to_string()));
+        };
+        let media_id = match value.parse::<u64>() {
+            Ok(media_id) => media_id,
+            Err(_) => return Some(Err("invalid original-image media id".to_string())),
+        };
+        Some(match action {
+            "REQUEST" => Ok(OriginalImageControl::Request(media_id)),
+            "UNAVAILABLE" => Ok(OriginalImageControl::Unavailable(media_id)),
+            "CANCEL" => Ok(OriginalImageControl::Cancel(media_id)),
+            _ => Err("unknown original-image control".to_string()),
+        })
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = sha2::Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn validate_original_image(bytes: &[u8], mime: &str) -> Result<(u32, u32), String> {
+        if bytes.is_empty() {
+            return Err("Original image is empty.".into());
+        }
+        if bytes.len() > ORIGINAL_IMAGE_MAX_BYTES {
+            return Err(format!(
+                "Original image is too large ({} bytes). Maximum is {} bytes.",
+                bytes.len(),
+                ORIGINAL_IMAGE_MAX_BYTES
+            ));
+        }
+        if !Self::is_supported_image_mime(mime) {
+            return Err(format!("Unsupported original image type: {mime}"));
+        }
+
+        let reader = ::image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|err| format!("Original image format check failed: {err}"))?;
+        let (width, height) = reader
+            .into_dimensions()
+            .map_err(|err| format!("Original image dimensions are invalid: {err}"))?;
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if pixels == 0 || pixels > ORIGINAL_IMAGE_MAX_PIXELS {
+            return Err(format!(
+                "Original image dimensions are too large: {width}x{height}."
+            ));
+        }
+        Ok((width, height))
+    }
+
+    fn cache_original_image(
+        tab: &mut OpenedTab,
+        media_id: u64,
+        filename: String,
+        mime: String,
+        bytes: Vec<u8>,
+        sha256: String,
+    ) {
+        while tab.shared_original_images.len() >= ORIGINAL_IMAGE_CACHE_MAX_ITEMS
+            || tab
+                .shared_original_images
+                .values()
+                .map(|image| image.bytes.len())
+                .sum::<usize>()
+                .saturating_add(bytes.len())
+                > ORIGINAL_IMAGE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = tab
+                .shared_original_images
+                .iter()
+                .min_by_key(|(_, image)| image.added_ms)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            tab.shared_original_images.remove(&oldest);
+        }
+
+        tab.shared_original_images.insert(
+            media_id,
+            SharedOriginalImage {
+                filename,
+                mime,
+                bytes,
+                sha256,
+                added_ms: Self::now_epoch_millis(),
+            },
+        );
+    }
+
+    fn received_original_image_cache_key(
+        media_id: u64,
+        sender_b32: Option<&str>,
+    ) -> (u64, String) {
+        (
+            media_id,
+            sender_b32
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_else(|| "1:1".into()),
+        )
+    }
+
+    fn cache_received_original_image(
+        tab: &mut OpenedTab,
+        media_id: u64,
+        sender_b32: Option<&str>,
+        filename: String,
+        mime: String,
+        bytes: Vec<u8>,
+    ) {
+        if bytes.len() > ORIGINAL_IMAGE_CACHE_MAX_BYTES {
+            return;
+        }
+
+        let key = Self::received_original_image_cache_key(media_id, sender_b32);
+        tab.received_original_images.remove(&key);
+        while tab.received_original_images.len() >= ORIGINAL_IMAGE_CACHE_MAX_ITEMS
+            || tab
+                .received_original_images
+                .values()
+                .map(|image| image.bytes.len())
+                .sum::<usize>()
+                .saturating_add(bytes.len())
+                > ORIGINAL_IMAGE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = tab
+                .received_original_images
+                .iter()
+                .min_by_key(|(_, image)| image.added_ms)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            tab.received_original_images.remove(&oldest);
+        }
+
+        tab.received_original_images.insert(
+            key,
+            SharedOriginalImage {
+                filename,
+                mime,
+                sha256: Self::sha256_hex(&bytes),
+                bytes,
+                added_ms: Self::now_epoch_millis(),
+            },
+        );
+    }
+
+    fn find_original_image_bubble(
+        bubbles: &[Bubble],
+        media_id: u64,
+        sender_b32: Option<&str>,
+    ) -> Option<usize> {
+        bubbles.iter().position(|bubble| {
+            let BubbleContent::Image(image) = &bubble.content else {
+                return false;
+            };
+            if image.original_media_id != Some(media_id) {
+                return false;
+            }
+            match (sender_b32, image.original_sender_b32.as_deref()) {
+                (Some(expected), Some(actual)) => actual.eq_ignore_ascii_case(expected),
+                (None, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    fn set_original_image_bubble_state(
+        bubbles: &mut [Bubble],
+        bubble_idx: usize,
+        state: OriginalImageBubbleState,
+        received: u64,
+    ) {
+        if let Some(BubbleContent::Image(image)) = bubbles
+            .get_mut(bubble_idx)
+            .map(|bubble| &mut bubble.content)
+        {
+            image.original_state = state;
+            image.original_received = received.min(image.original_size);
+        }
+    }
+
+    fn remember_cancelled_image_transfer(cancelled: &mut Vec<u64>, transfer_id: u64) {
+        const LIMIT: usize = 16;
+        if !cancelled.contains(&transfer_id) {
+            cancelled.push(transfer_id);
+        }
+        if cancelled.len() > LIMIT {
+            cancelled.drain(..cancelled.len() - LIMIT);
+        }
+    }
+
+    fn prepare_image_preview_bytes(
+        path: &Path,
+    ) -> Result<(Vec<u8>, String, Vec<u8>, String), String> {
         let source = std::fs::read(path).map_err(|e| format!("Image read failed: {e}"))?;
 
         if source.is_empty() {
@@ -15123,10 +17345,15 @@ impl IcedCommApp {
             ));
         }
 
+        let original_mime = Self::image_mime_for_path(path)
+            .ok_or_else(|| "Unsupported image type.".to_string())?
+            .to_string();
+        Self::validate_original_image(&source, &original_mime)?;
         let decoded =
             ::image::load_from_memory(&source).map_err(|e| format!("Image decode failed: {e}"))?;
         let keep_alpha = decoded.has_alpha();
-        Self::encode_image_preview(decoded, keep_alpha)
+        let (preview, preview_mime) = Self::encode_image_preview(decoded, keep_alpha)?;
+        Ok((preview, preview_mime, source, original_mime))
     }
 
     fn prepare_clipboard_image_draft(
@@ -15159,6 +17386,12 @@ impl IcedCommApp {
         let rgba = ::image::RgbaImage::from_raw(width, height, raw)
             .ok_or_else(|| "Clipboard image pixel data is invalid.".to_string())?;
         let decoded = ::image::DynamicImage::ImageRgba8(rgba);
+        let mut original_cursor = Cursor::new(Vec::new());
+        decoded
+            .write_to(&mut original_cursor, ::image::ImageFormat::Png)
+            .map_err(|e| format!("Clipboard image encode failed: {e}"))?;
+        let original_bytes = original_cursor.into_inner();
+        Self::validate_original_image(&original_bytes, "image/png")?;
         let (bytes, mime) = Self::encode_image_preview(decoded, keep_alpha)?;
         let extension = if mime == "image/png" { "png" } else { "jpg" };
         let filename = format!("pasted-image-{}.{}", Self::now_epoch_millis(), extension);
@@ -15167,6 +17400,8 @@ impl IcedCommApp {
             filename,
             mime,
             image: Self::image_bubble_data(bytes),
+            original_mime: "image/png".into(),
+            original_bytes,
         })
     }
 
@@ -15212,6 +17447,16 @@ impl IcedCommApp {
     }
 
     fn image_bubble_data(bytes: Vec<u8>) -> ImageBubbleData {
+        Self::image_bubble_data_with_original(bytes, "image".into(), None, 0, None)
+    }
+
+    fn image_bubble_data_with_original(
+        bytes: Vec<u8>,
+        filename: String,
+        original_media_id: Option<u64>,
+        original_size: u64,
+        original_sender_b32: Option<String>,
+    ) -> ImageBubbleData {
         let (width, height) = ::image::load_from_memory(&bytes)
             .map(|img| (img.width(), img.height()))
             .unwrap_or((300, 220));
@@ -15221,26 +17466,36 @@ impl IcedCommApp {
             handle,
             width,
             height,
+            filename,
+            original_media_id,
+            original_size,
+            original_sender_b32,
+            original_state: OriginalImageBubbleState::Idle,
+            original_received: 0,
         }
     }
 
     fn push_incoming_file_bubble(
         tab: &mut OpenedTab,
+        transfer_id: u64,
         filename: String,
-        saved_path: String,
         total_bytes: u64,
     ) {
         let bubble = Bubble {
             author: "Peer".into(),
             content: BubbleContent::File(FileBubbleData {
+                transfer_id,
                 filename,
-                saved_path: Some(saved_path),
+                saved_path: None,
                 total_bytes,
                 done_bytes: 0,
                 outgoing: false,
                 complete: false,
                 failed: false,
-                status: "Receiving...".into(),
+                can_accept: true,
+                can_decline: true,
+                can_cancel: false,
+                status: "Accept file?".into(),
             }),
             mine: false,
             offline: false,
@@ -15277,11 +17532,7 @@ impl IcedCommApp {
         false
     }
 
-    fn mark_group_delivered(
-        bubbles: &mut [Bubble],
-        delivered_id: u64,
-        peer_b32: &str,
-    ) -> bool {
+    fn mark_group_delivered(bubbles: &mut [Bubble], delivered_id: u64, peer_b32: &str) -> bool {
         let peer_b32 = peer_b32.to_ascii_lowercase();
 
         for bubble in bubbles.iter_mut().rev() {
@@ -15528,9 +17779,7 @@ impl IcedCommApp {
         session.drop_recv_base = offline.drop_recv_base;
         session.drop_window = offline.drop_window;
         session.consumed_drop_recv = offline.consumed_drop_recv.clone();
-        session.known_remote_next_send = offline
-            .known_remote_next_send
-            .max(offline.drop_recv_base);
+        session.known_remote_next_send = offline.known_remote_next_send.max(offline.drop_recv_base);
         session.highest_authenticated_recv_index = offline.highest_authenticated_recv_index;
         session.missing_drop_recv = offline.missing_drop_recv.clone();
         session.skipped_drop_recv = offline.skipped_drop_recv.clone();
@@ -15569,9 +17818,7 @@ impl IcedCommApp {
             return;
         };
         let offline = Self::offline_state_from_session(&tab.session);
-        if let Err(err) =
-            storage::save_offline_state(&tab.session.profile, &peer_b32, &offline)
-        {
+        if let Err(err) = storage::save_offline_state(&tab.session.profile, &peer_b32, &offline) {
             tab.session.log_lines.push(format!("{context}: {err}"));
         }
     }
@@ -16096,8 +18343,7 @@ impl IcedCommApp {
             && tab.e2e.ready()
             && Self::session_has_real_offline_secret(session)
             && session.stored_peer.as_deref() == session.current_peer_addr.as_deref()
-            && session.stored_peer_dest_b64.as_deref()
-                == session.current_peer_dest_b64.as_deref()
+            && session.stored_peer_dest_b64.as_deref() == session.current_peer_dest_b64.as_deref()
             && tab.live_conn.is_some()
     }
 
@@ -16370,14 +18616,7 @@ impl IcedCommApp {
                 dd.get_with_stats(&dd_key_for_task).await
             },
             move |(blobs, stats)| {
-                Message::OfflinePollKeyFinished(
-                    tab_id,
-                    recv_index,
-                    poll_kind,
-                    dd_key,
-                    blobs,
-                    stats,
-                )
+                Message::OfflinePollKeyFinished(tab_id, recv_index, poll_kind, dd_key, blobs, stats)
             },
         )
     }
@@ -16446,8 +18685,7 @@ impl IcedCommApp {
             };
 
             match Frame::decode(&frame_bytes) {
-                Ok(frame) => {
-                    match frame.msg_type {
+                Ok(frame) => match frame.msg_type {
                         MsgType::U => {
                             let plain = tab.e2e.decrypt(&frame.payload);
                             match String::from_utf8(plain) {
@@ -16457,10 +18695,7 @@ impl IcedCommApp {
                                     tab.session
                                         .bubbles
                                         .push(Bubble::peer_offline_with_id(text, frame.msg_id));
-                                    Self::append_tab_latest_text_history(
-                                        tab,
-                                        Some(peer_b32.clone()),
-                                    );
+                                Self::append_tab_latest_text_history(tab, Some(peer_b32.clone()));
                                     if mark_unread {
                                         tab.meta.has_unread = true;
                                     }
@@ -16483,8 +18718,7 @@ impl IcedCommApp {
                                 other, recv_index
                             ));
                         }
-                    }
-                }
+                },
                 Err(err) => {
                     tab.session.log_lines.push(format!(
                         "Offline frame decode failed at recv index {}: {}",
@@ -16550,7 +18784,9 @@ impl IcedCommApp {
                 entry.confirmed_miss_rounds = entry.confirmed_miss_rounds.saturating_add(1);
                 entry.last_miss_ms = now_ms;
             } else {
-                tab.session.missing_drop_recv.push(OfflineMissingIndexState {
+                tab.session
+                    .missing_drop_recv
+                    .push(OfflineMissingIndexState {
                     index: *index,
                     confirmed_miss_rounds: 1,
                     first_miss_ms: now_ms,
@@ -16578,7 +18814,9 @@ impl IcedCommApp {
                 .iter()
                 .any(|entry| entry.index == index)
             {
-                tab.session.skipped_drop_recv.push(OfflineSkippedIndexState {
+                tab.session
+                    .skipped_drop_recv
+                    .push(OfflineSkippedIndexState {
                     index,
                     skipped_at_ms: now_ms,
                     last_recovery_probe_ms: 0,
@@ -16708,7 +18946,7 @@ fn bubble_delivery_mark(bubble: &Bubble) -> Option<String> {
     None
 }
 
-fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
+fn message_row<'a>(tab_id: u64, idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
     let (body, max_width): (Element<'a, Message>, f32) = match &bubble.content {
         BubbleContent::Text(value) => {
             let show_author = should_show_bubble_author(bubble);
@@ -16820,12 +19058,15 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
         BubbleContent::Image(data) => {
             let (display_width, display_height) = image_display_size(data.width, data.height);
             let show_author = should_show_bubble_author(bubble);
-            let body_width = if show_author {
+            let mut body_width = if show_author {
                 let author_width = bubble.author.chars().count() as f32 * 7.0 + 4.0;
                 display_width.max(author_width.min(TEXT_BUBBLE_MAX_WIDTH - 24.0))
             } else {
                 display_width
             };
+            if !bubble.mine && data.original_media_id.is_some() {
+                body_width = body_width.max(220.0);
+            }
             let author_label: Element<'a, Message> = if show_author {
                 text(&bubble.author)
                     .size(10)
@@ -16835,6 +19076,97 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
             } else {
                 Space::new().height(0).into()
             };
+            let original_action: Element<'a, Message> = if !bubble.mine
+                && data.original_media_id.is_some()
+            {
+                let retry_button = || {
+                    tooltip(
+                        button(
+                            text("\u{e2c4}")
+                                .font(Font {
+                                    family: font::Family::Name(APP_ICON_FONT_FAMILY),
+                                    ..Font::default()
+                                })
+                                .size(14),
+                        )
+                        .width(22)
+                        .height(18)
+                        .padding(iced::Padding {
+                            top: 0.0,
+                            right: 2.0,
+                            bottom: 2.0,
+                            left: 4.0,
+                        })
+                        .style(copy_bubble_button_style)
+                        .on_press(Message::RequestOriginalImagePressed(tab_id, idx)),
+                        container(text("Request original image").size(11))
+                            .padding([4, 6])
+                            .style(|_| log_panel_style()),
+                        tooltip::Position::Top,
+                    )
+                };
+                match data.original_state {
+                    OriginalImageBubbleState::Idle => container(retry_button())
+                        .width(Length::Fill)
+                        .into(),
+                    OriginalImageBubbleState::Requesting
+                    | OriginalImageBubbleState::Receiving => {
+                        let total = data.original_size.max(1) as f32;
+                        let received = data.original_received.min(data.original_size) as f32;
+                        let label = if data.original_state
+                            == OriginalImageBubbleState::Requesting
+                        {
+                            "Requesting original...".to_string()
+                        } else {
+                            format!(
+                                "{} / {} bytes",
+                                data.original_received.min(data.original_size),
+                                data.original_size
+                            )
+                        };
+                        row![
+                            text(label).size(10).color(Color::from_rgb8(160, 160, 160)),
+                            progress_bar(0.0..=total, received)
+                                .girth(5)
+                                .length(Length::Fill),
+                            button(container(text("Cancel").size(10)).center_y(Length::Fill))
+                                .height(18)
+                                .padding([0, 6])
+                                .style(app_button_style)
+                                .on_press(Message::CancelOriginalImagePressed(tab_id, idx)),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill)
+                        .into()
+                    }
+                    OriginalImageBubbleState::Validating => text("Validating original image...")
+                        .size(11)
+                        .color(Color::from_rgb8(160, 160, 160))
+                        .width(Length::Fill)
+                        .into(),
+                    OriginalImageBubbleState::Failed
+                    | OriginalImageBubbleState::Unavailable
+                    | OriginalImageBubbleState::Cancelled => {
+                        let label = match data.original_state {
+                            OriginalImageBubbleState::Failed => "Original download failed",
+                            OriginalImageBubbleState::Unavailable => "Original unavailable",
+                            OriginalImageBubbleState::Cancelled => "Original download cancelled",
+                            _ => unreachable!(),
+                        };
+                        row![
+                            retry_button(),
+                            text(label).size(11).color(Color::from_rgb8(160, 160, 160)),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill)
+                        .into()
+                    }
+                }
+            } else {
+                Space::new().width(Length::Fill).into()
+            };
 
             (
                 column![
@@ -16843,7 +19175,12 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
                         .width(display_width)
                         .height(display_height)
                         .content_fit(ContentFit::Contain),
-                    bubble_timestamp_row(bubble),
+                    row![
+                        original_action,
+                        bubble_timestamp_row(bubble),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
                 ]
                 .spacing(6)
                 .width(body_width)
@@ -16859,6 +19196,34 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
                 file.total_bytes as f32
             };
             let done = file.done_bytes.min(file.total_bytes) as f32;
+            let controls: Element<'a, Message> = if file.can_accept && file.can_decline {
+                row![
+                    button(container(text("Accept").size(11)).center_y(Length::Fill))
+                        .height(24)
+                        .padding([0, 8])
+                        .style(app_button_style)
+                        .on_press(Message::AcceptIncomingFilePressed(tab_id, file.transfer_id,)),
+                    button(container(text("Decline").size(11)).center_y(Length::Fill))
+                        .height(24)
+                        .padding([0, 8])
+                        .style(app_button_style)
+                        .on_press(Message::DeclineIncomingFilePressed(
+                            tab_id,
+                            file.transfer_id,
+                        )),
+                ]
+                .spacing(6)
+                .into()
+            } else if file.can_cancel {
+                button(container(text("Cancel").size(11)).center_y(Length::Fill))
+                    .height(24)
+                    .padding([0, 8])
+                    .style(app_button_style)
+                    .on_press(Message::CancelFileTransferPressed(tab_id, file.transfer_id))
+                    .into()
+            } else {
+                Space::new().height(0).into()
+            };
 
             (
                 column![
@@ -16882,6 +19247,7 @@ fn message_row<'a>(idx: usize, bubble: &'a Bubble) -> Element<'a, Message> {
                     } else {
                         text("").size(10)
                     },
+                    controls,
                     bubble_timestamp_row(bubble),
                 ]
                 .spacing(6)
@@ -17483,10 +19849,7 @@ fn tab_status_marker<'a>(tab: &'a ChatTab, blink_on: bool, closing: bool) -> Ele
     }
 
     let connection_marker: Element<'a, Message> = if closing {
-        text("...")
-            .size(13)
-            .color(APP_TAB_DISABLED_TEXT)
-            .into()
+        text("...").size(13).color(APP_TAB_DISABLED_TEXT).into()
     } else if tab.initializing {
         let frame = APP_TAB_SPINNER_FRAMES
             [((IcedCommApp::now_epoch_millis() / 120) as usize) % APP_TAB_SPINNER_FRAMES.len()];
