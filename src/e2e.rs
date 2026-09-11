@@ -129,9 +129,6 @@ impl E2E {
         Ok(out)
     }
 
-    // Later on, during future cleanup stage, encrypt/decrypt_strict are to be merged into encrypt/decrypt.
-    // Currently this is an update for X and L frames mostly. Still, old encrypt/decrypt does not compromise practical security model at all:)
-    
     pub fn decrypt_strict(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let session_key = self
             .session_key
@@ -149,48 +146,6 @@ impl E2E {
         cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| "payload authentication failed".to_string())
-    }
-
-    pub fn encrypt(&self, payload: &[u8]) -> Vec<u8> {
-        let Some(session_key) = self.session_key else {
-            return payload.to_vec();
-        };
-
-        let cipher = XSalsa20Poly1305::new(Key::from_slice(&session_key));
-
-        let mut nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        match cipher.encrypt(nonce, payload) {
-            Ok(ciphertext) => {
-                let mut out = Vec::with_capacity(24 + ciphertext.len());
-                out.extend_from_slice(&nonce_bytes);
-                out.extend_from_slice(&ciphertext);
-                out
-            }
-            Err(_) => payload.to_vec(),
-        }
-    }
-
-    pub fn decrypt(&self, payload: &[u8]) -> Vec<u8> {
-        let Some(session_key) = self.session_key else {
-            return payload.to_vec();
-        };
-
-        if payload.len() < 24 {
-            return payload.to_vec();
-        }
-
-        let cipher = XSalsa20Poly1305::new(Key::from_slice(&session_key));
-
-        let (nonce_bytes, ciphertext) = payload.split_at(24);
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        match cipher.decrypt(nonce, ciphertext) {
-            Ok(plain) => plain,
-            Err(_) => payload.to_vec(),
-        }
     }
 
     pub fn derive_offline_blob_key(
@@ -226,9 +181,13 @@ impl E2E {
         Sha256::digest(&material).to_vec()
     }
 
-    pub fn encrypt_offline_blob(&self, frame: &[u8], blob_key: &[u8]) -> Vec<u8> {
+    pub fn encrypt_offline_blob_strict(
+        &self,
+        frame: &[u8],
+        blob_key: &[u8],
+    ) -> Result<Vec<u8>, String> {
         if blob_key.len() != 32 {
-            return frame.to_vec();
+            return Err("invalid offline blob key length".into());
         }
 
         let cipher = XSalsa20Poly1305::new(Key::from_slice(blob_key));
@@ -237,30 +196,13 @@ impl E2E {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        match cipher.encrypt(nonce, frame) {
-            Ok(ciphertext) => {
-                let mut out = Vec::with_capacity(24 + ciphertext.len());
-                out.extend_from_slice(&nonce_bytes);
-                out.extend_from_slice(&ciphertext);
-                out
-            }
-            Err(_) => frame.to_vec(),
-        }
-    }
-
-    pub fn decrypt_offline_blob(&self, blob: &[u8], blob_key: &[u8]) -> Vec<u8> {
-        if blob_key.len() != 32 || blob.len() < 25 {
-            return blob.to_vec();
-        }
-
-        let cipher = XSalsa20Poly1305::new(Key::from_slice(blob_key));
-        let (nonce_bytes, ciphertext) = blob.split_at(24);
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        match cipher.decrypt(nonce, ciphertext) {
-            Ok(plain) => plain,
-            Err(_) => blob.to_vec(),
-        }
+        let ciphertext = cipher
+            .encrypt(nonce, frame)
+            .map_err(|_| "offline blob encryption failed".to_string())?;
+        let mut out = Vec::with_capacity(24 + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
     }
 
     pub fn decrypt_offline_blob_strict(
@@ -282,5 +224,58 @@ impl E2E {
         cipher
             .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
             .map_err(|_| "offline blob authentication failed".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_pair() -> (E2E, E2E) {
+        let mut alice = E2E::new(false);
+        let mut bob = E2E::new(false);
+        let alice_public = alice.public_bytes();
+        let bob_public = bob.public_bytes();
+        alice.receive_peer_key(&bob_public);
+        bob.receive_peer_key(&alice_public);
+        (alice, bob)
+    }
+
+    #[test]
+    fn live_crypto_rejects_plaintext_and_tampering() {
+        let (alice, bob) = ready_pair();
+        let sealed = alice.encrypt_strict(b"authenticated").expect("encrypt");
+        assert_eq!(
+            bob.decrypt_strict(&sealed).expect("decrypt"),
+            b"authenticated"
+        );
+        assert!(bob.decrypt_strict(b"plaintext").is_err());
+
+        let mut tampered = sealed;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(bob.decrypt_strict(&tampered).is_err());
+    }
+
+    #[test]
+    fn offline_blob_crypto_fails_closed() {
+        let e2e = E2E::new(false);
+        let key = [7u8; 32];
+        let sealed = e2e
+            .encrypt_offline_blob_strict(b"encoded frame", &key)
+            .expect("encrypt offline blob");
+        assert_eq!(
+            e2e.decrypt_offline_blob_strict(&sealed, &key)
+                .expect("decrypt offline blob"),
+            b"encoded frame"
+        );
+        assert!(
+            e2e.encrypt_offline_blob_strict(b"frame", &[0u8; 31])
+                .is_err()
+        );
+        assert!(
+            e2e.decrypt_offline_blob_strict(&sealed, &[0u8; 31])
+                .is_err()
+        );
     }
 }

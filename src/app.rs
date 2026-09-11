@@ -4447,6 +4447,7 @@ impl IcedCommApp {
                         let mut tasks = Vec::new();
                         let mut sent_count = 0usize;
                         let mut expected_acks = Vec::new();
+                        let mut encryption_failed = false;
 
                         if let Some(tab) = state.active_tab_mut() {
                             let sam_runtime = tab.sam_runtime.clone();
@@ -4463,10 +4464,18 @@ impl IcedCommApp {
                                     continue;
                                 };
 
+                                let payload = match peer.e2e.encrypt_strict(outgoing_text.as_bytes()) {
+                                    Ok(payload) => payload,
+                                    Err(_) => {
+                                        encryption_failed = true;
+                                        continue;
+                                    }
+                                };
+
                                 let frame = Frame {
                                     msg_type: MsgType::U,
                                     msg_id,
-                                    payload: peer.e2e.encrypt(outgoing_text.as_bytes()),
+                                    payload,
                                 };
                                 sent_count += 1;
                                 expected_acks.push(peer.member.b32.to_ascii_lowercase());
@@ -4481,7 +4490,11 @@ impl IcedCommApp {
                         }
 
                         if sent_count == 0 {
-                            state.post_system("No ready group members.");
+                            state.post_system(if encryption_failed {
+                                "Group message encryption failed."
+                            } else {
+                                "No ready group members."
+                            });
                             state.store_active_runtime();
                             return operation::snap_to_end(state.session.logs_scroll_id.clone());
                         }
@@ -4515,10 +4528,20 @@ impl IcedCommApp {
                             None => return Task::none(),
                         };
 
-                        let enc_payload = state
+                        let enc_payload = match state
                             .active_tab()
-                            .map(|t| t.e2e.encrypt(outgoing_text.as_bytes()))
-                            .unwrap_or_else(|| outgoing_text.as_bytes().to_vec());
+                            .map(|tab| tab.e2e.encrypt_strict(outgoing_text.as_bytes()))
+                        {
+                            Some(Ok(payload)) => payload,
+                            Some(Err(err)) => {
+                                state.post_system(format!("Message encryption failed: {err}"));
+                                state.store_active_runtime();
+                                return operation::snap_to_end(
+                                    state.session.logs_scroll_id.clone(),
+                                );
+                            }
+                            None => return Task::none(),
+                        };
 
                         let msg_id = state.generate_msg_id();
 
@@ -4610,7 +4633,7 @@ impl IcedCommApp {
                             let frame = Frame {
                                 msg_type: MsgType::U,
                                 msg_id,
-                                payload: tab.e2e.encrypt(outgoing_text.as_bytes()),
+                                payload: outgoing_text.as_bytes().to_vec(),
                             };
 
                             let key = Self::offline_directional_key(
@@ -12332,10 +12355,18 @@ impl IcedCommApp {
             private_proof_signature: None,
         };
 
-        let payload = match serde_json::to_vec(&control) {
-            Ok(payload) => owner_peer.e2e.encrypt(&payload),
+        let payload = match serde_json::to_vec(&control)
+            .map_err(|err| format!("Group rename request encode failed: {err}"))
+            .and_then(|payload| {
+                owner_peer
+                    .e2e
+                    .encrypt_strict(&payload)
+                    .map_err(|err| format!("Group rename request encryption failed: {err}"))
+            })
+        {
+            Ok(payload) => payload,
             Err(err) => {
-                self.session.group_status = format!("Group rename request encode failed: {err}");
+                self.session.group_status = err;
                 return Task::none();
             }
         };
@@ -12387,10 +12418,14 @@ impl IcedCommApp {
                 continue;
             };
 
+            let Ok(encrypted_payload) = peer.e2e.encrypt_strict(&payload) else {
+                continue;
+            };
+
             let frame = Frame {
                 msg_type: MsgType::L,
                 msg_id: self.generate_msg_id(),
-                payload: peer.e2e.encrypt(&payload),
+                payload: encrypted_payload,
             };
             let task = Task::perform(
                 async move { conn.send_frame(&frame).await.map_err(|e| e.to_string()) },
@@ -13646,10 +13681,18 @@ impl IcedCommApp {
                         }
 
                         MsgType::J => {
-                            let strict_plain = tab.e2e.decrypt_strict(&frame.payload).ok();
-                            if let Some(control) = strict_plain
-                                .as_deref()
-                                .and_then(Self::parse_original_image_control)
+                            let strict_plain = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("Image header authentication failed: {err}"),
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Some(control) =
+                                Self::parse_original_image_control(&strict_plain)
                             {
                                 let control = match control {
                                     Ok(control) => control,
@@ -13768,8 +13811,7 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = strict_plain
-                                .unwrap_or_else(|| tab.e2e.decrypt(&frame.payload));
+                            let plain = strict_plain;
 
                             match String::from_utf8(plain) {
                                 Ok(body) => match Self::parse_image_header(&body) {
@@ -13876,7 +13918,17 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = tab.e2e.decrypt(&frame.payload);
+                            let plain = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("Image chunk authentication failed: {err}"),
+                                    );
+                                    Self::fail_incoming_original_image(tab);
+                                    continue;
+                                }
+                            };
 
                             match general_purpose::STANDARD.decode(&plain) {
                                 Ok(chunk) => {
@@ -14096,7 +14148,16 @@ impl IcedCommApp {
 
                         MsgType::U => {
                             let delivered_original_msg_id = frame.msg_id;
-                            let plain = tab.e2e.decrypt(&frame.payload);
+                            let plain = match tab.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    push_log(
+                                        tab,
+                                        format!("Chat payload authentication failed: {err}"),
+                                    );
+                                    continue;
+                                }
+                            };
 
                             match String::from_utf8(plain) {
                                 Ok(text) => {
@@ -15032,11 +15093,26 @@ impl IcedCommApp {
                         if read_n > 0 {
                             let encoded = general_purpose::STANDARD.encode(&buf[..read_n]);
                             let e2e = tab.e2e.clone();
+                            let payload = match e2e.encrypt_strict(encoded.as_bytes()) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    Self::update_outgoing_file_bubble(
+                                        tab,
+                                        tab.outgoing_sent,
+                                        format!("Send failed: {err}"),
+                                        false,
+                                        true,
+                                        false,
+                                    );
+                                    Self::clear_outgoing_file_state(tab);
+                                    return tasks;
+                                }
+                            };
 
                             let frame_c = Frame {
                                 msg_type: MsgType::C,
                                 msg_id: transfer_id,
-                                payload: e2e.encrypt(encoded.as_bytes()),
+                                payload,
                             };
 
                             tab.outgoing_send_in_flight = true;
@@ -15119,11 +15195,19 @@ impl IcedCommApp {
                             msg_id,
                             original,
                         );
+                        let payload = match e2e.encrypt_strict(header.as_bytes()) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                push_log(tab, format!("Image send failed: {err}"));
+                                Self::clear_outgoing_image_state(tab);
+                                return tasks;
+                            }
+                        };
 
                         let frame_j = Frame {
                             msg_type: MsgType::J,
                             msg_id,
-                            payload: e2e.encrypt(header.as_bytes()),
+                            payload,
                         };
 
                         tab.outgoing_image_send_in_flight = true;
@@ -15145,11 +15229,19 @@ impl IcedCommApp {
                             let encoded = general_purpose::STANDARD.encode(&chunk);
                             let msg_id = tab.outgoing_image_msg_id;
                             let e2e = tab.e2e.clone();
+                            let payload = match e2e.encrypt_strict(encoded.as_bytes()) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    push_log(tab, format!("Image send failed: {err}"));
+                                    Self::clear_outgoing_image_state(tab);
+                                    return tasks;
+                                }
+                            };
 
                             let frame_g = Frame {
                                 msg_type: MsgType::G,
                                 msg_id,
-                                payload: e2e.encrypt(encoded.as_bytes()),
+                                payload,
                             };
 
                             tab.outgoing_image_send_in_flight = true;
@@ -15370,7 +15462,16 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = peer.e2e.decrypt(&frame.payload);
+                            let plain = match peer.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Group control authentication failed from {}: {err}",
+                                        peer.member.name
+                                    ));
+                                    continue;
+                                }
+                            };
                             if let Ok(control) =
                                 serde_json::from_slice::<GroupControlMessage>(&plain)
                             {
@@ -15624,10 +15725,18 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let strict_plain = peer.e2e.decrypt_strict(&frame.payload).ok();
-                            if let Some(control) = strict_plain
-                                .as_deref()
-                                .and_then(Self::parse_original_image_control)
+                            let strict_plain = match peer.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Group image header authentication failed from {}: {err}",
+                                        peer.member.name
+                                    ));
+                                    continue;
+                                }
+                            };
+                            if let Some(control) =
+                                Self::parse_original_image_control(&strict_plain)
                             {
                                 let control = match control {
                                     Ok(control) => control,
@@ -15767,8 +15876,7 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = strict_plain
-                                .unwrap_or_else(|| peer.e2e.decrypt(&frame.payload));
+                            let plain = strict_plain;
                             match String::from_utf8(plain) {
                                 Ok(body) => match Self::parse_image_header(&body) {
                                     Ok(header) => {
@@ -15897,7 +16005,20 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = peer.e2e.decrypt(&frame.payload);
+                            let plain = match peer.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Group image chunk authentication failed from {}: {err}",
+                                        peer.member.name
+                                    ));
+                                    Self::fail_group_peer_incoming_original_image(
+                                        peer,
+                                        &mut tab.session.bubbles,
+                                    );
+                                    continue;
+                                }
+                            };
                             match general_purpose::STANDARD.decode(&plain) {
                                 Ok(chunk) => {
                                     let next_total =
@@ -16137,7 +16258,16 @@ impl IcedCommApp {
                                 continue;
                             }
 
-                            let plain = peer.e2e.decrypt(&frame.payload);
+                            let plain = match peer.e2e.decrypt_strict(&frame.payload) {
+                                Ok(plain) => plain,
+                                Err(err) => {
+                                    tab.session.log_lines.push(format!(
+                                        "Group message authentication failed from {}: {err}",
+                                        peer.member.name
+                                    ));
+                                    continue;
+                                }
+                            };
                             match String::from_utf8(plain) {
                                 Ok(body) => {
                                     tab.session.bubbles.push(Bubble {
@@ -16292,10 +16422,20 @@ impl IcedCommApp {
                                 if let Some(control) = control {
                                     match serde_json::to_vec(&control) {
                                         Ok(payload) => {
+                                            let payload = match peer.e2e.encrypt_strict(&payload) {
+                                                Ok(payload) => payload,
+                                                Err(err) => {
+                                                    tab.session.log_lines.push(format!(
+                                                        "Group control encryption failed for {}: {err}",
+                                                        peer.member.name
+                                                    ));
+                                                    continue;
+                                                }
+                                            };
                                             let frame = Frame {
                                                 msg_type: MsgType::L,
                                                 msg_id: Self::generate_msg_id_value(),
-                                                payload: peer.e2e.encrypt(&payload),
+                                                payload,
                                             };
                                             let conn = conn.clone();
                                             let task = Task::perform(
@@ -16957,7 +17097,7 @@ impl IcedCommApp {
         let frame_j = Frame {
             msg_type: MsgType::J,
             msg_id,
-            payload: e2e.encrypt(header.as_bytes()),
+            payload: e2e.encrypt_strict(header.as_bytes())?,
         };
         conn.send_frame(&frame_j).await.map_err(|e| e.to_string())?;
 
@@ -16966,7 +17106,7 @@ impl IcedCommApp {
             let frame_g = Frame {
                 msg_type: MsgType::G,
                 msg_id,
-                payload: e2e.encrypt(encoded.as_bytes()),
+                payload: e2e.encrypt_strict(encoded.as_bytes())?,
             };
             conn.send_frame(&frame_g).await.map_err(|e| e.to_string())?;
         }
@@ -17004,7 +17144,7 @@ impl IcedCommApp {
         let frame_j = Frame {
             msg_type: MsgType::J,
             msg_id: transfer_id,
-            payload: e2e.encrypt(header.as_bytes()),
+            payload: e2e.encrypt_strict(header.as_bytes())?,
         };
         conn.send_frame(&frame_j).await.map_err(|err| err.to_string())?;
 
@@ -17016,7 +17156,7 @@ impl IcedCommApp {
             let frame_g = Frame {
                 msg_type: MsgType::G,
                 msg_id: transfer_id,
-                payload: e2e.encrypt(encoded.as_bytes()),
+                payload: e2e.encrypt_strict(encoded.as_bytes())?,
             };
             conn.send_frame(&frame_g).await.map_err(|err| err.to_string())?;
         }
@@ -18470,7 +18610,7 @@ impl IcedCommApp {
     ) -> Result<Vec<u8>, String> {
         let encoded = frame.encode().map_err(|e| e.to_string())?;
         let blob_key = e2e.derive_offline_blob_key(shared_secret, my_b32, peer_b32);
-        Ok(e2e.encrypt_offline_blob(&encoded, &blob_key))
+        e2e.encrypt_offline_blob_strict(&encoded, &blob_key)
     }
 
     fn can_send_offline_now(&self) -> bool {
@@ -18687,8 +18827,7 @@ impl IcedCommApp {
             match Frame::decode(&frame_bytes) {
                 Ok(frame) => match frame.msg_type {
                         MsgType::U => {
-                            let plain = tab.e2e.decrypt(&frame.payload);
-                            match String::from_utf8(plain) {
+                            match String::from_utf8(frame.payload) {
                                 Ok(text) => {
                                     tab.session.seen_drop_msgs.push(blob_hash);
                                     got_valid_blob = true;
@@ -18758,6 +18897,10 @@ impl IcedCommApp {
             }
 
             Self::advance_drop_recv_base(&mut tab.session);
+            Self::save_offline_state_for_tab(
+                tab,
+                "Failed to save authenticated offline receive state",
+            );
         } else {
             Self::set_dd_status(&mut tab.session, "get_miss");
             tab.session.log_lines.push(format!(
